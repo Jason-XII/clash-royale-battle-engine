@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rendered Battle Engine"
+  short_description: "Replay native battles through the stock game UI"
+  default_prompt: "Use $operate-rendered-battle-engine to replay and inspect a native battle in the Android game UI."

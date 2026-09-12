@@ -1,0 +1,4 @@
+interface:
+  display_name: "Native Engine Throughput"
+  short_description: "Raise engine ticks/s with resident batching"
+  default_prompt: "Use $native-engine-throughput to measure and raise native engine throughput by batching resident battles and separating latency from compute."

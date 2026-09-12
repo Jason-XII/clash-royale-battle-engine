@@ -1,0 +1,4 @@
+interface:
+  display_name: "Headless Battle Engine"
+  short_description: "Build and validate the native battle engine"
+  default_prompt: "Use $build-and-run-headless-battle-engine to build and validate the local headless battle runtime."
