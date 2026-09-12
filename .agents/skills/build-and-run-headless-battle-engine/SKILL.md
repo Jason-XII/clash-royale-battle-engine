@@ -15,7 +15,12 @@ Compile the probe with the Android NDK using C++17, optimization, PIC, and 16 KB
 
 ## Start the runtime
 
-Keep the game process offline while using the harness. Scope IPv4 and IPv6 firewall rules to the installed game's current Android UID and preserve loopback traffic. Start Frida server, forward host port 26789, start the game, and obtain its current PID.
+After an ordinary emulator restart with the prepared APK already installed, run
+`python bootstrap_emulator.py`. It discovers the current app UID, replaces the
+offline rules, restores the port forward, launches the app, and waits for content.
+Do not hard-code a UID or start Frida when this path succeeds.
+
+Keep the game process offline while using the harness. Scope IPv4 and IPv6 firewall rules to the installed game's current Android UID and preserve loopback traffic. For initial probe injection or an unprepared APK, start Frida server, forward host port 26789, start the game, and obtain its current PID.
 
 Load the game's `libc++_shared.so` globally before loading the probe. Load injected libraries from the installed native-library directory when Android prohibits executable mappings from `/data/local/tmp`. Invoke `JNI_OnLoad` through Frida and confirm the control server is ready.
 
