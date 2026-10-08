@@ -11,7 +11,9 @@ anything; the wrong bottleneck is easy to "optimize" forever.
 
 Work from the repository root with the project's configured Python interpreter.
 The runtime client is in the root Python modules and the probe is under
-`vendor/firstlight/probe/`. `BASELINE.md` and `BATCH.md` are the state of record.
+`vendor/firstlight/probe/`. Measured numbers: single lane ~11k ticks/s
+(`python -m native_engine.benchmark`), resident batch of 16 ~26-32k ticks/s, and
+`minimal-run` (a whole replay in one round trip) ~0.15 s per 3-minute game.
 
 ## 1. Separate native cost from round-trip cost
 
@@ -54,7 +56,7 @@ flag and keep every existing command working.
    `build_minimal_capture()` (~1 KB `cr-minimal.v3` JSON) instead.
 3. Build with both `-DCR_MINIMAL_CAPTURE=1 -DCR_RESIDENT_COMMANDS=1`, keeping the
    baseline flags (`-std=c++17 -O2 -fPIC -fvisibility=hidden -Wall -Wextra`,
-   `-Wl,-z,max-page-size=16384`). The full command lives in `BATCH.md`.
+   `-Wl,-z,max-page-size=16384`). The full command is `tools/build_probe.sh`.
 4. Verify the batch payload is the compact schema and stays near 1 KB/slot; a jump
    back to tens of KB means the compact path failed and fell back.
 
@@ -76,7 +78,7 @@ A lane is in exactly one mode at a time, and the client must match it:
 
 | Mode | Client | Use |
 |---|---|---|
-| `legacy-headless` | `Engine` (`native_engine.minimal_demo`) | one battle, demos, debugging |
+| `legacy-headless` | `Engine` | one battle, replay rebuilding, debugging |
 | `resident-headless` | `Batch` (even `battles=1`) | many battles, training |
 
 - Check before guessing: `python -m native_engine.status [port ...]` prints mode,
@@ -112,8 +114,7 @@ Adding RAM removes guest memory pressure (2 GB evicts lanes; 4 GB keeps them) an
 gives a modest single-lane gain, but it does not multiply throughput. Adding CPU,
 lanes, or process count does not help while the workload is latency-bound and the
 host/guest CPUs are idle. It also will not move the single-lane number, which is
-set by adb round-trip latency. Treat `BATCH.md` as the record of
-measured numbers.
+set by adb round-trip latency.
 
 Read [references/troubleshooting.md](references/troubleshooting.md) for the concrete
 failures hit during this work and their fixes.

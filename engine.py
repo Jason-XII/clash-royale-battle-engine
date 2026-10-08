@@ -1,4 +1,4 @@
-"""Small synchronous client. One controller owns one standard-deck battle."""
+"""Small synchronous client. One controller owns one battle."""
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -50,8 +50,8 @@ class Engine:
             self.connection.close()
         self.stream = self.connection = None
 
-    def _receive(self):
-        payload = self.stream.readline(65537)
+    def _receive(self, limit=65537):
+        payload = self.stream.readline(limit)
         self.wire_bytes += len(payload)
         if not payload or not payload.endswith(b'\n'):
             raise ConnectionError(
@@ -59,26 +59,43 @@ class Engine:
                 f'check the lane is running and not in resident mode')
         return json.loads(payload)
 
-    def request(self, command):
+    def request(self, command, limit=65537):
         """Raw diagnostic access; callers must not mutate a managed episode through it."""
         try:
             self.connect()
             self.connection.sendall((command + '\n').encode())
-            return self._receive()
+            return self._receive(limit)
         except Exception:
             self.close()
             raise
 
-    def _capture(self, generation=0, cursor=0):
-        state = State.decode(self.request(f'minimal {generation} {cursor}'))
-        return state
+    def _state(self, command):
+        response = self.request(command)
+        if not response.get('ok'):
+            raise RuntimeError(f"{command.split()[0]}: {response.get('error')}")
+        return State.decode(response)
 
-    def reset(self, seed=1):
+    def _capture(self, generation=0, cursor=0):
+        return self._state(f'minimal {generation} {cursor}')
+
+    def reset(self, seed=1, match=None):
+        """Start a battle. `match` is a native replay dict (see standard_match.json); its
+        rndSeed wins over `seed`. Defaults to the Training Camp standard deck."""
         self.state = None
-        match = json.loads(Path(__file__).with_name('standard_match.json').read_text())
-        match['rndSeed'] = seed
-        self.request('configure ' + json.dumps(match, separators=(',', ':')))
-        self.request('step 90')  # First playable boundary; execute the first action at tick 91.
+        status = self.request('status')
+        if status.get('mode') != 'headless':
+            raise RuntimeError(
+                f"headless reset requires headless mode, found {status.get('mode')!r}; "
+                'run python bootstrap_emulator.py to restart the game before training')
+        if match is None:
+            match = json.loads(Path(__file__).with_name('standard_match.json').read_text())
+            match['rndSeed'] = seed
+        configured = self.request('configure ' + json.dumps(match, separators=(',', ':')))
+        if not configured.get('ok'):
+            raise RuntimeError(configured.get('error', 'headless configuration failed'))
+        stepped = self.request('step 90')  # First playable boundary; execute the first action at tick 91.
+        if not stepped.get('ok'):
+            raise RuntimeError(stepped.get('error', 'headless warmup failed'))
         self.state = self._capture()
         return self.state
 
@@ -95,12 +112,60 @@ class Engine:
             fields.extend(map(str, (action.owner, action.slot, action.x, action.y)))
         # A partial transport failure invalidates this client until reset; never replay writes.
         self.state = None
-        after = State.decode(self.request(' '.join(fields)))
+        after = self._state(' '.join(fields))
         advanced = after.tick - before.tick
         executed = tuple(any(e.owner == a.owner and e.card == card and e.tick == before.tick + 1
                              for e in after.plays) for a, card in zip(actions, cards))
         self.state = after
         return Transition(after, advanced, executed)
+
+    def run(self, ticks, count):
+        """Advance `count` chunks of `ticks` without actions in one round trip (scheduled
+        replay commands still fire); return the state after each chunk, stopping at the end."""
+        before = self.state
+        self.state = None
+        states = self.request(f'minimal-run {before.generation} {before.next_sequence} {ticks} {count}', limit=-1)
+        if isinstance(states, dict):
+            raise RuntimeError(f"minimal-run: {states.get('error')}")
+        states = [State.decode(s) for s in states]
+        self.state = states[-1]
+        return states
+
+    def advance(self, ticks):
+        """Step without actions; scheduled replay commands still fire."""
+        return self.step((), ticks)
+
+    def pipeline(self, commands):
+        """Send many commands in one write and return their responses in order."""
+        try:
+            self.connect()
+            self.connection.sendall(''.join(command + '\n' for command in commands).encode())
+            return [self._receive() for _ in commands]
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def card_command(owner, card, x, y, tick):
+        """Play `card` (by id) at the state boundary before `tick`; native resolves the hand slot."""
+        return f'replay-schedule-card {owner} {card} {x} {y} {tick}'
+
+    @staticmethod
+    def ability_command(owner, hints, tick):
+        """Activate the owner's Ready ability; `hints` are native name hints, () = the unique Ready one."""
+        hints = dict.fromkeys(''.join(c for c in h.casefold() if c.isascii() and c.isalnum()) for h in hints)
+        return f"replay-schedule-ability {owner} {','.join(h for h in hints if h) or '-'} {tick}"
+
+    def schedule(self, commands):
+        """Clear the replay schedule, queue `commands` in one round trip, return their sequences."""
+        receipts = self.pipeline(['replay-schedule-clear', *commands])
+        failed = [(c, r.get('error')) for c, r in zip(['clear', *commands], receipts) if not r.get('ok')]
+        if failed:
+            raise RuntimeError(f'schedule rejected: {failed[:3]}')
+        return [r['sequence'] for r in receipts[1:]]
+
+    def schedule_status(self, sequences):
+        return self.pipeline([f'replay-schedule-status {s}' for s in sequences])
 
 
 class RenderedEngine(Engine):

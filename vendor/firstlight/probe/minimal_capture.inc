@@ -1,4 +1,4 @@
-// Local standard-deck prototype. Reads native state directly; never builds rich JSON.
+// Compact any-deck state. Reads native state directly; never builds rich JSON.
 #ifdef CR_MINIMAL_CAPTURE
 bool reject_minimal_capture(const char *reason) {
   LOGE("minimal capture rejected: %s", reason);
@@ -13,13 +13,6 @@ bool install_minimal_capture_hook(std::uintptr_t base) {
   // Reuse only the card-play producer and its epoch bookkeeping, not the full hook set.
   g_combat_hooks_enabled.store(installed, std::memory_order_release);
   return installed;
-}
-
-bool minimal_card_supported(int id) {
-  constexpr int cards[] = {26000000, 26000001, 26000005, 28000001,
-                          28000000, 26000003, 26000014, 26000018};
-  for (int candidate : cards) if (candidate == id) return true;
-  return false;
 }
 
 bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t generation,
@@ -52,11 +45,6 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
     PlayerStateView player;
     if (!read_player_state(world, owner, &player) || player.deck_slots.count != 8)
       return reject_minimal_capture("player");
-    for (int slot = 0; slot < 8; ++slot) {
-      CardStateView card;
-      if (!read_card_state(player, slot, false, &card) || !minimal_card_supported(card.card_id))
-        return reject_minimal_capture("deck-card");
-    }
     json.object_element();
     json.field("owner", owner);
     json.field("elixir", player.elixir_raw);
@@ -67,7 +55,8 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
       if (slots[i] < 0) continue;
       CardStateView card;
       if (!read_card_state(player, slots[i], true, &card)) return reject_minimal_capture("hand-card");
-      json.append("%s[%d,%d,%d,%u]", first_hand ? "" : ",", i, card.card_id, card.cost, card.card_parameter);
+      json.append("%s[%d,%d,%d,%u,%d]", first_hand ? "" : ",", i, card.card_id, card.cost,
+                  card.card_parameter, card.command_card_id);
       first_hand = false;
     }
     json.end_array();
@@ -100,7 +89,14 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
     int hp = 0, max_hp = 0;
     const bool has_hp = read_hitpoints(object, &hp, &max_hp);
     const bool is_character = !is_projectile && has_hp;
-    if (!is_projectile && !is_character) return reject_minimal_capture("entity-type");
+    if (!is_projectile && !is_character) {
+      // Area effects (Poison, Freeze, Tornado, ...) carry no hitpoints or attack component.
+      json.append("%s[%u,%d,%d,%d,%d,null,null,null,null,\"area\",null]", first ? "" : ",",
+          identity.native_object_id, identity.owner, card_id, read_object_field<int>(object, 0x7c),
+          read_object_field<int>(object, 0x80));
+      first = false;
+      continue;
+    }
     const char *entity_type = is_projectile ? "projectile" : card_id == -1 ? "building" : "troop";
     int deployment_remaining_ms = 0;
     if (is_character) {
@@ -108,8 +104,9 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
       if (!process_range_is_readable(object, deploy_end)) return reject_minimal_capture("deployment-readable");
       const int native_remaining =
           read_object_field<int>(object, cr_phase_runtime::kObjectDeployRemainingOffset);
-      if (native_remaining < 0 || native_remaining > 3600000) return reject_minimal_capture("deployment-value");
-      deployment_remaining_ms = ((native_remaining + 49) / 50) * 50;
+      // Out-of-range values are reported as unknown (null) rather than failing the whole state.
+      deployment_remaining_ms = native_remaining < 0 || native_remaining > 3600000
+          ? -1 : ((native_remaining + 49) / 50) * 50;
     }
     NativeComponentInventoryView inventory;
     if (!read_native_component_inventory(object, &inventory)) return reject_minimal_capture("components");
@@ -127,8 +124,8 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
       if (!process_range_is_readable(attack, cooldown_end)) return reject_minimal_capture("cooldown-readable");
       const int native_remaining =
           read_object_field<int>(attack, cr_phase_runtime::kAttackLoadRemainingOffset);
-      if (native_remaining < 0 || native_remaining > 3600000) return reject_minimal_capture("cooldown-value");
-      attack_cooldown_ms = ((native_remaining + 49) / 50) * 50;
+      attack_cooldown_ms = native_remaining < 0 || native_remaining > 3600000
+          ? -1 : ((native_remaining + 49) / 50) * 50;
     }
     json.append("%s[%u,%d,%d,%d,%d,", first ? "" : ",", identity.native_object_id, identity.owner,
         card_id, read_object_field<int>(object, 0x7c),
@@ -136,9 +133,10 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
     if (has_hp) json.append("%d,%d,", hp, max_hp); else json.append("null,null,");
     if (has_attack && target.has_target) json.append("%u,", target.native_object_id);
     else json.append("null,");
-    if (has_attack) json.append("%d,", attack_cooldown_ms); else json.append("null,");
+    if (has_attack && attack_cooldown_ms >= 0) json.append("%d,", attack_cooldown_ms); else json.append("null,");
     json.append("\"%s\",", entity_type);
-    if (is_character) json.append("%d]", deployment_remaining_ms); else json.append("null]");
+    if (is_character && deployment_remaining_ms >= 0) json.append("%d]", deployment_remaining_ms);
+    else json.append("null]");
     first = false;
   }
   json.end_array();
@@ -250,8 +248,49 @@ bool handle_minimal_transition(int socket, const char *command) {
   return true;
 }
 
+// minimal-run GENERATION CURSOR TICKS COUNT: advance COUNT chunks of TICKS without actions
+// (scheduled replay commands still fire) and answer one JSON array with the state after
+// each chunk. Stops early once the battle ends. One host round trip per replay.
+bool handle_minimal_run(int socket, const char *command) {
+  if (std::strncmp(command, "minimal-run ", 12) != 0) return false;
+  unsigned long long generation = 0, cursor = 0;
+  unsigned int ticks = 0, count = 0;
+  char trailing = 0;
+  if (std::sscanf(command + 12, "%llu %llu %u %u%c", &generation, &cursor, &ticks, &count, &trailing) != 4 ||
+      ticks == 0 || ticks > 1000000 || count == 0 || count > 20000) {
+    send_control_error(socket, "minimal-run expects GENERATION CURSOR TICKS COUNT");
+    return true;
+  }
+  constexpr std::size_t kStateBytes = 65536;
+  std::unique_ptr<char[]> buffer(new char[kStateBytes]());
+  std::string out = "[";
+  for (unsigned int index = 0; index < count; ++index) {
+    const StepResult step = advance_controlled_manager(ticks);
+    if (!step.completed) {
+      send_control_error(socket, "minimal-run did not complete");
+      return true;
+    }
+    std::uint64_t next = cursor;
+    pthread_mutex_lock(&g_control_mutex);
+    const bool captured = build_minimal_capture(buffer.get(), kStateBytes, generation, cursor, &next);
+    pthread_mutex_unlock(&g_control_mutex);
+    if (!captured) {
+      send_control_error(socket, "minimal-run capture failed");
+      return true;
+    }
+    if (index) out += ',';
+    out += buffer.get();
+    cursor = next;
+    if (step.ended) break;
+  }
+  out += ']';
+  send_control_response(socket, out.c_str());
+  return true;
+}
+
 bool handle_minimal_capture(int socket, const char *command) {
   if (handle_minimal_transition(socket, command)) return true;
+  if (handle_minimal_run(socket, command)) return true;
   if (std::strncmp(command, "minimal ", 8) != 0) return false;
   unsigned long long generation = 0, cursor = 0;
   char trailing = 0;

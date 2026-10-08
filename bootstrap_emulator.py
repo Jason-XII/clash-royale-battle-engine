@@ -135,6 +135,13 @@ def main():
     shell(adb, arguments.serial, "am", "start", "-n", ACTIVITY)
 
     status = wait_until_ready(arguments.port, arguments.timeout)
+    if status.get('mode') != 'headless':
+        print(f"Restarting the game to leave {status.get('mode')} mode; the current battle will end.")
+        shell(adb, arguments.serial, 'am', 'force-stop', PACKAGE)
+        shell(adb, arguments.serial, 'am', 'start', '-n', ACTIVITY)
+        status = wait_until_ready(arguments.port, arguments.timeout)
+    if status.get('mode') != 'headless':
+        raise RuntimeError(f"expected a fresh headless runtime, found {status.get('mode')}")
     print(f"Battle engine ready at 127.0.0.1:{arguments.port}")
     print(f"device={arguments.serial} uid={uid} mode={status.get('mode')}")
 

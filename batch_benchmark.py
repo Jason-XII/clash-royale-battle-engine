@@ -1,6 +1,6 @@
 """Measure resident-batch throughput over complete, validated episodes.
 
-Run from crack-cr: python -m native_engine.batch_benchmark
+Run: python -m native_engine.batch_benchmark
 """
 import random
 import sys

@@ -1,5 +1,7 @@
 #define _GNU_SOURCE 1
 
+#include <algorithm>
+#include <string>
 #include <android/log.h>
 #include <arpa/inet.h>
 #include <cerrno>
@@ -6457,7 +6459,7 @@ void handle_control_command(int socket_fd, const char *command) {
   if (!resident_allowed && !native_render_allowed && std::strcmp(command, "status") != 0 &&
       std::strcmp(command, "observe") != 0 &&
       std::strncmp(command, "configure ", 10) != 0 && std::strncmp(command, "step ", 5) != 0 &&
-      std::strncmp(command, "inject ", 7) != 0) {
+      std::strncmp(command, "inject ", 7) != 0 && !is_replay_schedule_command(command)) {
     send_control_error(socket_fd, "unsupported command in minimal profile");
     return;
   }
@@ -7382,36 +7384,28 @@ void handle_control_command(int socket_fd, const char *command) {
       "replay-schedule-clear, inject JSON, speed 0.25|0.5|1|2|4, pause, resume");
 }
 
-bool receive_live_control_command(int socket_fd, char *command, std::size_t capacity) {
-  if (command == nullptr || capacity < 2) {
-    return false;
-  }
-  std::size_t used = 0;
-  command[0] = '\0';
-  while (used + 1 < capacity) {
-    const ssize_t received = recv(socket_fd, command + used, capacity - used - 1, 0);
-    if (received <= 0) {
-      return false;
-    }
-    used += static_cast<std::size_t>(received);
-    command[used] = '\0';
-    char *const newline = std::strpbrk(command, "\r\n");
-    if (newline != nullptr) {
-      *newline = '\0';
-      return true;
-    }
-  }
-  return false;
-}
-
 void handle_persistent_control_session(int socket_fd) {
   constexpr std::size_t kLiveSessionCommandBytes = 4096;
   send_control_response(socket_fd, "{\"ok\":true,\"session\":\"control-session.v1\"}");
+  // Bytes after a newline belong to the next command, so a client may pipeline many
+  // commands in one write and read the responses in order.
+  std::string pending;
   for (;;) {
-    char command[kLiveSessionCommandBytes] = {};
-    if (!receive_live_control_command(socket_fd, command, sizeof(command))) {
-      return;
+    std::size_t newline = pending.find_first_of("\r\n");
+    while (newline == std::string::npos) {
+      if (pending.size() >= kLiveSessionCommandBytes) return;
+      char chunk[kLiveSessionCommandBytes];
+      const ssize_t received = recv(socket_fd, chunk, sizeof(chunk), 0);
+      if (received <= 0) return;
+      pending.append(chunk, static_cast<std::size_t>(received));
+      newline = pending.find_first_of("\r\n");
     }
+    char command[kLiveSessionCommandBytes] = {};
+    const std::size_t length = std::min(newline, sizeof(command) - 1);
+    std::memcpy(command, pending.data(), length);
+    const std::size_t skip = pending.compare(newline, 2, "\r\n") == 0 ? 2 : 1;
+    pending.erase(0, newline + skip);
+    if (command[0] == '\0') continue;
     if (std::strcmp(command, "session-close") == 0) {
       send_control_response(socket_fd, "{\"ok\":true,\"sessionClosed\":true}");
       return;

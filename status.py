@@ -1,6 +1,6 @@
 """Show each lane's mode, occupancy, and per-slot progress.
 
-Run from crack-cr: python -m native_engine.status [port ...]
+Run: python -m native_engine.status [port ...]
 Defaults to the four cluster lane ports.
 """
 import json
