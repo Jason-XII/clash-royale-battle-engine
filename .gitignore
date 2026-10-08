@@ -1,0 +1,9 @@
+# Large local artifacts (data -> ~/cr-data, outside OneDrive)
+data
+build/
+runs/
+tools/cputemp
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
+.idea/
