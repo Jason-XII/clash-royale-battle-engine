@@ -197,7 +197,8 @@ def main():
                 break
         if step == args.max_steps:
             break
-    validate()
+    if step % args.eval_every:
+        validate()  # final model, unless the loop just validated it
 
 
 if __name__ == '__main__':
