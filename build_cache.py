@@ -16,7 +16,6 @@ import time
 import numpy as np
 
 from .engine import Engine
-from .replay import rebuild
 
 ENTITY_TYPES = ('troop', 'building', 'projectile', 'area')
 # Per-entity columns: state row, native id, owner, object type id, x, y, hp, max hp,
@@ -83,6 +82,7 @@ START_ENGINE = Path(__file__).resolve().parent / 'tools' / 'start_engine.sh'
 def rebuild_with_recovery(engine, payload, recoveries=2):
     """An OSError means the engine is gone (emulator crash, socket timeout), not a bad replay:
     restart the emulator and engine, then retry. Raises if recovery keeps failing."""
+    from .replay import rebuild  # FirstLight's converter (../firstlight-cr); Mac only
     for attempt in range(recoveries + 1):
         try:
             return rebuild(engine, payload)
