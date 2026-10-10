@@ -8,13 +8,15 @@ from pathlib import Path
 
 import torch
 
-from native_engine import Engine, Play
+import time
+
+from native_engine import Engine, Play, RenderedEngine
 from native_engine.replay import DECISION_TICKS, match_dict, prepare_collected_replay
 
 from .agent import Agent, load
 
 
-def play_game(engine, agents, match):
+def play_game(engine, agents, match, pace=0.0):
     state = engine.reset(match=match)
     for agent in agents:
         agent.reset()
@@ -31,7 +33,9 @@ def play_game(engine, agents, match):
                 pressed[agent.owner] += 1
         if abilities:
             engine.schedule(abilities)  # ponytail: whether an ability press did anything is not checked
+        started = time.monotonic()
         transition = engine.step(plays, DECISION_TICKS)
+        time.sleep(max(0.0, pace - (time.monotonic() - started)))
         for play, ok in zip(plays, transition.executed):
             done[play.owner] += ok
         state = transition.state
@@ -45,17 +49,19 @@ def main():
     parser.add_argument('--games', type=int, default=2)
     parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
     parser.add_argument('--port', type=int, default=26789)
+    parser.add_argument('--render', action='store_true', help='draw in the game UI at real-time speed')
     args = parser.parse_args()
     torch.set_num_threads(2)
     import pyarrow.parquet as pq
     rows = pq.read_table(args.replays, columns=['payload_json']).slice(0, args.games).to_pylist()
     model, vocab = load(args.checkpoint)
     agents = [Agent(model, vocab, owner, decode=args.decode) for owner in (0, 1)]
-    engine = Engine(port=args.port)
+    engine = (RenderedEngine if args.render else Engine)(port=args.port)
     for row in rows:
         replay = prepare_collected_replay(json.loads(row['payload_json'])).replay
         decks = (replay.episode_config.deck0, replay.episode_config.deck1)
-        print(json.dumps(play_game(engine, agents, match_dict(replay, decks, replay.episode_config.seed))), flush=True)
+        print(json.dumps(play_game(engine, agents, match_dict(replay, decks, replay.episode_config.seed),
+                                    DECISION_TICKS / 20 if args.render else 0.0)), flush=True)
 
 
 if __name__ == '__main__':

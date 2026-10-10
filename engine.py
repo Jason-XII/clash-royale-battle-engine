@@ -169,10 +169,11 @@ class Engine:
 class RenderedEngine(Engine):
     """One paused, exactly stepped battle drawn by the stock game UI."""
 
-    def reset(self, seed=1):
+    def reset(self, seed=1, match=None):
         self.state = None
-        match = json.loads(Path(__file__).with_name('standard_match.json').read_text())
-        match['rndSeed'] = seed
+        if match is None:
+            match = json.loads(Path(__file__).with_name('standard_match.json').read_text())
+            match['rndSeed'] = seed
         status = self.request('status')
         if status.get('mode') == 'resident-headless':
             raise RuntimeError('close the active Batch and call stop_resident() first')
