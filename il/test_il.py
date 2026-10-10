@@ -61,6 +61,12 @@ class IL(unittest.TestCase):
                 self.assertTrue(s['slot_ok'][np.flatnonzero(card), slot].all())
                 acts += (replay['actions'][:, 1] == owner).sum()
                 kept += ((s['action'] != D.WAIT) & s['label_mask']).sum()
+                # Each label sits on the last board at least DEPLOY_DELAY ticks before execution.
+                first = replay['actions'][(replay['actions'][:, 1] == owner) & (replay['actions'][:, 5] == 1)]
+                labeled = np.flatnonzero(s['action'] != D.WAIT)
+                if len(first) and len(labeled):
+                    tick = replay['tick'][labeled[0]]
+                    self.assertTrue(tick < first[0, 0] - D.DEPLOY_DELAY <= tick + 5)
         self.assertGreater(kept / acts, 0.95)
 
     def test_stepwise_equals_sequence(self):

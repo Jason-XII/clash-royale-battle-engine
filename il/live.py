@@ -22,6 +22,7 @@ import torch
 from native_engine import Engine
 from native_engine.protocol import State
 
+from . import data as D
 from .agent import Agent, load
 
 # Pixel_9_2 emulator screen (1080x2424), measured in clash-simulator-refactored/minimal_visualizer.py:
@@ -132,8 +133,8 @@ def play_battle(engine, agent, taps, state, args, log):
         _, slot, x, y = choice
         me = state.players[agent.owner]
         card = next((c for c in me.hand if c.slot == slot), None)
-        if card is None or card.cost * 10000 > me.elixir:
-            continue  # a failed placement would leave the card selected on screen
+        if card is None or card.cost * 10000 > me.elixir + D.AFFORD_SLACK:
+            continue  # the game waits for elixir only when the tap is almost affordable
         started = time.perf_counter()
         screen = taps.play(slot, x, y, agent.owner)
         pending = (card.card, state.tick)

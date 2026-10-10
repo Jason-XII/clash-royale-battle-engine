@@ -17,8 +17,12 @@ MAX_ENTITIES = 64
 ENTITY_FLOATS = 10
 SCALARS = 6
 REVEALED = 8
-# Elixir can rise during the 5-tick window before the human's play executes (max ~0.3).
-AFFORD_SLACK = 3000
+# A play lands ~22 ticks (1.1 s) after the tap (measured live: 21-25), so a human decided on the
+# board ~22 ticks before the command's execution tick; labels use that board.
+DEPLOY_DELAY = 22
+# The game accepts a tap up to ~1 elixir short and lands the card once it is affordable; at the
+# board 22 ticks before execution humans were short by <= 0.8 elixir in 99.5% of plays.
+AFFORD_SLACK = 8000
 
 
 class Shard:
@@ -141,8 +145,8 @@ def revealed_cards(replay, owner, vocab, T):
 def labels(replay, owner):
     """Human action per decision: WAIT, ABILITY or 2 + slot * CELLS + cell, plus a loss mask.
 
-    A command executing at tick c belongs to the last state with tick < c (the engine applies
-    an action chosen at state tick T on the way to T + 1).
+    A command executing at tick c belongs to the last state with tick < c - DEPLOY_DELAY: the board
+    the human saw when tapping.
     """
     tick, hand, elixir = replay['tick'], replay['hand'][:, owner], replay['elixir'][:, owner]
     T = len(tick)
@@ -151,7 +155,7 @@ def labels(replay, owner):
     for c_tick, o, card, x, y, executed in replay['actions']:
         if o != owner:
             continue
-        t = np.searchsorted(tick, c_tick) - 1
+        t = np.searchsorted(tick, c_tick - DEPLOY_DELAY) - 1
         if t < 0 or t >= T or action[t] != WAIT:
             continue  # ponytail: a 2nd action in one 250 ms window is dropped (~0.1% of windows)
         if not executed:
