@@ -31,6 +31,7 @@ TILE_W, TILE_H = (X1 - X0) / 18, (Y1 - Y0) / 30
 BOTTOM = Y1 + TILE_H
 # Home screen Battle (yellow) and results screen OK (blue) overlap here, below their labels.
 BUTTON = (440, 2035)
+BATTLE_TAB = (541, 2323)  # bottom bar; a restarted game opens on the trophy road page
 
 
 def button_color(serial):
@@ -147,10 +148,12 @@ def connect(args):
     return engine
 
 
-def restart_game(args):
-    """The game died (seen: a stock JNI abort after a battle). Bring it back online."""
+def restart_game(args, taps):
+    """The game died. Bring it back online and on the home screen."""
     print('game lost; restarting it', flush=True)
     subprocess.run([sys.executable, 'bootstrap_emulator.py', '--online'], check=True)
+    time.sleep(10)
+    taps.tap(*BATTLE_TAB)
     return connect(args)
 
 
@@ -205,7 +208,7 @@ def main():
                               f'crowns {state.crowns[owner]}-{state.crowns[1 - owner]} -> {path}', flush=True)
                         played += 1
             except (ConnectionError, OSError):
-                engine, done = restart_game(args), set()  # generations restart with the game
+                engine, done = restart_game(args, taps), set()  # generations restart with the game
     finally:
         try:
             engine.request('live off')

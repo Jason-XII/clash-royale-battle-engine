@@ -61,6 +61,9 @@ constexpr std::uintptr_t kLibgStringFromUtf8Offset = 0x0138a800;
 constexpr std::uintptr_t kNativeReplayRunnerOffset = 0x00c87ecc;
 constexpr std::uintptr_t kReplayBattleControllerLifecycleOffset = 0x00c87620;
 constexpr std::uintptr_t kReplayBattleControllerFullUpdateOffset = 0x00c88bbc;
+// Byte the controller update checks before opening the "Rate this app" dialog (libg+0xc88fb0).
+// That dialog calls a Java store-review class the patched APK lacks: a JNI abort after battles.
+constexpr std::uintptr_t kRateAppPendingOffset = 0x019bc929;
 constexpr std::uintptr_t kReplayBattleControllerClockOffset = 0x00c890bc;
 constexpr std::uintptr_t kReplayBattleControllerAlternateUpdateOffset = 0x00c899e0;
 constexpr std::uintptr_t kReplayClockGlobalPauseGuardOffset = 0x00cb6694;
@@ -7644,6 +7647,7 @@ void replay_battle_controller_full_update_hook(void *controller, float delta_sec
   }
   std::uint64_t generation = 0;
   if (!is_current_native_controller(controller, &generation)) {
+    *reinterpret_cast<volatile std::uint8_t *>(g_libg_base + kRateAppPendingOffset) = 0;  // never ask to rate
     original(controller, delta_seconds);
 #ifdef CR_MINIMAL_CAPTURE
     if (g_live_enabled.load(std::memory_order_acquire)) live_controller_updated(controller);
