@@ -14,10 +14,16 @@ def load(checkpoint, device='cpu'):
 
 
 class Agent:
-    """One player. `act(state)` returns ('wait',), ('ability',) or ('card', slot, x, y) in world units."""
+    """One player. `act(state)` returns ('wait',), ('ability',) or ('card', slot, x, y) in world units.
 
-    def __init__(self, model, vocab, owner, sample=True, device='cpu'):
-        self.model, self.vocab, self.owner, self.sample, self.device = model, vocab, owner, sample, device
+    decode: 'gate'   - play with probability 1 - p(wait), then the best card/cell/ability (default)
+            'sample' - sample the whole joint action
+            'argmax' - joint argmax; almost never plays, because a decision to play is spread
+                       over hundreds of card x cell options while WAIT is a single option
+    """
+
+    def __init__(self, model, vocab, owner, decode='gate', device='cpu'):
+        self.model, self.vocab, self.owner, self.decode, self.device = model, vocab, owner, decode, device
         self.reset()
 
     def reset(self):
@@ -38,7 +44,13 @@ class Agent:
     def act(self, state):
         logits, value, self.lstm = self.model(self.observe(state), self.lstm)
         logits = logits[0, 0].float()
-        action = int(torch.distributions.Categorical(logits=logits).sample() if self.sample else logits.argmax())
+        if self.decode == 'sample':
+            action = int(torch.distributions.Categorical(logits=logits).sample())
+        elif self.decode == 'argmax':
+            action = int(logits.argmax())
+        else:
+            play = torch.rand(()) > logits.softmax(-1)[D.WAIT]
+            action = 1 + int(logits[1:].argmax()) if play else D.WAIT
         if action == D.WAIT:
             return ('wait',)
         if action == D.ABILITY:

@@ -43,14 +43,14 @@ def main():
     parser.add_argument('checkpoint', type=Path)
     parser.add_argument('replays', type=Path, help='a parquet part; its decks are used')
     parser.add_argument('--games', type=int, default=2)
-    parser.add_argument('--argmax', action='store_true')
+    parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
     parser.add_argument('--port', type=int, default=26789)
     args = parser.parse_args()
     torch.set_num_threads(2)
     import pyarrow.parquet as pq
     rows = pq.read_table(args.replays, columns=['payload_json']).slice(0, args.games).to_pylist()
     model, vocab = load(args.checkpoint)
-    agents = [Agent(model, vocab, owner, sample=not args.argmax) for owner in (0, 1)]
+    agents = [Agent(model, vocab, owner, decode=args.decode) for owner in (0, 1)]
     engine = Engine(port=args.port)
     for row in rows:
         replay = prepare_collected_replay(json.loads(row['payload_json'])).replay

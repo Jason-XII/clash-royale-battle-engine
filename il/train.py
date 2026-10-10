@@ -77,6 +77,9 @@ def losses(model, batch, device, value_coef):
         'wait_acc': (pred[action == D.WAIT] == D.WAIT).float().mean().item(),
         'act_rate_true': (action != D.WAIT).float().mean().item(),
         'act_rate_pred': (1 - logits[labeled].float().softmax(-1)[:, D.WAIT]).mean().item(),
+        # Timing: p(play) when the human played vs when the human waited (wider gap = better).
+        'p_play_on_act': (1 - logits[labeled][action != D.WAIT].float().softmax(-1)[:, D.WAIT]).mean().item(),
+        'p_play_on_wait': (1 - logits[labeled][action == D.WAIT].float().softmax(-1)[:, D.WAIT]).mean().item(),
         # On human card plays: chosen card right / exact (card, cell) in top-1 and top-5.
         'card_acc': ((logits[labeled][acts][:, 2:].reshape(-1, 4, D.CELLS).logsumexp(-1).argmax(-1))
                      == (action[acts] - 2) // D.CELLS).float().mean().item(),
