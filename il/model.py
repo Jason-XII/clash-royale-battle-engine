@@ -33,12 +33,16 @@ class Policy(nn.Module):
         ys, xs = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing='ij')
         self.register_buffer('coords', torch.stack([xs, ys])[None], persistent=False)
         global_in = 2 * channels + SCALARS + 5 * (card_dim + 1) + REVEALED * (card_dim + 1)
+        # Both norms keep the LSTM input at unit scale: unnormalised pooled grid features (~10-20)
+        # saturated the LSTM in the first IL run, freezing its state and the value head.
+        self.global_norm = nn.LayerNorm(global_in)
         self.globals = mlp(global_in, core, core)
+        self.lstm_norm = nn.LayerNorm(core)
         self.lstm = nn.LSTM(core, core, batch_first=True)
         self.wait_ability = nn.Linear(core, 2)
         self.film = nn.Linear(core + card_dim, 2 * channels)
         self.cell = nn.Conv2d(channels, 1, 1)
-        self.value = mlp(core, 128, 1)
+        self.value = mlp(core + SCALARS, 128, 1)  # scalars (crowns, time, elixir) read directly
 
     def initial_state(self, batch, device=None):
         zeros = torch.zeros(1, batch, self.config['core'], device=device)
@@ -66,14 +70,15 @@ class Policy(nn.Module):
         nxt = torch.cat([self.card(x['next_card']), torch.zeros_like(x['next_card'], dtype=hand.dtype).unsqueeze(-1)], -1)
         rev = torch.cat([self.card(x['rev_card']), x['rev_age'].unsqueeze(-1)], -1)
         g = torch.cat([pooled, x['scalars'], hand.flatten(2), nxt, rev.flatten(2)], -1)
-        core, state = self.lstm(F.relu(self.globals(g)), state)  # [B, T, core]
+        core, state = self.lstm(self.lstm_norm(F.relu(self.globals(self.global_norm(g)))), state)  # [B, T, core]
         # Per hand slot: condition the grid on (core, card) and score every cell.
         film = self.film(torch.cat([core.unsqueeze(2).expand(-1, -1, 4, -1), self.card(x['hand_card'])], -1))
         scale, shift = film.reshape(N, 4, 2 * C, 1, 1).chunk(2, 2)
         cells = self.cell(F.relu(grid.unsqueeze(1) * (1 + scale) + shift).reshape(N * 4, C, H, W))
         cells = cells.reshape(B, T, 4, CELLS).masked_fill(~x['slot_ok'].unsqueeze(-1), float('-inf'))
         logits = torch.cat([self.wait_ability(core), cells.flatten(2)], -1)
-        return logits, self.value(core).squeeze(-1), state
+        value = self.value(torch.cat([core, x['scalars']], -1)).squeeze(-1)
+        return logits, value, state
 
 
 def decode(action):

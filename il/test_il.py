@@ -75,6 +75,19 @@ class IL(unittest.TestCase):
                 steps.append(logits)
         self.assertTrue(torch.allclose(torch.cat(steps, 1), full, atol=1e-5))
 
+    def test_lstm_input_is_normalized(self):
+        """The first IL run froze: unnormalised inputs saturated the LSTM (core std over time 0.004)."""
+        model = Policy(max(self.vocab.values()) + 1).eval()
+        s = D.sequence(self.shard[0], 0, self.vocab)
+        x = {k: torch.as_tensor(s[k][:100])[None] for k in INPUT_KEYS}
+        grab = {}
+        model.lstm.register_forward_hook(lambda mod, i, o: grab.update(inp=i[0], core=o[0]))
+        with torch.no_grad():
+            model(x)
+        self.assertLess(abs(grab['inp'].std().item() - 1), 0.2)
+        self.assertLess((grab['core'].abs() > 0.99).float().mean().item(), 0.05)
+        self.assertGreater(grab['core'][0].std(0).mean().item(), 0.02)
+
     def test_model_can_memorize_a_short_game(self):
         torch.manual_seed(0)
         model = Policy(max(self.vocab.values()) + 1)
