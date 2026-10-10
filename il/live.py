@@ -11,7 +11,9 @@ runs/live/<time>.jsonl.
 import argparse
 import dataclasses
 import json
+import struct
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -27,6 +29,17 @@ from .agent import Agent, load
 X0, X1, Y0, Y1 = 16, 1053, 295, 1714
 TILE_W, TILE_H = (X1 - X0) / 18, (Y1 - Y0) / 30
 BOTTOM = Y1 + TILE_H
+# Home screen Battle (yellow) and results screen OK (blue) overlap here, below their labels.
+BUTTON = (440, 2035)
+
+
+def button_color(serial):
+    """'yellow' (Battle), 'blue' (OK) or None (matchmaking, loading, battle)."""
+    raw = subprocess.run(['adb', '-s', serial, 'exec-out', 'screencap'], capture_output=True).stdout
+    w, h = struct.unpack('<II', raw[:8])
+    i = len(raw) - w * h * 4 + (BUTTON[1] * w + BUTTON[0]) * 4
+    r, g, b = raw[i:i + 3]
+    return 'yellow' if r > 200 and g > 130 and b < 80 else 'blue' if b > 180 and r < 120 else None
 
 
 def slot_screen(slot):
@@ -45,6 +58,11 @@ class Taps:
     def __init__(self, serial):
         self.shell = subprocess.Popen(['adb', '-s', serial, 'shell'], stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def tap(self, x, y):
+        self.shell.stdin.write(f'input tap {x} {y}; echo done:$?\n')
+        self.shell.stdin.flush()
+        self.shell.stdout.readline()
 
     def play(self, slot, x, y, owner):
         (sx, sy), (tx, ty) = slot_screen(slot), world_screen(x, y, owner)
@@ -69,7 +87,7 @@ def capture(engine, cursor=0):
 def find_owner(state, deck, owner):
     if owner is not None:
         return owner
-    seats = [p.owner for p in state.players if {c.card for c in p.hand} | set(p.cycle) == deck]
+    seats = [p.owner for p in state.players if deck <= {c.card for c in p.hand} | set(p.cycle)]
     if len(seats) == 1:
         return seats[0]
     decks = {p.owner: sorted({c.card for c in p.hand} | set(p.cycle)) for p in state.players}
@@ -103,6 +121,8 @@ def play_battle(engine, agent, taps, state, args, log):
         # The agent sees every play since its last decision, as in training.
         choice = agent.act(dataclasses.replace(state, plays=tuple(plays)))
         plays = []
+        log({'event': 'decision', 'tick': state.tick, 'elixir': state.players[agent.owner].elixir,
+             'crowns': state.crowns, 'choice': choice[0]})
         if pending and state.tick - pending[1] > 30:
             log({'event': 'unconfirmed', 'tick': state.tick, 'card': pending[0]})
             pending = None
@@ -121,53 +141,76 @@ def play_battle(engine, agent, taps, state, args, log):
     return state
 
 
+def connect(args):
+    engine = Engine(port=args.port)
+    print('probe:', engine.request('live on'), flush=True)
+    return engine
+
+
+def restart_game(args):
+    """The game died (seen: a stock JNI abort after a battle). Bring it back online."""
+    print('game lost; restarting it', flush=True)
+    subprocess.run([sys.executable, 'bootstrap_emulator.py', '--online'], check=True)
+    return connect(args)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('checkpoint', type=Path)
-    parser.add_argument('--deck', help='our 8 card ids, comma separated')
+    parser.add_argument('--deck', help='card ids only our deck has (up to all 8), comma separated')
     parser.add_argument('--owner', type=int, choices=(0, 1), help='our native seat (mirror matches)')
     parser.add_argument('--games', type=int, default=1)
     parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
     parser.add_argument('--port', type=int, default=26789)
     parser.add_argument('--serial', default='emulator-5554')
+    parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each game')
     args = parser.parse_args()
     if args.deck is None and args.owner is None:
         parser.error('give --deck (or --owner)')
     deck = {int(c) for c in args.deck.split(',')} if args.deck else None
     torch.set_num_threads(2)
     model, vocab = load(args.checkpoint)
-    engine = Engine(port=args.port)
-    print('probe:', engine.request('live on'), flush=True)
+    engine = connect(args)
     taps = Taps(args.serial)
     Path('runs/live').mkdir(parents=True, exist_ok=True)
     try:
         played, done = 0, set()
         while played < args.games:
-            print('waiting for a battle...', flush=True)
-            state = None
-            while state is None or state.finalized or state.generation in done:
-                time.sleep(0.5)
-                state = capture(engine)
-            done.add(state.generation)
-            owner = find_owner(state, deck, args.owner)
-            agent = Agent(model, vocab, owner, decode=args.decode)
-            path = Path('runs/live') / time.strftime('%Y%m%d_%H%M%S.jsonl')
-            with path.open('w') as f:
-                def log(record):
-                    f.write(json.dumps(record) + '\n')
-                    f.flush()
-                log({'event': 'start', 'checkpoint': str(args.checkpoint), 'owner': owner,
-                     'generation': state.generation, 'tick': state.tick})
-                state = play_battle(engine, agent, taps, state, args, log)
-                if state.finalized:
-                    won = state.result == owner
-                    log({'event': 'end', 'result': state.result, 'won': won, 'crowns': state.crowns,
-                         'tick': state.tick})
-                    print(f'{"WIN" if won else "LOSS" if state.result in (0, 1) else "DRAW"} '
-                          f'crowns {state.crowns[owner]}-{state.crowns[1 - owner]} -> {path}', flush=True)
-                    played += 1
+            try:
+                print('waiting for a battle...', flush=True)
+                state, checked = None, 0.0
+                while state is None or state.finalized or state.generation in done:
+                    time.sleep(0.5)
+                    state = capture(engine)
+                    if args.queue and time.monotonic() - checked > 5:
+                        checked = time.monotonic()
+                        if button_color(args.serial):  # OK on results, then Battle on the home screen
+                            taps.tap(*BUTTON)
+                done.add(state.generation)
+                owner = find_owner(state, deck, args.owner)
+                agent = Agent(model, vocab, owner, decode=args.decode)
+                path = Path('runs/live') / time.strftime('%Y%m%d_%H%M%S.jsonl')
+                with path.open('w') as f:
+                    def log(record):
+                        f.write(json.dumps(record) + '\n')
+                        f.flush()
+                    log({'event': 'start', 'checkpoint': str(args.checkpoint), 'owner': owner,
+                         'generation': state.generation, 'tick': state.tick})
+                    state = play_battle(engine, agent, taps, state, args, log)
+                    if state.finalized:
+                        won = state.result == owner
+                        log({'event': 'end', 'result': state.result, 'won': won, 'crowns': state.crowns,
+                             'tick': state.tick})
+                        print(f'{"WIN" if won else "LOSS" if state.result in (0, 1) else "DRAW"} '
+                              f'crowns {state.crowns[owner]}-{state.crowns[1 - owner]} -> {path}', flush=True)
+                        played += 1
+            except (ConnectionError, OSError):
+                engine, done = restart_game(args), set()  # generations restart with the game
     finally:
-        engine.request('live off')
+        try:
+            engine.request('live off')
+        except OSError:
+            pass
 
 
 if __name__ == '__main__':
