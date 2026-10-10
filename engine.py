@@ -102,20 +102,18 @@ class Engine:
     def step(self, actions=(), ticks=5):
         before = self.state
         actions = tuple(actions)
-        cards = []
         fields = ['minimal-transition', str(before.generation), str(before.next_sequence),
                   str(ticks), str(len(actions))]
         for action in actions:
-            player = before.players[action.owner]
-            card = next((c for c in player.hand if c.slot == action.slot), None)
-            cards.append(card.card)
             fields.extend(map(str, (action.owner, action.slot, action.x, action.y)))
         # A partial transport failure invalidates this client until reset; never replay writes.
         self.state = None
         after = self._state(' '.join(fields))
         advanced = after.tick - before.tick
-        executed = tuple(any(e.owner == a.owner and e.card == card and e.tick == before.tick + 1
-                             for e in after.plays) for a, card in zip(actions, cards))
+        # Not matched by card: evolved/champion forms are recorded under another id (e.g. 0).
+        # ponytail: two plays by one owner in one step can't be told apart; callers send one each.
+        executed = tuple(any(e.owner == a.owner and e.tick == before.tick + 1 for e in after.plays)
+                         for a in actions)
         self.state = after
         return Transition(after, advanced, executed)
 
@@ -224,10 +222,9 @@ class RenderedEngine(Engine):
         if not advanced.get('ok'):
             raise RuntimeError(advanced.get('error', 'could not advance native renderer'))
         after = self._capture(before.generation, before.next_sequence)
-        executed = tuple(any(event.owner == action.owner and event.card == card
-                             and event.tick == before.tick + 1
+        executed = tuple(any(event.owner == action.owner and event.tick == before.tick + 1
                              for event in after.plays)
-                         for action, card in zip(actions, cards))
+                         for action in actions)  # not by card: see Engine.step
         self.state = after
         return Transition(after, after.tick - before.tick, executed)
 

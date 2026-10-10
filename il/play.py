@@ -18,24 +18,24 @@ def play_game(engine, agents, match):
     state = engine.reset(match=match)
     for agent in agents:
         agent.reset()
-    tried = {0: 0, 1: 0}
-    done = {0: 0, 1: 0}
+    tried, done, pressed = {0: 0, 1: 0}, {0: 0, 1: 0}, {0: 0, 1: 0}
     while not state.finalized and state.tick < 7200:
         plays, abilities = [], []
         for agent in agents:
             choice = agent.act(state)
             if choice[0] == 'card':
                 plays.append(Play(agent.owner, choice[1], choice[2], choice[3]))
+                tried[agent.owner] += 1
             elif choice[0] == 'ability':
                 abilities.append(Engine.ability_command(agent.owner, (), state.tick + 1))
-            tried[agent.owner] += choice[0] != 'wait'
+                pressed[agent.owner] += 1
         if abilities:
-            engine.schedule(abilities)  # ponytail: ability success is not counted in `done`
+            engine.schedule(abilities)  # ponytail: whether an ability press did anything is not checked
         transition = engine.step(plays, DECISION_TICKS)
         for play, ok in zip(plays, transition.executed):
             done[play.owner] += ok
         state = transition.state
-    return {'result': state.result, 'crowns': state.crowns, 'tick': state.tick, 'actions': tried, 'executed': done}
+    return {'result': state.result, 'crowns': state.crowns, 'tick': state.tick, 'plays': tried, 'executed': done, 'ability_presses': pressed}
 
 
 def main():
