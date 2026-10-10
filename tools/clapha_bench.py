@@ -4,6 +4,7 @@
 """
 import argparse
 from collections import Counter
+import os
 import time
 
 import torch
@@ -67,3 +68,4 @@ for game in range(args.games):
 print('objects without hitpoints (card id, data class): count')
 for key, n in noh.most_common(25):
     print(' ', key, n)
+os._exit(0)  # ponytail: the engine segfaults in its exit-time destructors; nothing is left to flush

@@ -20,7 +20,7 @@ from .engine import Transition
 from .protocol import CardPlay, Entity, HandCard, Player, State
 
 COSTS = {int(k): v for k, v in json.loads(Path(__file__).with_name('card_costs.json').read_text()).items()}
-PROJECTILE_CLASS = 24  # ponytail: data global id // 1e6 of projectiles; confirm with tools/clapha_bench.py
+PROJECTILE_CLASS = 10  # data global id // 1e6 of LogicProjectileData (the probe checks type 0x0a); measured
 
 
 def _ms(value):
