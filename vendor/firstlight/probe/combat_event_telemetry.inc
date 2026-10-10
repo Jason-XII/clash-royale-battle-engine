@@ -1185,6 +1185,37 @@ extern "C" void cr_combat_heal_bridge(void *component, std::int32_t requested, s
   }
 }
 
+// Live battles only: a card play the strict replay validation refuses (seen: a Training Camp
+// bot whose deck slot did not hold the played card) is still recorded by its played card id,
+// so one odd play cannot stop every later capture. Headless and rendered games stay strict.
+bool live_fallback_deployment(const CombatCaptureContext &capture, void *owner_root,
+                              const NativeCardSelection *descriptor, CombatDeploymentContext *result) {
+  if (!g_live_enabled.load(std::memory_order_acquire) || !process_range_is_readable(descriptor, 20)) return false;
+  NativeCardSelection selection;
+  std::memcpy(&selection, descriptor, 20);
+  if (!process_range_is_readable(selection.card_data, 0x44)) return false;
+  void *const world = read_object_field<void *>(capture.game_manager, 0xa8);
+  for (std::int32_t owner = 0; owner < kPlayerCount; ++owner) {
+    PlayerStateView player{};
+    if (!read_player_state(world, owner, &player) || player.player != owner_root) continue;
+    *result = {};
+    result->validated = true;
+    result->generation = capture.generation;
+    result->state_epoch = capture.state_epoch;
+    result->deployment_sequence = g_combat_next_deployment_sequence.fetch_add(1, std::memory_order_acq_rel);
+    result->owner = owner;
+    result->played_card_global_id = read_object_field<std::uint32_t>(selection.card_data, 0x40);
+    result->effective_card_global_id = result->played_card_global_id;
+    result->card_parameter = selection.packed;
+    result->cost = static_cast<std::int32_t>(selection.packed >> 28);
+    result->form_code = static_cast<std::int32_t>(selection.packed & 0x0fU);
+    result->consumed_tick = capture.tick;
+    LOGI("live fallback deployment owner=%d card=%u", owner, result->played_card_global_id);
+    return true;
+  }
+  return false;
+}
+
 void combat_consume_card_hook(void *owner_root, const NativeCardSelection *descriptor, std::int32_t argument_two,
                               std::int32_t argument_three, std::int32_t argument_four, std::int32_t argument_five) {
   const CombatDeploymentContext previous = g_combat_active_deployment;
@@ -1192,7 +1223,8 @@ void combat_consume_card_hook(void *owner_root, const NativeCardSelection *descr
   CombatCaptureContext capture;
   const bool capture_active = current_combat_capture_context(&capture);
   const bool deployment_valid =
-      capture_active && capture_combat_deployment(capture, owner_root, descriptor, &deployment);
+      capture_active && (capture_combat_deployment(capture, owner_root, descriptor, &deployment) ||
+                         live_fallback_deployment(capture, owner_root, descriptor, &deployment));
   if (capture_active && !deployment_valid) {
     g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
   }

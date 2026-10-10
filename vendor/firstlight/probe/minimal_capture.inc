@@ -22,13 +22,26 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
   if (!manager || !capture.generation || !g_hook_install_ok.load() ||
       (generation && generation != capture.generation))
     return reject_minimal_capture("manager-or-generation");
+  if (!process_range_is_readable(manager, 0xb0)) return reject_minimal_capture("manager-readable");
   void *world = read_object_field<void *>(manager, 0xa8);
+  // A stock (live) battle is not ours: validate every pointer before following it.
+  if (!process_range_is_readable(world, 0x1e8)) return reject_minimal_capture("world-readable");
+  for (int owner = 0; owner < 2; ++owner) {
+    void *player = read_object_field<void *>(world, 0xe0 + owner * sizeof(void *));
+    if (!process_range_is_readable(player, 0x300)) return reject_minimal_capture("player-readable");
+  }
   void *object_manager = combat_object_manager_from_game_manager(manager);
+  if (!process_range_is_readable(object_manager, 0x18)) return reject_minimal_capture("object-manager-readable");
   void **objects = nullptr;
   int count = 0;
   BattleResultView result;
-  if (!world || !read_combat_object_vector(object_manager, &objects, &count) || count > 256 ||
-      !read_battle_result(world, &result)) return reject_minimal_capture("world-or-object-vector");
+  if (!world) return reject_minimal_capture("world");
+  if (!read_combat_object_vector(object_manager, &objects, &count)) return reject_minimal_capture("object-vector");
+  if (count > 256) {
+    LOGE("minimal capture: %d objects", count);
+    return reject_minimal_capture("object-count");
+  }
+  if (!read_battle_result(world, &result)) return reject_minimal_capture("battle-result");
   const int tick = g_game_state_tick(manager);
   std::size_t used = 0;
   JsonWriter json(buffer, capacity, used);
@@ -288,7 +301,58 @@ bool handle_minimal_run(int socket, const char *command) {
   return true;
 }
 
+// After a stock battle controller update: attach to its battle and buffer a capture.
+void live_controller_updated(void *controller) {
+  constexpr std::int32_t kControllerInBattle = 8;  // controller+0x30 state while a battle runs
+  if (!process_range_is_readable(controller, 0x98) ||
+      read_object_field<std::int32_t>(controller, 0x30) != kControllerInBattle) return;
+  void *const manager = read_object_field<void *>(controller, 0x90);
+  if (!process_range_is_readable(manager, 0xb0)) return;
+  const std::int32_t tick = g_game_state_tick(manager);
+  pthread_mutex_lock(&g_control_mutex);
+  if (manager != g_live_manager.load(std::memory_order_acquire) || tick < g_live_tick) {
+    ++g_live_generation;  // a new battle (a reused address restarts its tick)
+    g_live_manager.store(manager, std::memory_order_release);
+    begin_combat_event_epoch(manager, g_live_generation, g_live_generation);
+    g_live_capture_ok = false;
+    LOGI("live attach controller=%p manager=%p tick=%d", controller, manager, tick);
+  }
+  bind_combat_event_object_manager(manager);
+  if (tick != g_live_tick) {
+    g_live_tick = tick;
+    g_live_capture_ok = build_minimal_capture(g_live_capture, sizeof(g_live_capture), 0, 0);
+  }
+  pthread_mutex_unlock(&g_control_mutex);
+}
+
+bool handle_live_command(int socket, const char *command) {
+  if (std::strncmp(command, "live ", 5) != 0) return false;
+  const char *argument = command + 5;
+  char response[256];
+  pthread_mutex_lock(&g_control_mutex);
+  if (std::strcmp(argument, "on") == 0) {
+    g_live_enabled.store(true, std::memory_order_release);
+  } else if (std::strcmp(argument, "off") == 0) {
+    g_live_enabled.store(false, std::memory_order_release);
+    end_combat_event_epoch(g_live_manager.exchange(nullptr, std::memory_order_acq_rel));
+    g_live_tick = -1;
+    g_live_capture_ok = false;
+  } else if (std::strcmp(argument, "status") != 0) {
+    pthread_mutex_unlock(&g_control_mutex);
+    send_control_error(socket, "live expects on|off|status");
+    return true;
+  }
+  std::snprintf(response, sizeof(response),
+      "{\"ok\":true,\"live\":%s,\"attached\":%s,\"generation\":%llu,\"tick\":%d}",
+      g_live_enabled.load() ? "true" : "false", g_live_manager.load() ? "true" : "false",
+      static_cast<unsigned long long>(g_live_generation), g_live_tick);
+  pthread_mutex_unlock(&g_control_mutex);
+  send_control_response(socket, response);
+  return true;
+}
+
 bool handle_minimal_capture(int socket, const char *command) {
+  if (handle_live_command(socket, command)) return true;
   if (handle_minimal_transition(socket, command)) return true;
   if (handle_minimal_run(socket, command)) return true;
   if (std::strncmp(command, "minimal ", 8) != 0) return false;
@@ -300,6 +364,15 @@ bool handle_minimal_capture(int socket, const char *command) {
   }
   std::unique_ptr<char[]> buffer(new char[65536]());
   pthread_mutex_lock(&g_control_mutex);
+  if (g_live_enabled.load(std::memory_order_acquire)) {
+    // Live: the latest capture from the game thread, with every play of the battle (filter by sequence).
+    const bool live_ok = g_live_capture_ok;
+    if (live_ok) std::memcpy(buffer.get(), g_live_capture, sizeof(g_live_capture));
+    pthread_mutex_unlock(&g_control_mutex);
+    if (live_ok) send_control_response(socket, buffer.get());
+    else send_control_error(socket, "no live battle capture yet");
+    return true;
+  }
   const bool ok = build_minimal_capture(buffer.get(), 65536, generation, cursor);
   pthread_mutex_unlock(&g_control_mutex);
   if (ok) send_control_response(socket, buffer.get());

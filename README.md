@@ -66,6 +66,16 @@ comes from HuggingFace `VanguardX101/IL_Replay`.
    python -m il.play runs/il-001/best.pt data/IL_Replay/replays/part-000051.parquet --games 10
    ```
 
+4. **Play live Nulls Royale battles (Mac).** The probe's live mode reads the battle the game
+   itself runs, so the model gets exactly its training features; cards are played by adb taps
+   (calibrated for the Pixel_9_2 emulator screen, 1080x2424).
+   ```bash
+   python bootstrap_emulator.py --online      # lifts the offline firewall rule
+   python -m il.live runs/il-002/best.pt --deck <our 8 card ids> --games 5   # start each battle in the game
+   ```
+   Test in Training Camp (menu > Training Camp) before ladder. Logs go to `runs/live/`.
+   Not yet: hero ability taps, starting battles automatically.
+
 Tests: `python -m unittest il.test_il`. It needs a smoke cache:
 `python -m native_engine.build_cache data/IL_Replay/replays data/cache-smoke --parts 0 --limit 100`.
 With the engine running, it also checks that the agent's online features equal the cached

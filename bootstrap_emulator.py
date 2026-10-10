@@ -42,7 +42,7 @@ def app_directory(adb, serial):
     return PurePosixPath(base).parent
 
 
-def replace_offline_rule(adb, serial, table, uid):
+def replace_offline_rule(adb, serial, table, uid, offline=True):
     listing = shell(adb, serial, table, "-L", "OUTPUT", "--line-numbers", "-n").stdout
     numbers = [
         int(line.split()[0])
@@ -51,6 +51,8 @@ def replace_offline_rule(adb, serial, table, uid):
     ]
     for number in reversed(numbers):
         shell(adb, serial, table, "-D", "OUTPUT", number)
+    if not offline:
+        return
     shell(
         adb,
         serial,
@@ -113,6 +115,7 @@ def main():
     parser.add_argument("--serial", default="emulator-5554")
     parser.add_argument("--port", type=int, default=DEVICE_PORT)
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--online", action="store_true", help="allow network access (live matches)")
     arguments = parser.parse_args()
 
     adb = shutil.which("adb")
@@ -129,8 +132,8 @@ def main():
     directory = app_directory(adb, arguments.serial)
     verify_engine(adb, arguments.serial, directory, repository)
     uid = shell(adb, arguments.serial, "stat", "-c", "%u", f"/data/user/0/{PACKAGE}").stdout.strip()
-    replace_offline_rule(adb, arguments.serial, "iptables", uid)
-    replace_offline_rule(adb, arguments.serial, "ip6tables", uid)
+    replace_offline_rule(adb, arguments.serial, "iptables", uid, not arguments.online)
+    replace_offline_rule(adb, arguments.serial, "ip6tables", uid, not arguments.online)
     command(adb, arguments.serial, "forward", f"tcp:{arguments.port}", f"tcp:{DEVICE_PORT}")
     shell(adb, arguments.serial, "am", "start", "-n", ACTIVITY)
 
@@ -143,7 +146,7 @@ def main():
     if status.get('mode') != 'headless':
         raise RuntimeError(f"expected a fresh headless runtime, found {status.get('mode')}")
     print(f"Battle engine ready at 127.0.0.1:{arguments.port}")
-    print(f"device={arguments.serial} uid={uid} mode={status.get('mode')}")
+    print(f"device={arguments.serial} uid={uid} mode={status.get('mode')} network={'on' if arguments.online else 'off'}")
 
 
 if __name__ == "__main__":

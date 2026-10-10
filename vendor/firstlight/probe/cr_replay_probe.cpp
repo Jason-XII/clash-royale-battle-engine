@@ -359,6 +359,17 @@ std::atomic<void *> g_native_render_replay_manager{nullptr};
 std::atomic<void *> g_native_render_controller{nullptr};
 std::atomic<void *> g_native_render_manager{nullptr};
 std::atomic<std::int32_t> g_native_render_tick{-1};
+// Live mode: read-only capture of a battle the stock game runs itself (an online match).
+// The battle controller's update builds a `minimal` capture on the game thread after each
+// update (the stock world is only consistent there); `minimal` then serves the latest one.
+// While on, the card-play log follows that battle; do not run headless work at the same time.
+std::atomic<bool> g_live_enabled{false};
+std::atomic<void *> g_live_manager{nullptr};
+std::int32_t g_live_tick = -1;                // the rest is guarded by g_control_mutex
+std::uint64_t g_live_generation = 1ULL << 48; // far from headless generations
+char g_live_capture[65536];
+bool g_live_capture_ok = false;
+void live_controller_updated(void *controller);
 std::uint64_t g_native_render_state_epoch = 0;
 char g_pending_native_command_json[kMaxPendingCommandBytes] = {};
 std::uint64_t g_pending_native_command_sequence = 0;
@@ -5322,7 +5333,11 @@ struct ObservationCaptureIdentity {
 ObservationCaptureIdentity observation_capture_identity_locked() {
   ObservationCaptureIdentity identity;
   identity.mode = static_cast<RunnerMode>(g_runner_mode.load(std::memory_order_acquire));
-  if (identity.mode == RunnerMode::NativeRender) {
+  if (g_live_enabled.load(std::memory_order_acquire)) {
+    identity.manager = g_live_manager.load(std::memory_order_acquire);
+    identity.generation = g_live_generation;
+    identity.state_epoch = g_live_generation;
+  } else if (identity.mode == RunnerMode::NativeRender) {
     identity.manager = g_native_render_manager.load(std::memory_order_acquire);
     identity.generation = g_native_render_request_sequence;
     identity.state_epoch = g_native_render_state_epoch;
@@ -7630,6 +7645,9 @@ void replay_battle_controller_full_update_hook(void *controller, float delta_sec
   std::uint64_t generation = 0;
   if (!is_current_native_controller(controller, &generation)) {
     original(controller, delta_seconds);
+#ifdef CR_MINIMAL_CAPTURE
+    if (g_live_enabled.load(std::memory_order_acquire)) live_controller_updated(controller);
+#endif
     return;
   }
 
