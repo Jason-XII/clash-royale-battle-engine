@@ -5,13 +5,16 @@
 #   cd ~/cr-engine && sbatch tools/collectors.sbatch                          # 30 collectors for runs/ppo-general
 #   RUN=~/cr-engine/runs/other COLLECTORS=16 sbatch tools/collectors.sbatch
 #
+# No GPU is requested: the collectors only need CPU. qos_p107-rtx5090 allows 16 CPUs per user (separate from the
+# A100 job's QoS). qos_stu_cpu_long (32 CPUs) would be better, but its association names the partition 'students'
+# while the partition is 'Students', so Slurm rejects it ("Invalid qos specification") until the admin fixes it.
 #SBATCH --job-name=cr-collect
-#SBATCH --account=stu
-#SBATCH --partition=Students
-#SBATCH --qos=qos_stu_cpu_long
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=120G
-#SBATCH --time=3-00:00:00
+#SBATCH --account=competition
+#SBATCH --partition=P107-RTX5090
+#SBATCH --qos=qos_p107-rtx5090
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=60G
+#SBATCH --time=4-00:00:00
 #SBATCH --output=runs/collect-%j.out
 
 ulimit -u 65536
