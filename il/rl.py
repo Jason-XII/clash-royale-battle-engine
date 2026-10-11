@@ -36,6 +36,8 @@ from .model import INPUT_KEYS, Policy
 from .train import collate
 
 TEMPERATURE = 0.5
+REPLY_TIMEOUT = 180  # s; the learner can be busy with an update (~20 s). A node that dies sends nothing, so a
+                     # collector that waits longer treats the connection as gone and reconnects (il.collect).
 CROWN_REWARD = 0.1
 OVERFLOW_PENALTY = 0.002
 
@@ -104,6 +106,13 @@ def collector(index, args, learner, conn):
     os._exit(0)  # the engine segfaults in its exit-time destructors
 
 
+def receive(conn):
+    """conn.recv(), but a peer that stays silent for REPLY_TIMEOUT counts as gone (a failed node never closes)."""
+    if not conn.poll(REPLY_TIMEOUT):
+        raise EOFError(f'no reply for {REPLY_TIMEOUT} s')
+    return conn.recv()
+
+
 def play_games(index, delay, engine, vocab, learner, conn):
     """Plays the learner's games until it sends None: actions from the decision server (`conn`), games and
     trajectories through the learner (`learner`). Local pipes or TCP connections (il.collect) alike."""
@@ -112,7 +121,7 @@ def play_games(index, delay, engine, vocab, learner, conn):
     from .arena import make_match
     while True:
         learner.send(('new_game', index, None))
-        spec = learner.recv()
+        spec = receive(learner)
         if spec is None:
             break
         match = make_match(spec['decks'], spec['seed'])
@@ -127,7 +136,7 @@ def play_games(index, delay, engine, vocab, learner, conn):
             rows = [{k: v[0, 0].numpy() for k, v in agents[o].observe(state).items()} for o in (0, 1)]
             t1 = time.perf_counter()
             conn.send(('act', index, [((index, o), models[o], rows[o]) for o in (0, 1)]))
-            replies = conn.recv()
+            replies = receive(conn)
             t2 = time.perf_counter()
             timing['features'] += t1 - t0
             timing['wait'] += t2 - t1
@@ -267,10 +276,14 @@ class Server:
         by_model = defaultdict(list)
         for i, (seat, key, row) in enumerate(requests):
             by_model[key].append(i)
+        # every input of the round stacked and copied once; each model then takes its own rows on the device
+        everything = {k: torch.from_numpy(np.stack([r[2][k] for r in requests]))[:, None].to(self.device, non_blocking=True)
+                      for k in INPUT_KEYS}
+        whole = len(by_model) == 1
         for key, idx in by_model.items():
             rows = self._rows([requests[i][0] for i in idx])
-            x = {k: torch.from_numpy(np.stack([requests[i][2][k] for i in idx]))[:, None].to(self.device, non_blocking=True)
-                 for k in INPUT_KEYS}
+            pick = None if whole else torch.tensor(idx, device=self.device)
+            x = everything if whole else {k: v.index_select(0, pick) for k, v in everything.items()}
             # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
             logits, value, (h, c) = self._forward(key, x, self.h[:, rows], self.c[:, rows])
             self.h[:, rows], self.c[:, rows] = h.float(), c.float()

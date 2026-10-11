@@ -174,6 +174,37 @@ class PPOServer(unittest.TestCase):
         self.assertAlmostEqual(value, full[0][0].item(), places=4)
 
 
+    def test_mixed_models_in_one_round(self):
+        """Requests for two models in one round: each model gets exactly its own rows."""
+        from .rl import Server
+        torch.manual_seed(1)
+        shard = D.Shard(CACHE)
+        vocab = D.build_vocab([CACHE])
+        models = {'a': Policy(max(vocab.values()) + 1).eval(), 'b': Policy(max(vocab.values()) + 1).eval()}
+        seqs = [D.sequence(shard[g], g % 2, vocab) for g in range(4)]
+        keys = ['a', 'b', 'b', 'a']
+        T = 8
+        with torch.no_grad():
+            full = [models[keys[g]]({k: torch.as_tensor(s[k][:T])[None] for k in INPUT_KEYS})[1][0] for g, s in enumerate(seqs)]
+        server = Server(models, torch.device('cpu'), models['a'].config['core'])
+        got = [[] for _ in seqs]
+        for t in range(T):
+            reqs = [((g, 0), keys[g], {k: seqs[g][k][t] for k in INPUT_KEYS}) for g in (3, 0, 2, 1)]
+            for g, (_, _, value) in zip((3, 0, 2, 1), server.act(reqs)):
+                got[g].append(value)
+        for g in range(4):
+            self.assertTrue(torch.allclose(torch.tensor(got[g]), full[g], atol=1e-4))
+
+    def test_silent_peer_times_out(self):
+        from . import rl
+        old, rl.REPLY_TIMEOUT = rl.REPLY_TIMEOUT, 0.2
+        try:
+            a, b = __import__('multiprocessing').Pipe()
+            with self.assertRaises(EOFError):
+                rl.receive(a)
+        finally:
+            rl.REPLY_TIMEOUT = old
+
 @unittest.skipUnless(engine_running() and PARQUET.exists(), 'needs the emulator engine and IL_Replay part 0')
 class EngineFeatures(unittest.TestCase):
     def test_agent_sees_what_training_sees(self):
