@@ -746,7 +746,7 @@ def main():
             failed.append(error)
 
     threading.Thread(target=serve_collectors, daemon=True).start()
-    started = last = time.time()
+    started = last = update_end = time.time()
     metrics = open(out / 'metrics.jsonl', 'a')
     for update_index in range(start_update, args.updates):
         # Games keep being played (with the previous weights) while an update runs; PPO's ratio uses the log-probs
@@ -759,7 +759,8 @@ def main():
                 trajectories.append(ready.get(timeout=1))
             except queue.Empty:
                 pass
-        collect_time = time.time() - last  # wall clock since the last update: collection overlaps updates
+        waited = time.time() - update_end  # the learner's wait for this batch after the last update
+        collect_time, last = time.time() - last, time.time()  # wall clock per update: collection overlaps updates
         update_start = time.time()
         model.train()
         stats_row = update(model, reference, optimizer, trajectories, args, device)
@@ -767,7 +768,7 @@ def main():
         publish()
         step = update_index + 1
         save(out / 'latest.pt', model, saved, optimizer, {'update': step})
-        last = time.time()
+        update_end = time.time()
         if step % args.snapshot_every == 0:
             path = out / 'pool' / f'update-{step:05d}.pt'
             save(path, model, saved)
@@ -784,7 +785,7 @@ def main():
                    collector_ms={k: round(1000 * sum(t[k] for t in timed) / decisions, 2) for k in ('features', 'wait', 'engine')},
                    server_s={k: round(served[k] / args.servers, 1) for k in ('receive', 'decide', 'reply')},
                    mean_batch=round(served['requests'] / max(served['batches'], 1), 1),
-                   hours=(time.time() - started) / 3600, collect_s=collect_time, update_s=time.time() - update_start,
+                   hours=(time.time() - started) / 3600, cycle_s=collect_time, wait_s=waited, update_s=time.time() - update_start,
                    steps=int(sum(len(t['action']) for t in trajectories)),
                    plays_per_game=float(np.mean([(t['action'] >= 2).sum() for t in trajectories])),
                    full_elixir=float(np.mean(np.concatenate([t['full'] for t in trajectories]))),

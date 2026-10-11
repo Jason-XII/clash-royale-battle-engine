@@ -118,11 +118,11 @@ towards the IL policy. Decks: real ladder deck pairs with evolutions and the gam
 
 **Throughput** on our allocation (8 physical cores / 16 hyper-threads, one A100): ~9.2k games per hour of wall
 clock before the changes below (the log's `games_per_hour` then left out the PPO update, during which collectors
-stalled). Now the learner keeps receiving games while it trains (`collect_s` and `games_per_hour` are wall clock
-per update), and a server call is one packed input copy, one CUDA graph (state gather, forward, sampling) and one
+stalled). Now the learner keeps receiving games while it trains (`cycle_s`, wall clock per update, and
+`games_per_hour` over it; `wait_s`: how long the learner waited for games after its update), and a server call is one packed input copy, one CUDA graph (state gather, forward, sampling) and one
 copy back per model: 1.7 ms instead of 3.2 ms, and 2.3 ms instead of 9.0 ms when a frozen opponent shares the
 round. Per game, collectors spend ~1.5 CPU-s on features and ~0.8 CPU-s in the engine, so the node's CPUs are the
-next limit; more collectors in a second job (`tools/collectors.sbatch`) add CPUs.
+next limit: ~17.6k games/h measured (35 s per 256 trajectories, the update itself 28 s); more collectors in a second job (`tools/collectors.sbatch`) add CPUs.
 
 ## 4. Evaluation
 
