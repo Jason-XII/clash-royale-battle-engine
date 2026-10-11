@@ -10,6 +10,7 @@ Differences from the probe, each filled to match it:
   - card plays: the probe logs them as consumed; here a card that left a hand between snapshots was played
   - projectile vs area (objects without hitpoints): by the class of the object's data global id
 """
+import ctypes
 import json
 from pathlib import Path
 import resource
@@ -21,6 +22,7 @@ from .engine import Transition
 from .protocol import CardPlay, Entity, HandCard, Player, State
 
 COSTS = {int(k): v for k, v in json.loads(Path(__file__).with_name('card_costs.json').read_text()).items()}
+ENGINE_CPUS = 2  # what the engine is told about the machine: it sized its thread pool from all 128 CPUs (~70 threads)
 WAIT_LIMIT = 60  # ticks a delayed play waits for elixir before it is dropped (ponytail: the game's own limit is unknown)
 PROJECTILE_CLASS = 10  # data global id // 1e6 of LogicProjectileData (the probe checks type 0x0a); measured
 
@@ -40,12 +42,25 @@ def raise_thread_limit():
         resource.setrlimit(resource.RLIMIT_NPROC, (hard if hard == resource.RLIM_INFINITY else min(hard, 1 << 20), hard))
 
 
+def _report_cpus(loader):
+    """Answer the engine's 'how many CPUs' (sysconf, get_nprocs) with ENGINE_CPUS: clapha passes it through to the node,
+    which has 128; each engine only ever uses one core. Registered before boot, when clapha links the engine."""
+    android_nprocessors = (0x60, 0x61)  # _SC_NPROCESSORS_CONF / _ONLN in bionic's numbering
+    passthrough = loader._sysconf
+    loader.shim('sysconf', ctypes.c_long, ctypes.c_int)(
+        lambda name: ENGINE_CPUS if name in android_nprocessors else passthrough(name))
+    loader.shim('get_nprocs', ctypes.c_int)(lambda: ENGINE_CPUS)
+    loader.shim('get_nprocs_conf', ctypes.c_int)(lambda: ENGINE_CPUS)
+
+
 class ClaphaEngine:
     def __init__(self, clapha_dir, workdir=None):
         raise_thread_limit()  # also here, for scripts that start a single engine
         clapha = Path(clapha_dir).expanduser().resolve()
         sys.path.insert(0, str(clapha / 'crx'))
-        from env import CrxEnv  # clapha's crx modules import each other as top-level modules
+        import loader  # clapha's crx modules import each other as top-level modules
+        _report_cpus(loader)
+        from env import CrxEnv
         self.env = CrxEnv(clapha / 'engine', Path(workdir or tempfile.mkdtemp(prefix='clapha-')),
                           str(clapha / 'data' / 'assets'))
         self.state, self.generation, self.sequence, self.pending = None, 0, 0, []
@@ -57,6 +72,9 @@ class ClaphaEngine:
         self.env.create_match(match)
         self.generation += 1
         self.hands, self.pending = None, []
+        r = self.env.reader
+        logic = r.logic(self.env.battle)  # a deck never changes within a battle: read its card ids once
+        self.deck = [[r.card_id(r.card_data(slot)) for slot in r.deck_slots(logic, owner)] for owner in (0, 1)]
         self.env.step(90 - self.env.tick())
         self.state = self._capture()
         return self.state
@@ -84,17 +102,38 @@ class ClaphaEngine:
         self.state = after
         return Transition(after, after.tick - before.tick, tuple(executed))
 
+    def _players(self):
+        """Per owner: ({hand index: (deck slot, card id)}, cycle card ids, elixir raw), with the battle's cached deck
+        (clapha's reader re-reads both decks on every call)."""
+        r = self.env.reader
+        f = r.f
+        logic = r.logic(self.env.battle)
+        out = []
+        for owner in (0, 1):
+            ids = self.deck[owner]
+            player = r.player(logic, owner)
+            data, count = r.vector(player, f['player.hand'], 8)
+            hand = {}
+            for i in range(count):
+                slot = ctypes.c_int32.from_address(data + 4 * i).value
+                if slot >= 0:
+                    hand[i] = (slot, ids[slot])
+            data, count = r.vector(player, f['player.cycle'], 8)
+            cycle = tuple(ids[ctypes.c_int32.from_address(data + 4 * i).value] for i in range(count))
+            out.append((hand, cycle, ctypes.c_int32.from_address(player + f['player.elixir_raw']).value))
+        return out
+
     def _release(self):
         """Hand the plays due on the next tick to the engine, if their card is still there and affordable."""
         now = self.env.tick()
         due = [p for p in self.pending if p['due'] <= now + 1]
         if not due:
             return
-        players = {p['owner']: p for p in self.env.reader.players_state(self.env.battle)}
+        players = self._players()
         for p in due:
-            player = players[p['owner']]
-            in_hand = any(h['handIndex'] == p['slot'] and h['cardId'] == p['card'] for h in player['hand'])
-            if in_hand and player['elixirRaw'] >= p['cost'] * 10000:
+            hand, _, elixir = players[p['owner']]
+            in_hand = hand.get(p['slot'], (None, None))[1] == p['card']
+            if in_hand and elixir >= p['cost'] * 10000:
                 self.env.queue_hand_action_at(SimpleNamespace(owner=p['owner'], hand_index=p['slot'], x=p['x'],
                                                               y=p['y']), execute_tick=now + 1)
             elif in_hand and now + 1 < p['until']:
@@ -112,30 +151,28 @@ class ClaphaEngine:
     # ---- snapshot -> State --------------------------------------------------------------------------------------------
     def _capture(self):
         env = self.env
-        snap = env.observe()
+        objects = env.reader.objects(env.battle)
+        crowns, ended, winner = env._result(objects)
+        tick = env.tick()
         players, plays, hands = [], [], {}
-        for p in sorted(snap['players'], key=lambda p: p['owner']):
-            hand = {h['handIndex']: h for h in p['hand']}
-            hands[p['owner']] = {i: h['cardId'] for i, h in hand.items()}
-            players.append(Player(p['owner'], p['elixirRaw'],
-                                  tuple(HandCard(i, h['cardId'], self._cost(p['owner'], h), 0, h['cardId'])
-                                        for i, h in sorted(hand.items())),
-                                  tuple(c['cardId'] for c in p['cycle'])))
+        for owner, (hand, cycle, elixir) in enumerate(self._players()):
+            hands[owner] = {i: card for i, (_, card) in hand.items()}
+            players.append(Player(owner, elixir, tuple(HandCard(i, card, self._cost(owner, slot, card), 0, card)
+                                                       for i, (slot, card) in sorted(hand.items())), cycle))
             if self.hands is not None:  # a card that left its slot since the last snapshot was played
-                for i, card in self.hands[p['owner']].items():
-                    if hands[p['owner']].get(i) != card:
+                for i, card in self.hands[owner].items():
+                    if hands[owner].get(i) != card:
                         self.sequence += 1
-                        plays.append(CardPlay(self.sequence, snap['tick'], p['owner'], card,
-                                              COSTS.get(card, -1)))
+                        plays.append(CardPlay(self.sequence, tick, owner, card, COSTS.get(card, -1)))
         self.hands = hands
-        entities = tuple(self._entity(o) for o in snap['objects'])
-        return State(self.generation, snap['tick'], bool(snap['ended']), snap['winner'], tuple(snap['crownsRaw']),
+        entities = tuple(self._entity(o) for o in objects)
+        return State(self.generation, tick, bool(ended), winner, (crowns[0], crowns[1]),
                      tuple(players), entities, tuple(plays), self.sequence + 1)
 
-    def _cost(self, owner, hand_card):
-        cost = COSTS.get(hand_card['cardId'])
+    def _cost(self, owner, deck_slot, card):
+        cost = COSTS.get(card)
         if cost is None:  # variable cost (Mirror, ...) or unseen card: the engine's own selection
-            chosen = self.env._selection(owner, hand_card['deckSlot'])
+            chosen = self.env._selection(owner, deck_slot)
             cost = chosen[1] >> 28 if chosen else -1
         return cost
 
