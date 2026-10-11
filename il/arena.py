@@ -34,6 +34,21 @@ def decks(cache, count, seed):
     return [pairs[i] for i in rng.choice(len(pairs), count, replace=count > len(pairs))]
 
 
+LEVEL = 16  # 75% of IL_Replay games: lvlcap = cardlvlmin = 16 (the rest 11); level 1 put towers far out of the data
+
+
+def make_match(decks, seed):
+    """A native match for two 8-card decks at ladder levels (the template alone plays everything at level 1)."""
+    match = json.loads((Path(__file__).parents[1] / 'standard_match.json').read_text())
+    battle = match['battle']
+    battle['lvlcap'] = battle['cardlvlmin'] = LEVEL
+    for owner in (0, 1):
+        battle[f'deck{owner}']['sp'] = [{'d': c} for c in decks[owner]]
+        battle[f'avatar{owner}']['expLevel'] = LEVEL
+    match['rndSeed'] = seed
+    return match
+
+
 def worker(index, args, jobs, out):
     log = os.open(f'runs/arena-logs/worker-{index}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     os.dup2(log, 1)
@@ -46,12 +61,8 @@ def worker(index, args, jobs, out):
     torch.set_num_threads(1)
     engine = ClaphaEngine(args.clapha)
     models = [load(args.a), load(args.b)]
-    template = json.loads((Path(__file__).parents[1] / 'standard_match.json').read_text())
-    for game, (deck0, deck1) in jobs:
-        match = json.loads(json.dumps(template))
-        match['battle']['deck0']['sp'] = [{'d': c} for c in deck0]
-        match['battle']['deck1']['sp'] = [{'d': c} for c in deck1]
-        match['rndSeed'] = game + 1
+    for game, pair in jobs:
+        match = make_match(pair, game + 1)
         a_owner = game % 2
         agents = [Agent(*models[0 if owner == a_owner else 1], owner, decode=args.decode) for owner in (0, 1)]
         state = engine.reset(match=match)

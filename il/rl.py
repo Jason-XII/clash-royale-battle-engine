@@ -89,18 +89,15 @@ def collector(index, args, conn):
     from native_engine import Play
     from native_engine.clapha import ClaphaEngine
     from .agent import Agent
+    from .arena import make_match
     engine = ClaphaEngine(args.clapha)
     vocab = D.load_vocab(Path(args.out) / 'vocab.json')
-    template = json.loads((Path(__file__).parents[1] / 'standard_match.json').read_text())
     while True:
         conn.send(('new_game', index, None))
         spec = conn.recv()
         if spec is None:
             break
-        match = json.loads(json.dumps(template))
-        match['battle']['deck0']['sp'] = [{'d': c} for c in spec['decks'][0]]
-        match['battle']['deck1']['sp'] = [{'d': c} for c in spec['decks'][1]]
-        match['rndSeed'] = spec['seed']
+        match = make_match(spec['decks'], spec['seed'])
         models = spec['models']  # per seat: 'current' or a frozen opponent's key
         agents = [Agent(None, vocab, owner) for owner in (0, 1)]
         steps = [defaultdict(list) for _ in (0, 1)]
