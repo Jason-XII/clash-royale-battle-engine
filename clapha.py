@@ -21,6 +21,7 @@ from .engine import Transition
 from .protocol import CardPlay, Entity, HandCard, Player, State
 
 COSTS = {int(k): v for k, v in json.loads(Path(__file__).with_name('card_costs.json').read_text()).items()}
+WAIT_LIMIT = 60  # ticks a delayed play waits for elixir before it is dropped (ponytail: the game's own limit is unknown)
 PROJECTILE_CLASS = 10  # data global id // 1e6 of LogicProjectileData (the probe checks type 0x0a); measured
 
 
@@ -41,7 +42,7 @@ class ClaphaEngine:
         from env import CrxEnv  # clapha's crx modules import each other as top-level modules
         self.env = CrxEnv(clapha / 'engine', Path(workdir or tempfile.mkdtemp(prefix='clapha-')),
                           str(clapha / 'data' / 'assets'))
-        self.state, self.generation, self.sequence = None, 0, 0
+        self.state, self.generation, self.sequence, self.pending = None, 0, 0, []
 
     def reset(self, seed=1, match=None):
         if match is None:
@@ -49,23 +50,50 @@ class ClaphaEngine:
             match['rndSeed'] = seed
         self.env.create_match(match)
         self.generation += 1
-        self.hands = None
+        self.hands, self.pending = None, []
         self.env.step(90 - self.env.tick())
         self.state = self._capture()
         return self.state
 
-    def step(self, actions=(), ticks=5):
+    def step(self, actions=(), ticks=5, delay=0):
+        """Plays decided on the current state land `delay` ticks later (live: il.data.DEPLOY_DELAY), or on the
+        next tick with delay=0. As in the live game, a play that is not affordable when due waits for elixir
+        (up to WAIT_LIMIT ticks), and, as il.live does, a player with a play in flight cannot start another.
+        `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
         before = self.state
-        actions = tuple(actions)
+        executed = []
         for a in actions:
-            self.env.queue_hand_action_at(SimpleNamespace(owner=a.owner, hand_index=a.slot, x=a.x, y=a.y),
-                                          execute_tick=before.tick + 1)
-        self.env.step(ticks)
+            card = next((h for h in before.players[a.owner].hand if h.slot == a.slot), None)
+            ok = card is not None and all(p['owner'] != a.owner for p in self.pending)
+            if ok:
+                due = before.tick + max(delay, 1)
+                self.pending.append(dict(due=due, until=due + WAIT_LIMIT, owner=a.owner, slot=a.slot,
+                                         card=card.card, cost=card.cost, x=a.x, y=a.y))
+            executed.append(ok)
+        for _ in range(ticks):
+            if self.pending:
+                self._release()
+            self.env.step(1)
         after = self._capture()
-        played = {p.owner for p in after.plays}
-        executed = tuple(a.owner in played for a in actions)  # ponytail: one play per owner per step, as Engine
         self.state = after
-        return Transition(after, after.tick - before.tick, executed)
+        return Transition(after, after.tick - before.tick, tuple(executed))
+
+    def _release(self):
+        """Hand the plays due on the next tick to the engine, if their card is still there and affordable."""
+        now = self.env.tick()
+        due = [p for p in self.pending if p['due'] <= now + 1]
+        if not due:
+            return
+        players = {p['owner']: p for p in self.env.reader.players_state(self.env.battle)}
+        for p in due:
+            player = players[p['owner']]
+            in_hand = any(h['handIndex'] == p['slot'] and h['cardId'] == p['card'] for h in player['hand'])
+            if in_hand and player['elixirRaw'] >= p['cost'] * 10000:
+                self.env.queue_hand_action_at(SimpleNamespace(owner=p['owner'], hand_index=p['slot'], x=p['x'],
+                                                              y=p['y']), execute_tick=now + 1)
+            elif in_hand and now + 1 < p['until']:
+                continue  # wait for elixir
+            self.pending.remove(p)
 
     def run(self, ticks, count):
         states = []
