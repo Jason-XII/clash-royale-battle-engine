@@ -103,10 +103,17 @@ def collector(index, args, conn):
         steps = [defaultdict(list) for _ in (0, 1)]
         state = engine.reset(match=match)
         crowns = (0, 0)
+        timing = defaultdict(float)  # seconds per part of a decision, for the learner's log
         while True:
+            t0 = time.perf_counter()
             rows = [{k: v[0, 0].numpy() for k, v in agents[o].observe(state).items()} for o in (0, 1)]
+            t1 = time.perf_counter()
             conn.send(('act', index, [((index, o), models[o], rows[o]) for o in (0, 1)]))
             replies = conn.recv()
+            t2 = time.perf_counter()
+            timing['features'] += t1 - t0
+            timing['wait'] += t2 - t1
+            timing['decisions'] += 1
             plays = []
             for o, (action, logp, value) in enumerate(replies):
                 full = state.players[o].elixir >= 100000
@@ -124,8 +131,10 @@ def collector(index, args, conn):
                     plays.append(Play(o, int(slot), int(x), int(y)))
             if state.finalized or state.tick >= 7200:
                 break
+            t3 = time.perf_counter()
             transition = engine.step(plays, 5, delay=args.delay)
             state = transition.state
+            timing['engine'] += time.perf_counter() - t3
             for o in (0, 1):  # crowns taken minus crowns lost since the last decision
                 gained = (state.crowns[o] - crowns[o]) - (state.crowns[1 - o] - crowns[1 - o])
                 steps[o]['reward'][-1] += CROWN_REWARD * gained
@@ -135,7 +144,8 @@ def collector(index, args, conn):
             steps[o]['reward'][-1] += outcome
             if models[o] == 'current':
                 trajectory = {k: np.array(v) for k, v in steps[o].items()}
-                conn.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o])))
+                conn.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o], timing=timing)))
+                timing = {}  # counted once per game
         conn.send(('reset', index, [(index, 0), (index, 1)]))
     conn.close()
     os._exit(0)  # the engine segfaults in its exit-time destructors
@@ -307,7 +317,9 @@ def main():
     metrics = open(out / 'metrics.jsonl', 'a')
     for update_index in range(start, args.updates):
         collect_start = time.time()
+        serve = defaultdict(float)
         while len(buffer) < args.games_per_update:
+            t0 = time.perf_counter()
             requests, owners = [], []
             for conn in wait(conns, timeout=1):
                 try:
@@ -334,12 +346,19 @@ def main():
                     played += 1
                 elif kind == 'reset':
                     server.reset(payload)
+            t1 = time.perf_counter()
+            serve['receive'] += t1 - t0
             if requests:
                 replies = server.act(requests)
+                t2 = time.perf_counter()
+                serve['decide'] += t2 - t1
+                serve['batches'] += 1
+                serve['requests'] += len(requests)
                 k = 0
                 for conn, n in owners:
                     conn.send(replies[k:k + n])
                     k += n
+                serve['reply'] += time.perf_counter() - t2
         collect_time = time.time() - collect_start
         trajectories, buffer = buffer[:args.games_per_update], buffer[args.games_per_update:]
         update_start = time.time()
@@ -354,7 +373,13 @@ def main():
             frozen[path.stem] = load_policy(path, device)[0].eval()
             server.models[path.stem] = frozen[path.stem]
         outcomes = [t['outcome'] for t in trajectories if t['opponent'] != 'current']
-        row = dict(update=step, trajectories=played, hours=(time.time() - started) / 3600,
+        timed = [t['timing'] for t in trajectories if t['timing']]
+        decisions = sum(t['decisions'] for t in timed) or 1
+        per_decision = {k: round(1000 * sum(t[k] for t in timed) / decisions, 2) for k in ('features', 'wait', 'engine')}
+        games_per_hour = 3600 * len(timed) / max(collect_time, 1e-9)
+        learner_s = {k: round(serve[k], 1) for k in ('receive', 'decide', 'reply')}
+        row = dict(update=step, trajectories=played, games_per_hour=round(games_per_hour),
+                   collector_ms=per_decision, learner_s=learner_s, mean_batch=round(serve['requests'] / max(serve['batches'], 1), 1), hours=(time.time() - started) / 3600,
                    collect_s=collect_time, update_s=time.time() - update_start,
                    steps=int(sum(len(t['action']) for t in trajectories)),
                    plays_per_game=float(np.mean([(t['action'] >= 2).sum() for t in trajectories])),
