@@ -262,7 +262,8 @@ def main():
     parser.add_argument('--value-coef', type=float, default=0.5)
     parser.add_argument('--entropy', type=float, default=0.002)
     parser.add_argument('--kl-coef', type=float, default=0.05)
-    parser.add_argument('--cache', default='data/cache', help='deck pairs are drawn from these human games')
+    parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (tools/build_deck_pool.py)')
+    parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
     out = Path(args.out)
@@ -271,8 +272,8 @@ def main():
     resume = out / 'latest.pt'
     _, saved = load_policy(resume if resume.exists() else args.init, 'cpu')
     (out / 'vocab.json').write_text(json.dumps({str(k): v for k, v in saved['vocab'].items()}))
-    from .arena import decks
-    deck_pairs = decks(args.cache, 20000, seed=random.randrange(1 << 20))
+    from .arena import deck_pairs as sample_decks
+    deck_pairs = sample_decks(args.pool, args.cache, 30000, seed=random.randrange(1 << 20))
 
     # Collectors first: fork before CUDA starts in this process.
     ctx = mp.get_context('fork')

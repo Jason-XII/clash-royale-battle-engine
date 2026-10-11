@@ -38,17 +38,34 @@ def decks(cache, count, seed):
 LEVEL = 16  # 75% of IL_Replay games: lvlcap = cardlvlmin = 16 (the rest 11); level 1 put towers far out of the data
 
 
-def make_match(decks, seed):
-    """A native match for two 8-card decks at ladder levels (the template alone plays everything at level 1)."""
+def make_match(pair, seed):
+    """A native match. `pair` is a deck pool entry (tools/build_deck_pool.py: cards with their evolution flags and
+    the real game's levels) or two lists of 8 card ids (no evolutions, all at LEVEL). The template alone plays
+    everything at level 1; the king tower level is separate (human games: 7728 hp at 16; level 1: 2400)."""
     match = json.loads((Path(__file__).parents[1] / 'standard_match.json').read_text())
     battle = match['battle']
-    battle['lvlcap'] = battle['cardlvlmin'] = LEVEL
+    if isinstance(pair, dict):
+        sp, cap, card_min, kt, exp = pair['decks'], pair['lvlcap'], pair['cardlvlmin'], pair['kt'], pair['exp']
+    else:
+        sp, cap, card_min, kt, exp = [[{'d': c} for c in d] for d in pair], LEVEL, LEVEL, [LEVEL] * 2, [LEVEL] * 2
+    battle['lvlcap'], battle['cardlvlmin'] = cap, card_min
     for owner in (0, 1):
-        battle[f'deck{owner}']['sp'] = [{'d': c} for c in decks[owner]]  # ponytail: no evolutions ('el')
-        battle[f'avatar{owner}']['expLevel'] = LEVEL
-        battle['hbd'][owner]['kt'] = LEVEL  # king tower level (human games: 7728 hp at 16; the template's 1: 2400)
+        battle[f'deck{owner}']['sp'] = sp[owner]
+        battle[f'avatar{owner}']['expLevel'] = exp[owner]
+        battle['hbd'][owner]['kt'] = kt[owner]
     match['rndSeed'] = seed
     return match
+
+
+def deck_pairs(pool, cache, count, seed):
+    """Deck pairs for `count` games: from the deck pool file when it exists (evolutions, real levels), else from
+    the cache (card ids only, LEVEL, no evolutions)."""
+    if pool and Path(pool).exists():
+        entries = json.loads(Path(pool).read_text())
+        rng = np.random.default_rng(seed)
+        return [entries[i] for i in rng.choice(len(entries), count, replace=count > len(entries))]
+    print(f'no deck pool at {pool}: cached decks without evolutions', flush=True)
+    return decks(cache, count, seed)
 
 
 def worker(index, args, jobs, out):
@@ -95,19 +112,21 @@ def main():
     parser.add_argument('--procs', type=int, default=16)
     parser.add_argument('--delay', type=int, default=D.DEPLOY_DELAY, help='decision -> landing ticks (0: instant)')
     parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
-    parser.add_argument('--deck', help='8 comma-separated card ids: both players use this deck (mirror match) '
-                        'instead of cached human deck pairs')
-    parser.add_argument('--cache', default='data/cache')
+    parser.add_argument('--deck', help='8 comma-separated cards, id or id:el (el = evolution flag as in replays): '
+                        'both players use this deck at level 16 (mirror match)')
+    parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (tools/build_deck_pool.py)')
+    parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', default='runs/arena.jsonl')
     args = parser.parse_args()
     os.makedirs('runs/arena-logs', exist_ok=True)
     if args.deck:
-        deck = [int(c) for c in args.deck.split(',')]
+        deck = [dict(zip(('d', 'el'), map(int, c.split(':')))) for c in args.deck.split(',')]
         assert len(deck) == 8, 'a deck has 8 cards'
-        pairs = [(g, [deck, deck]) for g in range(args.games)]
+        mirror = {'decks': [deck, deck], 'lvlcap': LEVEL, 'cardlvlmin': LEVEL, 'kt': [LEVEL] * 2, 'exp': [LEVEL] * 2}
+        pairs = [(g, mirror) for g in range(args.games)]
     else:
-        pairs = list(enumerate(decks(args.cache, args.games, args.seed)))
+        pairs = list(enumerate(deck_pairs(args.pool, args.cache, args.games, args.seed)))
     ctx = mp.get_context('fork')
     out = ctx.Queue()
     workers = [ctx.Process(target=worker, args=(i, args, pairs[i::args.procs], out)) for i in range(args.procs)]
