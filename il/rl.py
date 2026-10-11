@@ -161,10 +161,22 @@ def load_policy(path, device):
 
 
 class Server:
-    """Batched decisions for every collector, with per-seat LSTM state."""
+    """Batched decisions for every collector. Each seat's LSTM state lives in one row of a preallocated GPU
+    tensor (gathered and written back by index); results come back to the CPU in one transfer per call."""
 
-    def __init__(self, models, device):
-        self.models, self.device, self.states = models, device, {}
+    def __init__(self, models, device, core):
+        self.models, self.device, self.core = models, device, core
+        self.rows = {}  # seat -> row in self.h / self.c
+        self.h = self.c = torch.zeros(1, 0, core, device=device)
+
+    def _rows(self, seats):
+        for seat in seats:
+            if seat not in self.rows:
+                self.rows[seat] = len(self.rows)
+        if len(self.rows) > self.h.shape[1]:  # grow, keeping the existing rows
+            grow = torch.zeros(1, max(64, len(self.rows)), self.core, device=self.device)
+            self.h, self.c = torch.cat([self.h, grow], 1), torch.cat([self.c, grow.clone()], 1)
+        return torch.tensor([self.rows[seat] for seat in seats], device=self.device)
 
     @torch.no_grad()
     def act(self, requests):
@@ -174,24 +186,28 @@ class Server:
         for i, (seat, key, row) in enumerate(requests):
             by_model[key].append(i)
         for key, idx in by_model.items():
-            model = self.models[key]
-            x = {k: torch.from_numpy(np.stack([requests[i][2][k] for i in idx]))[:, None].to(self.device)
+            rows = self._rows([requests[i][0] for i in idx])
+            x = {k: torch.from_numpy(np.stack([requests[i][2][k] for i in idx]))[:, None].to(self.device, non_blocking=True)
                  for k in INPUT_KEYS}
-            zero = model.initial_state(1, self.device)
-            h = torch.cat([self.states.get(requests[i][0], zero)[0] for i in idx], 1)
-            c = torch.cat([self.states.get(requests[i][0], zero)[1] for i in idx], 1)
-            logits, value, (h, c) = model(x, (h, c))
+            # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
+            with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda'):
+                logits, value, (h, c) = self.models[key](x, (self.h[:, rows], self.c[:, rows]))
+            self.h[:, rows], self.c[:, rows] = h.float(), c.float()
             dist = distribution(logits[:, 0])
             action = sample(dist)
-            logp = log_prob(dist, action)
+            result = torch.stack([action.float(), log_prob(dist, action), value[:, 0].float()], 1).cpu().tolist()
             for j, i in enumerate(idx):
-                self.states[requests[i][0]] = (h[:, j:j + 1], c[:, j:j + 1])
-                out[i] = (int(action[j]), float(logp[j]), float(value[j, 0]))
+                a, logp, v = result[j]
+                out[i] = (int(a), logp, v)
         return out
 
     def reset(self, seats):
-        for seat in seats:
-            self.states.pop(seat, None)
+        """A seat's game ended: its next game starts from a zero LSTM state."""
+        known = [seat for seat in seats if seat in self.rows]
+        if known:
+            rows = torch.tensor([self.rows[seat] for seat in known], device=self.device)
+            self.h[:, rows] = 0
+            self.c[:, rows] = 0
 
 
 def advantages(trajectory, gamma, lam):
@@ -309,7 +325,7 @@ def main():
     start = saved.get('update', 0)
     pool = {'il': args.init, **{p.stem: str(p) for p in sorted((out / 'pool').glob('*.pt'))}}
     frozen = {k: load_policy(v, device)[0].eval() for k, v in pool.items()}
-    server = Server({'current': model.eval(), **frozen}, device)
+    server = Server({'current': model.eval(), **frozen}, device, model.config['core'])
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> recent learner outcomes
 
     def pick_opponent():

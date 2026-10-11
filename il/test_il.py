@@ -146,6 +146,34 @@ class PPODistribution(unittest.TestCase):
         self.assertFalse((actions == D.ABILITY).any())
 
 
+@unittest.skipUnless(CACHE.exists(), 'build data/cache-smoke first')
+class PPOServer(unittest.TestCase):
+    """il.rl.Server keeps every seat's LSTM state apart: interleaved seats see what one full-sequence pass sees."""
+
+    def test_interleaved_seats_match_full_sequences(self):
+        from .rl import Server
+        torch.manual_seed(0)
+        shard = D.Shard(CACHE)
+        vocab = D.build_vocab([CACHE])
+        model = Policy(max(vocab.values()) + 1).eval()
+        seqs = [D.sequence(shard[g], g % 2, vocab) for g in range(3)]
+        T = 12
+        with torch.no_grad():
+            full = [model({k: torch.as_tensor(s[k][:T])[None] for k in INPUT_KEYS})[1][0] for s in seqs]
+        server = Server({'current': model}, torch.device('cpu'), model.config['core'])
+        got = [[] for _ in seqs]
+        for t in range(T):
+            order = [2, 0, 1] if t % 2 else [0, 1, 2]  # requests arrive in varying order
+            reqs = [((g, 0), 'current', {k: seqs[g][k][t] for k in INPUT_KEYS}) for g in order]
+            for g, (_, _, value) in zip(order, server.act(reqs)):
+                got[g].append(value)
+        for g in range(3):
+            self.assertTrue(torch.allclose(torch.tensor(got[g]), full[g], atol=1e-4))
+        server.reset([(0, 0)])  # a new game for seat 0 starts from zero state again
+        _, _, value = server.act([((0, 0), 'current', {k: seqs[0][k][0] for k in INPUT_KEYS})])[0]
+        self.assertAlmostEqual(value, full[0][0].item(), places=4)
+
+
 @unittest.skipUnless(engine_running() and PARQUET.exists(), 'needs the emulator engine and IL_Replay part 0')
 class EngineFeatures(unittest.TestCase):
     def test_agent_sees_what_training_sees(self):
