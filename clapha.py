@@ -12,6 +12,7 @@ Differences from the probe, each filled to match it:
 """
 import json
 from pathlib import Path
+import resource
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -30,6 +31,11 @@ def _ms(value):
 
 class ClaphaEngine:
     def __init__(self, clapha_dir, workdir=None):
+        # Each engine starts ~70 threads; a cluster's default 1024 threads per user (ulimit -u) stops ~14
+        # engines with a SIGABRT at boot. The soft limit may be raised to the hard one without privileges.
+        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        if soft != resource.RLIM_INFINITY and (hard == resource.RLIM_INFINITY or hard > soft):
+            resource.setrlimit(resource.RLIMIT_NPROC, (hard if hard == resource.RLIM_INFINITY else min(hard, 1 << 20), hard))
         clapha = Path(clapha_dir).expanduser().resolve()
         sys.path.insert(0, str(clapha / 'crx'))
         from env import CrxEnv  # clapha's crx modules import each other as top-level modules
