@@ -164,7 +164,7 @@ def main():
     parser.add_argument('--deck', help='card ids only our deck has (up to all 8), comma separated')
     parser.add_argument('--owner', type=int, choices=(0, 1), help='our native seat (mirror matches)')
     parser.add_argument('--games', type=int, default=1)
-    parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
+    parser.add_argument('--decode', choices=('gate', 'sample', 'argmax', 'policy'), default='gate')
     parser.add_argument('--port', type=int, default=26789)
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each game')

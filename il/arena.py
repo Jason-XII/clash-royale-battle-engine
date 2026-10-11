@@ -69,7 +69,7 @@ def deck_pairs(pool, cache, count, seed):
 
 
 def worker(index, args, jobs, out):
-    log = os.open(f'runs/arena-logs/worker-{index}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    log = os.open(f'{args.logs}/worker-{index}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     os.dup2(log, 1)
     os.dup2(log, 2)
     time.sleep(index // 4 * 8)  # boot 4 engines at a time
@@ -103,6 +103,48 @@ def worker(index, args, jobs, out):
     os._exit(0)  # the engine segfaults in its exit-time destructors
 
 
+def mirror(deck_text):
+    """A deck pool entry where both players use one deck at LEVEL: 8 comma-separated cards, id or id:el."""
+    deck = [dict(zip(('d', 'el'), map(int, c.split(':')))) for c in deck_text.split(',')]
+    assert len(deck) == 8, 'a deck has 8 cards'
+    return {'decks': [deck, deck], 'lvlcap': LEVEL, 'cardlvlmin': LEVEL, 'kt': [LEVEL] * 2, 'exp': [LEVEL] * 2}
+
+
+def run(clapha, a, b, pairs, procs=16, delay=D.DEPLOY_DELAY, decode='gate', out=None, report_every=20, logs='runs/arena-logs'):
+    """Plays A against B on `pairs` [(game index, deck pair)] across `procs` engines; returns the game records."""
+    from native_engine.clapha import raise_thread_limit
+    raise_thread_limit()  # before any engine process starts, so every process gets it
+    os.makedirs(logs, exist_ok=True)
+    args = argparse.Namespace(clapha=clapha, a=a, b=b, delay=delay, decode=decode, logs=logs)
+    ctx = mp.get_context('fork')
+    q = ctx.Queue()
+    workers = [ctx.Process(target=worker, args=(i, args, pairs[i::procs], q)) for i in range(procs)]
+    for w in workers:
+        w.start()
+    results, live = [], set(range(procs))
+    f = open(out, 'a') if out else None
+    while live:
+        try:
+            kind, index, value = q.get(timeout=5)
+        except queue.Empty:
+            for i in [i for i in live if workers[i].exitcode is not None]:
+                print(f'worker {i} died (exit {workers[i].exitcode}); see {logs}/worker-{i}.log', flush=True)
+                live.discard(i)
+            continue
+        if kind == 'done':
+            live.discard(index)
+            continue
+        results.append(value)
+        if f:
+            f.write(json.dumps(dict(value, a=a, b=b, delay=delay)) + '\n')
+            f.flush()
+        if report_every and len(results) % report_every == 0:
+            report(results)
+    if f:
+        f.close()
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('clapha')
@@ -111,7 +153,8 @@ def main():
     parser.add_argument('--games', type=int, default=400)
     parser.add_argument('--procs', type=int, default=16)
     parser.add_argument('--delay', type=int, default=D.DEPLOY_DELAY, help='decision -> landing ticks (0: instant)')
-    parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
+    parser.add_argument('--decode', choices=('gate', 'sample', 'argmax', 'policy'), default='gate',
+                        help="policy: il.rl's training policy (wait with p(wait), else card x cell at its temperature)")
     parser.add_argument('--deck', help='8 comma-separated cards, id or id:el (el = evolution flag as in replays): '
                         'both players use this deck at level 16 (mirror match)')
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (tools/build_deck_pool.py)')
@@ -119,51 +162,34 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', default='runs/arena.jsonl')
     args = parser.parse_args()
-    os.makedirs('runs/arena-logs', exist_ok=True)
-    from native_engine.clapha import raise_thread_limit
-    raise_thread_limit()  # before any engine process starts, so every process (the learner too) gets it
     if args.deck:
-        deck = [dict(zip(('d', 'el'), map(int, c.split(':')))) for c in args.deck.split(',')]
-        assert len(deck) == 8, 'a deck has 8 cards'
-        mirror = {'decks': [deck, deck], 'lvlcap': LEVEL, 'cardlvlmin': LEVEL, 'kt': [LEVEL] * 2, 'exp': [LEVEL] * 2}
-        pairs = [(g, mirror) for g in range(args.games)]
+        pairs = [(g, mirror(args.deck)) for g in range(args.games)]
     else:
         pairs = list(enumerate(deck_pairs(args.pool, args.cache, args.games, args.seed)))
-    ctx = mp.get_context('fork')
-    out = ctx.Queue()
-    workers = [ctx.Process(target=worker, args=(i, args, pairs[i::args.procs], out)) for i in range(args.procs)]
-    for w in workers:
-        w.start()
-    results, live = [], set(range(args.procs))
-    with open(args.out, 'a') as f:
-        while live:
-            try:
-                kind, index, value = out.get(timeout=5)
-            except queue.Empty:
-                for i in [i for i in live if workers[i].exitcode is not None]:
-                    print(f'worker {i} died (exit {workers[i].exitcode}); see runs/arena-logs/worker-{i}.log', flush=True)
-                    live.discard(i)
-                continue
-            if kind == 'done':
-                live.discard(index)
-                continue
-            results.append(value)
-            f.write(json.dumps(dict(value, a=args.a, b=args.b, delay=args.delay)) + '\n')
-            if len(results) % 20 == 0:
-                report(results, args)
-    report(results, args)
+    report(run(args.clapha, args.a, args.b, pairs, args.procs, args.delay, args.decode, args.out))
 
 
-def report(results, args):
+def summary(results):
+    """Score of A with a 95% interval, and how the games went (both sides' activity included)."""
     n = len(results)
     a = sum(r['winner'] == 'A' for r in results)
     b = sum(r['winner'] == 'B' for r in results)
     score = (a + 0.5 * (n - a - b)) / n
-    half = 1.96 * math.sqrt(score * (1 - score) / n)
     mean = lambda k: sum(r[k] for r in results) / n
-    print(f'{n} games: A {a} wins, B {b} wins, {n - a - b} draws | A scores {score:.1%} +/- {half:.1%} | '
-          f'crowns A {mean("crowns_a"):.2f} B {mean("crowns_b"):.2f} | plays A {mean("plays_a"):.1f} '
-          f'B {mean("plays_b"):.1f} | {mean("seconds"):.1f} s/game', flush=True)
+    minutes = sum(max(r['tick'] - 90, 1) for r in results) / 1200
+    ticks = sorted(r['tick'] for r in results)
+    return dict(games=n, a_wins=a, b_wins=b, score=round(score, 4), ci95=round(1.96 * math.sqrt(score * (1 - score) / n), 4),
+                crowns_a=round(mean('crowns_a'), 2), crowns_b=round(mean('crowns_b'), 2),
+                plays_per_min_a=round(sum(r['plays_a'] for r in results) / minutes, 2),
+                plays_per_min_b=round(sum(r['plays_b'] for r in results) / minutes, 2),
+                median_tick=ticks[n // 2], three_crowns=round(sum(max(r['crowns_a'], r['crowns_b']) == 3 for r in results) / n, 3))
+
+
+def report(results):
+    s = summary(results)
+    print(f"{s['games']} games: A {s['a_wins']} wins, B {s['b_wins']} wins | A scores {s['score']:.1%} +/- {s['ci95']:.1%} | "
+          f"crowns A {s['crowns_a']} B {s['crowns_b']} | plays/min A {s['plays_per_min_a']} B {s['plays_per_min_b']} | "
+          f"median tick {s['median_tick']}, 3-crowns {s['three_crowns']:.0%}", flush=True)
 
 
 if __name__ == '__main__':

@@ -47,7 +47,7 @@ def main():
     parser.add_argument('checkpoint', type=Path)
     parser.add_argument('replays', type=Path, help='a parquet part; its decks are used')
     parser.add_argument('--games', type=int, default=2)
-    parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
+    parser.add_argument('--decode', choices=('gate', 'sample', 'argmax', 'policy'), default='gate')
     parser.add_argument('--port', type=int, default=26789)
     parser.add_argument('--render', action='store_true', help='draw in the game UI at real-time speed')
     args = parser.parse_args()

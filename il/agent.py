@@ -17,6 +17,7 @@ class Agent:
     """One player. `act(state)` returns ('wait',), ('ability',) or ('card', slot, x, y) in world units.
 
     decode: 'gate'   - play with probability 1 - p(wait), then the best card/cell/ability (default)
+            'policy' - il.rl's PPO policy: wait with p(wait), else card x cell sampled at its temperature
             'sample' - sample the whole joint action
             'argmax' - joint argmax; almost never plays, because a decision to play is spread
                        over hundreds of card x cell options while WAIT is a single option
@@ -44,7 +45,10 @@ class Agent:
     def act(self, state):
         logits, value, self.lstm = self.model(self.observe(state), self.lstm)
         logits = logits[0, 0].float()
-        if self.decode == 'sample':
+        if self.decode == 'policy':  # il.rl's training policy
+            from .rl import distribution, sample
+            action = int(sample(distribution(logits[None]))[0])
+        elif self.decode == 'sample':
             action = int(torch.distributions.Categorical(logits=logits).sample())
         elif self.decode == 'argmax':
             action = int(logits.argmax())
