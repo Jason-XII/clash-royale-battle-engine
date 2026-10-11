@@ -2,8 +2,9 @@
 
     PYTHONPATH=. python -m il.arena ~/clapha-engine runs/il-003/best.pt runs/il-002/best.pt --games 400 --procs 16
 
-Decks are the two players' opening hand + cycle of cached human games (one cached game per arena game);
-seats alternate so each model plays both sides of each deck pair equally often. Abilities are not played
+Decks are the two players' opening hand + cycle of cached human games (one cached game per arena game),
+or one fixed deck for both players with --deck (a mirror match); seats alternate so each model plays both
+sides of each deck pair equally often. Abilities are not played
 (clapha does not support them yet).
 """
 import argparse
@@ -94,12 +95,19 @@ def main():
     parser.add_argument('--procs', type=int, default=16)
     parser.add_argument('--delay', type=int, default=D.DEPLOY_DELAY, help='decision -> landing ticks (0: instant)')
     parser.add_argument('--decode', choices=('gate', 'sample', 'argmax'), default='gate')
+    parser.add_argument('--deck', help='8 comma-separated card ids: both players use this deck (mirror match) '
+                        'instead of cached human deck pairs')
     parser.add_argument('--cache', default='data/cache')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', default='runs/arena.jsonl')
     args = parser.parse_args()
     os.makedirs('runs/arena-logs', exist_ok=True)
-    pairs = list(enumerate(decks(args.cache, args.games, args.seed)))
+    if args.deck:
+        deck = [int(c) for c in args.deck.split(',')]
+        assert len(deck) == 8, 'a deck has 8 cards'
+        pairs = [(g, [deck, deck]) for g in range(args.games)]
+    else:
+        pairs = list(enumerate(decks(args.cache, args.games, args.seed)))
     ctx = mp.get_context('fork')
     out = ctx.Queue()
     workers = [ctx.Process(target=worker, args=(i, args, pairs[i::args.procs], out)) for i in range(args.procs)]
