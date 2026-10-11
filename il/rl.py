@@ -144,6 +144,7 @@ def collector(index, args, conn):
             steps[o]['reward'][-1] += outcome
             if models[o] == 'current':
                 trajectory = {k: np.array(v) for k, v in steps[o].items()}
+                trajectory = {k: v.astype(np.float32) if v.dtype == np.float64 else v for k, v in trajectory.items()}
                 conn.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o], timing=timing)))
                 timing = {}  # counted once per game
         conn.send(('reset', index, [(index, 0), (index, 1)]))
@@ -258,6 +259,7 @@ def main():
     parser.add_argument('init', help='IL checkpoint to start from (also the KL reference and first frozen opponent)')
     parser.add_argument('out')
     parser.add_argument('--collectors', type=int, default=32)
+    parser.add_argument('--batch-ms', type=float, default=2.0, help='how long the learner gathers decisions per GPU call')
     parser.add_argument('--games-per-update', type=int, default=128)
     parser.add_argument('--updates', type=int, default=100000)
     parser.add_argument('--self-play', type=float, default=0.5)
@@ -315,24 +317,29 @@ def main():
 
     buffer, played, started = [], 0, time.time()
     metrics = open(out / 'metrics.jsonl', 'a')
+    # Decision requests waiting for one batched GPU call: gathered from the first request for up to
+    # --batch-ms, or until every collector is waiting (nothing else can arrive). Kept across updates.
+    owners, first = [], None  # [(collector pipe, its requests)]
+    window = args.batch_ms / 1000
     for update_index in range(start, args.updates):
         collect_start = time.time()
         serve = defaultdict(float)
         while len(buffer) < args.games_per_update:
             t0 = time.perf_counter()
-            requests, owners = [], []
-            for conn in wait(conns, timeout=1):
+            timeout = 1 if first is None else max(0.0, window - (t0 - first))
+            for conn in wait(conns, timeout=timeout):
                 try:
                     kind, index, payload = conn.recv()
                 except EOFError:  # the collector died; its log says why
                     conns.remove(conn)
+                    owners = [(c, r) for c, r in owners if c is not conn]
                     print(f'a collector died ({len(conns)} left); see {out}/logs/', flush=True)
                     if not conns:
                         raise RuntimeError('every collector died')
                     continue
                 if kind == 'act':
-                    requests += payload
-                    owners.append((conn, len(payload)))
+                    owners.append((conn, payload))
+                    first = first or time.perf_counter()
                 elif kind == 'new_game':
                     learner_seat = random.randrange(2)
                     models = ['current', 'current']
@@ -348,17 +355,19 @@ def main():
                     server.reset(payload)
             t1 = time.perf_counter()
             serve['receive'] += t1 - t0
-            if requests:
+            if owners and (t1 - first >= window or len(owners) >= len(conns)):
+                requests = [r for _, payload in owners for r in payload]
                 replies = server.act(requests)
                 t2 = time.perf_counter()
                 serve['decide'] += t2 - t1
                 serve['batches'] += 1
                 serve['requests'] += len(requests)
                 k = 0
-                for conn, n in owners:
-                    conn.send(replies[k:k + n])
-                    k += n
+                for conn, payload in owners:
+                    conn.send(replies[k:k + len(payload)])
+                    k += len(payload)
                 serve['reply'] += time.perf_counter() - t2
+                owners, first = [], None
         collect_time = time.time() - collect_start
         trajectories, buffer = buffer[:args.games_per_update], buffer[args.games_per_update:]
         update_start = time.time()
