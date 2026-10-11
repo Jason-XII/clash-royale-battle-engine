@@ -182,6 +182,17 @@ Times from one play with the console's gesture (two 16 ms touches, 8 ms apart):
 - The cards they have played (in first-play order) and their exact elixir are readable; their hand and
   cycle are not (the hand reads empty for the whole battle, the cycle pointer is null). A Royal Trainer's
   commands carry account -1.
+- **Their evolution and hero slots** (measured 2026-10-11 on 515 recorded battles, 443 against real players):
+  - Their deck and its slot flags are hidden until the battle ends, against every kind of opponent: readable
+    before the first play in 0 of 515 battles, at the end in 97% of real-player battles. So **an opponent
+    evolution can't be known at the start**; it is known once played (the unit's form id), or guessed from a deck
+    prior (RoyaleAPI, or the deck the other console publishes). A HUD must show the guess as a guess.
+  - **Their hero and champion are known from the start**: their ability controller names the card, and every
+    controller seen was there before the first play (132 of 132). Our table of controller characters lacked Hero
+    Ice Wizard (character 1741956296, 14 battles) and Goblinstein (4047250230, 3 battles).
+  - The slot flags mean the **active** form of the slot, not "this card can evolve": on our own side, flag 1
+    slots were played as an evolution 291 times and never as a hero, flag 2 slots as a hero 123 times. No other
+    value occurs; a wild slot shows as what is equipped in it.
 
 ## 10. Where the simulator differed from the game
 
@@ -258,3 +269,4 @@ In ordinary games, with the bot playing: `il/timing.py` (lateness of every play)
 - 2026-10-03: first measurement, build 160402012 (MuMu), tap probe (sections 1-12).
 - 2026-10-11: shared with clash-royale-battle-engine; the refill timer (section 4) cites RoyaleSim's measurement on
   the August client; its double / triple elixir periods are not measured on our build yet (section 13).
+- 2026-10-11: section 9, the opponent's evolution and hero slots: what is readable when (515 recorded battles).

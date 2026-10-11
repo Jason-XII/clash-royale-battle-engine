@@ -46,7 +46,7 @@ the next card fills the empty slot (4 cards)**. Two plays close together: the re
 |---|---|---|
 | Own pending play: card, where, time until it lands | missing (since PR #1 the model cannot play while one is pending, but it cannot see it) | (A) ClaphaEngine.pending |
 | Hand as the screen shows it: card out and elixir spent at the tap; the refilled slot can't be played until dealt | missing (the model sees the game's hand, where the card stays until it lands) | (A) rules in docs/GAME_INTEGRATION.md |
-| Enemy pending play | missing | (C) a human can't see it; the engine's command queue holds it a few ticks early |
+| Enemy pending play | missing | (C) a human can't see it; the live client's command queue holds it 2-21 ticks before it lands (median 13) |
 
 ## 3. Own cards
 
@@ -64,7 +64,7 @@ the next card fills the empty slot (4 cards)**. Two plays close together: the re
 |---|---|---|
 | Cards seen | partial (last 8 different, with plays ago) | |
 | **Card counting**: the order they were played, where each card is now (hand / cycle), plays until it is back | missing | (A) derived from their plays (the cycle is deterministic) |
-| Opponent active evo / hero: which, cycles until evo | missing | (A) once seen; (C) at battle start the engine knows their slots |
+| Opponent active evo / hero: which, cycles until evo | missing | (A) once seen; (C) at battle start the engine knows their slots. Live: heroes and champions are readable from the start, evolutions only once played (docs/GAME_INTEGRATION.md section 9) |
 | A guessed deck (RoyaleAPI, live only; can be wrong, has no order) | missing | (C) e.g. "probably in their deck" flags with a confidence, kept apart from "seen", replaced by what the game shows |
 | A given deck (friendly / war) | missing | (C) |
 
