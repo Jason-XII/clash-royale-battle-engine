@@ -34,15 +34,27 @@ BOTTOM = Y1 + TILE_H
 # Home screen Battle (yellow) and results screen OK (blue) overlap here, below their labels.
 BUTTON = (440, 2035)
 BATTLE_TAB = (541, 2323)  # bottom bar; a restarted game opens on the trophy road page
+ROAD_OK = (539, 2345)  # OK at the bottom of the trophy road page after a new arena
+
+WIZARD = 26000017  # its hero form's ability button is still uncalibrated: --shots captures it
 
 
-def button_color(serial):
-    """'yellow' (Battle), 'blue' (OK) or None (matchmaking, loading, battle)."""
+def menu_button(serial):
+    """Where to tap on the way to the next battle: Battle (yellow) or results OK (blue) at BUTTON, the OK of a trophy
+    road page (shown on reaching a new arena; light blue at both ends of ROAD_OK), or None (matchmaking, loading,
+    battle)."""
     raw = subprocess.run(['adb', '-s', serial, 'exec-out', 'screencap'], capture_output=True).stdout
     w, h = struct.unpack('<II', raw[:8])
-    i = len(raw) - w * h * 4 + (BUTTON[1] * w + BUTTON[0]) * 4
-    r, g, b = raw[i:i + 3]
-    return 'yellow' if r > 200 and g > 130 and b < 80 else 'blue' if b > 180 and r < 120 else None
+
+    def pixel(x, y):
+        i = len(raw) - w * h * 4 + (y * w + x) * 4
+        return raw[i:i + 3]
+    r, g, b = pixel(*BUTTON)
+    if (r > 200 and g > 130 and b < 80) or (b > 180 and r < 120):
+        return BUTTON
+    if all(r < 120 and 150 <= g <= 210 and b > 230 for r, g, b in (pixel(470, ROAD_OK[1]), pixel(610, ROAD_OK[1]))):
+        return ROAD_OK
+    return None
 
 
 def slot_screen(slot):
@@ -115,8 +127,15 @@ def play_battle(engine, agent, taps, state, args, log):
         seen = time.monotonic()
         state, cursor = new, new.next_sequence
         plays += new.plays
+        for p in new.plays:
+            if p.owner != agent.owner:
+                log({'event': 'opponent', 'tick': p.tick, 'card': p.card})
         if pending and any(p.owner == agent.owner for p in new.plays):
             log({'event': 'landed', 'tick': state.tick, 'delay_ticks': state.tick - pending[1]})
+            if pending[0] == WIZARD and args.shots:  # the hero ability button shows while our Wizard lives
+                shot = Path(args.shots) / f'{time.strftime("%Y%m%d_%H%M%S")}_t{state.tick}.png'
+                subprocess.Popen(['sh', '-c', f"sleep 2; adb -s {args.serial} exec-out screencap -p > '{shot}'"])
+                log({'event': 'screenshot', 'tick': state.tick, 'path': str(shot)})
             pending = None
         if decided is not None and state.tick < decided + 5:
             continue
@@ -201,6 +220,7 @@ def main():
     parser.add_argument('--port', type=int, default=26789)
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each game')
+    parser.add_argument('--shots', help='a directory: screenshot 2 s after each of our Wizard plays lands')
     parser.add_argument('--watch', type=Path, help='a replay parquet part: self-play with its decks instead')
     parser.add_argument('--render', action='store_true', help='--watch: draw in the game UI at real-time speed')
     args = parser.parse_args()
@@ -214,6 +234,8 @@ def main():
     engine = connect(args)
     taps = Taps(args.serial)
     Path('runs/live').mkdir(parents=True, exist_ok=True)
+    if args.shots:
+        Path(args.shots).mkdir(parents=True, exist_ok=True)
     try:
         played, done = 0, set()
         while played < args.games:
@@ -225,8 +247,9 @@ def main():
                     state = capture(engine)
                     if args.queue and time.monotonic() - checked > 5:
                         checked = time.monotonic()
-                        if button_color(args.serial):  # OK on results, then Battle on the home screen
-                            taps.tap(*BUTTON)
+                        button = menu_button(args.serial)  # OK on results / trophy road, then Battle
+                        if button:
+                            taps.tap(*button)
                 done.add(state.generation)
                 owner = find_owner(state, deck, args.owner)
                 agent = Agent(model, vocab, owner, decode=args.decode)
