@@ -28,7 +28,7 @@ not marked checked is from reading the code.
 | **Invisible** (Royal Ghost, Archer Queen ability): can't be targeted, **can** take area damage | spells still hit it | missing | (B) |
 | **Underground** (Miner / Drill / Mighty Miner travelling, Tesla hidden): can't be targeted, **can't** be hurt | nothing hits it | missing | (B) |
 | Evolved or not, hero or not (per unit) | they behave differently | missing | (A) the unit's form id |
-| Hero / champion ability: phase, time into it, cooldown, charges | ability timing | missing (abilities masked) | (A) own: cooldown, charges, button state; per-unit phase (B) |
+| Hero / champion ability (英雄技能资讯): **whether it is in its ability now, how long the ability has lasted so far, whether the ability has been used already, Boss Bandit's number of uses**; plus cooldown and charges | ability timing; what is left of a hero | missing (abilities masked) | (A) own: cooldown, charges, button state; (B) per unit: in ability, time into it, used yet, use count |
 | Spell areas with a duration (Graveyard, Poison, Freeze, Tornado, Earthquake, …): time elapsed / left | how many more Skeletons, how long the freeze lasts | missing (position only) | (B) |
 | "Just happened": died, spawned, got hit, spell landed | events are part of the moment's state | missing | (A) derivable from the change between two decisions |
 
@@ -73,7 +73,14 @@ the next card fills the empty slot (4 cards)**. Two plays close together: the re
 What can be **counted** (cycles, cards seen, elixir spent) should be an input, like a player's notes; the LSTM is then
 left for what can't be counted (this opponent's habits).
 
-## 6. Timing
+## 6. Playing abilities
+
+The model cannot play hero or champion abilities now: IL learned one "ability" action from human presses (when, not
+which), PPO masks it out (il/rl.py), and il/live.py skips it. Needed: the engine taking ability commands (clapha-engine
+crx has `queue_ability_action_at`, not verified yet: engine work) and an ability action per hero / champion in the
+model's output.
+
+## 7. Timing
 
 - A decision every 5 ticks (0.25 s), like FirstLight. Deciding every 2-3 ticks would cost roughly 40-55% of games per
   hour (estimate). Cheaper precision: choose a small delay with each play (FirstLight: 0 / 50 / 100 / 150 / 200 ms).
