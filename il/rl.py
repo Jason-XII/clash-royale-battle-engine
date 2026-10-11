@@ -530,8 +530,10 @@ def update(model, reference, optimizer, trajectories, args, device):
 def save(path, model, saved, optimizer=None, extra=None):
     """Same layout as IL checkpoints (il.model.load reads it); only latest.pt keeps the optimizer."""
     base = {k: v for k, v in saved.items() if k not in ('optimizer', 'update')}
+    tmp = Path(f'{path}.tmp')  # written whole, then renamed: a kill mid-write (scancel, node failure) keeps the old file
     torch.save(dict(base, model=model.state_dict(), **({'optimizer': optimizer.state_dict()} if optimizer else {}),
-                    **(extra or {})), path)
+                    **(extra or {})), tmp)
+    os.replace(tmp, path)
 
 
 def endpoint(run):
