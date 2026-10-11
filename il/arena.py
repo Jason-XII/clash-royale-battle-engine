@@ -43,8 +43,9 @@ def make_match(decks, seed):
     battle = match['battle']
     battle['lvlcap'] = battle['cardlvlmin'] = LEVEL
     for owner in (0, 1):
-        battle[f'deck{owner}']['sp'] = [{'d': c} for c in decks[owner]]
+        battle[f'deck{owner}']['sp'] = [{'d': c} for c in decks[owner]]  # ponytail: no evolutions ('el')
         battle[f'avatar{owner}']['expLevel'] = LEVEL
+        battle['hbd'][owner]['kt'] = LEVEL  # king tower level (human games: 7728 hp at 16; the template's 1: 2400)
     match['rndSeed'] = seed
     return match
 
