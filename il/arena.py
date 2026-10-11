@@ -21,14 +21,17 @@ from . import data as D
 
 
 def decks(cache, count, seed):
-    """`count` deck pairs from one cache shard: [[8 ids of owner 0], [8 ids of owner 1]]."""
-    shards = sorted(Path(cache).glob('part-*.npz'))
-    with np.load(shards[seed % len(shards)]) as z:
-        first = z['tick_off'][:-1]
-        hand, cycle = z['hand'][first][..., 0], z['cycle'][first]
+    """`count` deck pairs of cached human games, spread over shards: [[8 ids of owner 0], [8 ids of owner 1]]."""
     rng = np.random.default_rng(seed)
-    return [[[int(c) for c in list(hand[g, o]) + list(cycle[g, o]) if c >= 0] for o in (0, 1)]
-            for g in rng.choice(len(first), count, replace=count > len(first))]
+    shards = sorted(Path(cache).glob('part-*.npz'))
+    pairs = []
+    for shard in rng.permutation(len(shards))[:max(1, count // 200)]:  # ~200 games from each shard used
+        with np.load(shards[shard]) as z:
+            first = z['tick_off'][:-1]
+            hand, cycle = z['hand'][first][..., 0], z['cycle'][first]
+        pairs += [[[int(c) for c in list(hand[g, o]) + list(cycle[g, o]) if c >= 0] for o in (0, 1)]
+                  for g in range(len(first))]
+    return [pairs[i] for i in rng.choice(len(pairs), count, replace=count > len(pairs))]
 
 
 def worker(index, args, jobs, out):

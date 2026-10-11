@@ -114,6 +114,38 @@ class IL(unittest.TestCase):
         self.assertLess(loss.item(), first * 0.1)
 
 
+class PPODistribution(unittest.TestCase):
+    """il.rl's factorised policy: wait with p(wait), else a card x cell at a temperature."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.logits = torch.randn(3, D.ACTIONS) * 2
+        self.logits[0, 2 + D.CELLS:] = float('-inf')  # only hand slot 0 playable
+        self.logits[1, 2:] = float('-inf')            # nothing playable: must wait
+
+    def test_normalized_legal_and_consistent(self):
+        from .rl import distribution, entropy, kl, log_prob
+        dist = distribution(self.logits)
+        every = torch.arange(D.ACTIONS).expand(3, -1)
+        p = log_prob(tuple(t.unsqueeze(1).expand(-1, D.ACTIONS, *t.shape[1:]) if t.dim() > 1 else
+                           t.unsqueeze(1).expand(-1, D.ACTIONS) for t in dist), every).exp()
+        p[:, D.ABILITY] = 0  # ability is never chosen
+        self.assertTrue(torch.allclose(p.sum(-1), torch.ones(3), atol=1e-4))
+        self.assertEqual(p[0, 2 + D.CELLS:].sum().item(), 0)
+        self.assertAlmostEqual(p[1, D.WAIT].item(), 1, places=5)
+        direct = -(p * torch.where(p > 0, p.log(), torch.zeros_like(p))).sum(-1)
+        self.assertTrue(torch.allclose(entropy(dist), direct, atol=1e-3))
+        self.assertTrue(torch.allclose(kl(dist, dist), torch.zeros(3), atol=1e-5))
+
+    def test_sampling_matches_probabilities(self):
+        from .rl import distribution, log_prob, sample
+        dist = distribution(self.logits[2:].expand(20000, -1))
+        actions = sample(dist)
+        p_wait = log_prob(dist, torch.zeros_like(actions))[0].exp().item()
+        self.assertAlmostEqual((actions == D.WAIT).float().mean().item(), p_wait, delta=0.015)
+        self.assertFalse((actions == D.ABILITY).any())
+
+
 @unittest.skipUnless(engine_running() and PARQUET.exists(), 'needs the emulator engine and IL_Replay part 0')
 class EngineFeatures(unittest.TestCase):
     def test_agent_sees_what_training_sees(self):
