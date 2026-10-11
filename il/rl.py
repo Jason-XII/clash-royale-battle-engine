@@ -87,6 +87,7 @@ def collector(index, args, learner, conn):
     os.dup2(log, 1)
     os.dup2(log, 2)
     time.sleep(index // 4 * 8)  # boot 4 engines at a time
+    os.nice(5)  # the decision servers are the bottleneck on a busy node: let them run first
     torch.set_num_threads(1)
     from native_engine import Play
     from native_engine.clapha import ClaphaEngine
@@ -409,7 +410,7 @@ def main():
     parser.add_argument('init', help='IL checkpoint to start from (also the KL reference and first frozen opponent)')
     parser.add_argument('out')
     parser.add_argument('--collectors', type=int, default=24)
-    parser.add_argument('--servers', type=int, default=4, help='decision server processes (each one Python thread)')
+    parser.add_argument('--servers', type=int, default=3, help='decision server processes (each one Python thread)')
     parser.add_argument('--batch-ms', type=float, default=2.0, help='how long a server gathers decisions per GPU call')
     parser.add_argument('--games-per-update', type=int, default=128)
     parser.add_argument('--updates', type=int, default=100000)
