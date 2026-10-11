@@ -162,14 +162,80 @@ def load_policy(path, device):
     return model.to(device), saved
 
 
+GRAPH_BUCKETS = (8, 16, 32, 64, 128)  # batch sizes a recorded forward pass is padded to
+
+
+class GraphedForward:
+    """One model's forward pass for a fixed batch, recorded as a CUDA graph and replayed with one launch (an eager
+    call costs ~4 ms of kernel launches whatever its batch). Weights are read from the model's own tensors, which
+    load_state_dict updates in place; autocast's weight cache is off so no stale bf16 copy is recorded."""
+
+    def __init__(self, model, batch, example):
+        device = example['scalars'].device
+        self.x = {k: v[:1].repeat(batch, *[1] * (v.dim() - 1)).contiguous() for k, v in example.items()}
+        self.h = torch.zeros(1, batch, model.config['core'], device=device)
+        self.c = torch.zeros_like(self.h)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
+            for _ in range(3):
+                model(self.x, (self.h, self.c))
+        torch.cuda.current_stream().wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
+            self.out = model(self.x, (self.h, self.c))
+
+    def __call__(self, x, h, c):
+        n = h.shape[1]
+        for k, v in x.items():
+            self.x[k][:n].copy_(v)
+        self.h[:, :n].copy_(h)
+        self.c[:, :n].copy_(c)
+        self.graph.replay()
+        logits, value, (h, c) = self.out
+        return logits[:n], value[:n], (h[:, :n], c[:, :n])
+
+
 class Server:
     """Batched decisions for every collector. Each seat's LSTM state lives in one row of a preallocated GPU
-    tensor (gathered and written back by index); results come back to the CPU in one transfer per call."""
+    tensor (gathered and written back by index); results come back to the CPU in one transfer per call. On a
+    GPU, forward passes replay recorded CUDA graphs (checked against an eager pass when recorded; a failed check
+    falls back to eager calls)."""
 
     def __init__(self, models, device, core):
         self.models, self.device, self.core = models, device, core
         self.rows = {}  # seat -> row in self.h / self.c
         self.h = self.c = torch.zeros(1, 0, core, device=device)
+        self.graphs = {} if device.type == 'cuda' else None  # (model key, bucket) -> GraphedForward
+
+    def _forward(self, key, x, h, c):
+        model, n = self.models[key], h.shape[1]
+        bucket = next((b for b in GRAPH_BUCKETS if b >= n), None)
+        if self.graphs is not None and bucket:
+            if (key, bucket) not in self.graphs:
+                self.graphs[(key, bucket)] = self._record(model, bucket, x, h, c)
+            graphed = self.graphs.get((key, bucket))
+            if graphed is not None:
+                return graphed(x, h, c)
+        with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda'):
+            return model(x, (h, c))
+
+    def _record(self, model, bucket, x, h, c):
+        """A recorded forward pass for `bucket`, or None (logged) if recording fails or disagrees with eager."""
+        try:
+            graphed = GraphedForward(model, bucket, x)
+            got = [t.float() for t in (graphed(x, h, c)[0], graphed(x, h, c)[1])]
+            with torch.autocast('cuda', torch.bfloat16):
+                want = [t.float() for t in model(x, (h, c))[:2]]
+            finite = torch.isfinite(want[0])
+            same = (torch.equal(finite, torch.isfinite(got[0]))
+                    and torch.allclose(got[0][finite], want[0][finite], atol=0.05, rtol=0.05)
+                    and torch.allclose(got[1], want[1], atol=0.05, rtol=0.05))
+            print(f'CUDA graph for batch {bucket}: {"ok" if same else "MISMATCH, using eager calls"}', flush=True)
+            return graphed if same else None
+        except Exception as error:  # noqa: BLE001 - any recording failure: keep the eager path
+            print(f'CUDA graph for batch {bucket} failed ({error!r}); using eager calls', flush=True)
+            return None
 
     def _rows(self, seats):
         for seat in seats:
@@ -192,8 +258,7 @@ class Server:
             x = {k: torch.from_numpy(np.stack([requests[i][2][k] for i in idx]))[:, None].to(self.device, non_blocking=True)
                  for k in INPUT_KEYS}
             # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
-            with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda'):
-                logits, value, (h, c) = self.models[key](x, (self.h[:, rows], self.c[:, rows]))
+            logits, value, (h, c) = self._forward(key, x, self.h[:, rows], self.c[:, rows])
             self.h[:, rows], self.c[:, rows] = h.float(), c.float()
             dist = distribution(logits[:, 0])
             action = sample(dist)
