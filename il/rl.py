@@ -89,6 +89,18 @@ def sample(dist):
 
 
 # ---- collectors ---------------------------------------------------------------------------------------------------------
+def hold_while_in_flight(rows, pending):
+    """Feature rows of both seats, with no card playable for a player whose play is still on its way.
+    ClaphaEngine.step drops a second play while one is pending (executed False), but the trajectory would store it
+    as played (action, logp): PPO would credit or blame a play that never happened, about 4 decisions after every
+    play (22-tick delay, a decision every 5 ticks). With every slot_ok False the policy waits with probability 1
+    (logp 0), so what is stored is what happened."""
+    for o in (0, 1):
+        if any(p['owner'] == o for p in pending):
+            rows[o]['slot_ok'] = np.zeros_like(rows[o]['slot_ok'])
+    return rows
+
+
 def collector_engine(name, out, clapha, stagger):
     """A collector process's log, CPU priority and booted engine (+ the run's vocab)."""
     log = os.open(f'{out}/logs/collector-{name}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
@@ -139,7 +151,8 @@ def play_games(index, delay, engine, vocab, learner, servers):
         timing = defaultdict(float)  # seconds per part of a decision, for the learner's log
         while True:
             t0 = time.perf_counter()
-            rows = [{k: v[0, 0].numpy() for k, v in agents[o].observe(state).items()} for o in (0, 1)]
+            rows = hold_while_in_flight([{k: v[0, 0].numpy() for k, v in agents[o].observe(state).items()}
+                                         for o in (0, 1)], engine.pending)
             t1 = time.perf_counter()
             conn.send(('act', index, [((index, o), models[o], pack(rows[o])) for o in (0, 1)]))
             replies = receive(conn)

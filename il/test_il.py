@@ -104,6 +104,18 @@ class PPODistribution(unittest.TestCase):
         self.assertTrue(torch.allclose(entropy(dist), direct, atol=1e-3))
         self.assertTrue(torch.allclose(kl(dist, dist), torch.zeros(3), atol=1e-5))
 
+    def test_play_in_flight_forces_wait(self):
+        from .rl import distribution, hold_while_in_flight, log_prob, sample
+        rows = [{'slot_ok': np.ones(4, bool)} for _ in (0, 1)]
+        rows = hold_while_in_flight(rows, [{'owner': 0}])
+        self.assertFalse(rows[0]['slot_ok'].any())
+        self.assertTrue(rows[1]['slot_ok'].all())
+        logits = torch.randn(1, D.ACTIONS)
+        logits[0, 2:] = float('-inf')                 # what the model's mask makes of slot_ok all False
+        dist = distribution(logits.expand(1000, -1))
+        self.assertTrue((sample(dist) == D.WAIT).all())
+        self.assertTrue(torch.allclose(log_prob(dist, torch.zeros(1000, dtype=torch.long)), torch.zeros(1000)))
+
     def test_sampling_matches_probabilities(self):
         from .rl import distribution, log_prob, sample
         dist = distribution(self.logits[2:].expand(20000, -1))
