@@ -415,11 +415,29 @@ def advantages(trajectory, gamma, lam):
     return adv.astype(np.float32), (adv + value).astype(np.float32)
 
 
+def discounted(reward, gamma):
+    """Discounted sum of the rewards still to come, at every step (what actually happened)."""
+    out, running = np.zeros_like(reward), 0.0
+    for t in reversed(range(len(reward))):
+        running = reward[t] + gamma * running
+        out[t] = running
+    return out
+
+
+def explained(target, value):
+    """1 - Var(target - value) / Var(target): 1 = the value head predicts the target, 0 = no better than its mean."""
+    return float(1 - np.var(target - value) / max(np.var(target), 1e-8))
+
+
 def update(model, reference, optimizer, trajectories, args, device):
     for t in trajectories:
         t['adv'], t['ret'] = advantages(t, args.gamma, args.lam)
     flat = np.concatenate([t['adv'] for t in trajectories])
     mean, std = flat.mean(), flat.std() + 1e-8
+    value = np.concatenate([t['value'] for t in trajectories])
+    diagnostics = {  # how much the value head (the advantages' baseline) knows, before this update
+        'value_ev_mc': explained(np.concatenate([discounted(t['reward'], args.gamma) for t in trajectories]), value),
+        'value_ev_gae': explained(np.concatenate([t['ret'] for t in trajectories]), value)}
     keys = INPUT_KEYS + ('action', 'logp', 'adv', 'ret')
     stats = defaultdict(list)
     for _ in range(args.epochs):
@@ -453,7 +471,7 @@ def update(model, reference, optimizer, trajectories, args, device):
                 stats['kl_ref'].append(kl_ref.item())
                 stats['approx_kl'].append(((ratio - 1) - ratio.log())[m].mean().item())
                 stats['clip_frac'].append(((ratio - 1).abs() > args.clip)[m].float().mean().item())
-    return {k: float(np.mean(v)) for k, v in stats.items()}
+    return {**{k: float(np.mean(v)) for k, v in stats.items()}, **diagnostics}
 
 
 def save(path, model, saved, optimizer=None, extra=None):
