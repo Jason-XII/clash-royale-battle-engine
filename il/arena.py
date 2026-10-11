@@ -120,6 +120,8 @@ def main():
     parser.add_argument('--out', default='runs/arena.jsonl')
     args = parser.parse_args()
     os.makedirs('runs/arena-logs', exist_ok=True)
+    from native_engine.clapha import raise_thread_limit
+    raise_thread_limit()  # before any engine process starts, so every process (the learner too) gets it
     if args.deck:
         deck = [dict(zip(('d', 'el'), map(int, c.split(':')))) for c in args.deck.split(',')]
         assert len(deck) == 8, 'a deck has 8 cards'

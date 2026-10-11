@@ -279,6 +279,8 @@ def main():
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
     out = Path(args.out)
+    from native_engine.clapha import raise_thread_limit
+    raise_thread_limit()  # before any engine process starts, so every process (the learner too) gets it
     (out / 'logs').mkdir(parents=True, exist_ok=True)
     (out / 'pool').mkdir(exist_ok=True)
     resume = out / 'latest.pt'

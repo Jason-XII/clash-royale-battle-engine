@@ -116,6 +116,8 @@ if __name__ == '__main__':
     parser.add_argument('--work', choices=('state', 'features'), default='state')
     parser.add_argument('--vocab', default='data/cache/vocab.json')
     args = parser.parse_args()
+    from native_engine.clapha import raise_thread_limit
+    raise_thread_limit()  # before any engine process starts, so every process (the learner too) gets it
     print(f'cpus visible to this process: {len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count()}', flush=True)
     os.makedirs('runs/throughput-logs', exist_ok=True)
     for procs in map(int, args.procs.split(',')):

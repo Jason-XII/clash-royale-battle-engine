@@ -30,13 +30,19 @@ def _ms(value):
     return None if value is None or value < 0 or value > 3600000 else (value + 49) // 50 * 50
 
 
+def raise_thread_limit():
+    """Each engine starts ~70 threads, and `ulimit -u` (1024 by default on the cluster) counts every thread of
+    the user. Call this in the parent before starting engine processes: a process whose own soft limit stays
+    low (the PPO learner) then fails to create threads ('Resource temporarily unavailable'). The soft limit
+    may be raised to the hard one without privileges."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    if soft != resource.RLIM_INFINITY and (hard == resource.RLIM_INFINITY or hard > soft):
+        resource.setrlimit(resource.RLIMIT_NPROC, (hard if hard == resource.RLIM_INFINITY else min(hard, 1 << 20), hard))
+
+
 class ClaphaEngine:
     def __init__(self, clapha_dir, workdir=None):
-        # Each engine starts ~70 threads; a cluster's default 1024 threads per user (ulimit -u) stops ~14
-        # engines with a SIGABRT at boot. The soft limit may be raised to the hard one without privileges.
-        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
-        if soft != resource.RLIM_INFINITY and (hard == resource.RLIM_INFINITY or hard > soft):
-            resource.setrlimit(resource.RLIMIT_NPROC, (hard if hard == resource.RLIM_INFINITY else min(hard, 1 << 20), hard))
+        raise_thread_limit()  # also here, for scripts that start a single engine
         clapha = Path(clapha_dir).expanduser().resolve()
         sys.path.insert(0, str(clapha / 'crx'))
         from env import CrxEnv  # clapha's crx modules import each other as top-level modules
