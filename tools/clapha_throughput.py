@@ -14,10 +14,21 @@ import random
 import time
 
 
-def worker(clapha, work, seconds, vocab_path, start, out):
+def worker(index, clapha, work, seconds, vocab_path, booting, start, out):
+    log = os.open(f'runs/throughput-logs/worker-{index}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.dup2(log, 1)  # the engine's own chatter goes to the worker's log
+    os.dup2(log, 2)
     from native_engine import Play
     from native_engine.clapha import ClaphaEngine
-    engine = ClaphaEngine(clapha)
+    try:
+        with booting:  # many engines booting at once can crash one (seen at 16 on a busy node)
+            engine = ClaphaEngine(clapha)
+    except Exception as error:
+        out.put(('failed', repr(error)))
+        out.close()
+        out.join_thread()
+        os._exit(1)
+    out.put(('ready', None))
     if work == 'features':
         from il import data as D
         from il.agent import Agent
@@ -45,7 +56,7 @@ def worker(clapha, work, seconds, vocab_path, start, out):
             decisions += 1
         ticks += state.tick - first
         games += state.finalized
-    out.put((games, decisions, ticks))
+    out.put(('done', (games, decisions, ticks)))
     out.close()
     out.join_thread()
     os._exit(0)  # the engine segfaults in its exit-time destructors
@@ -53,17 +64,23 @@ def worker(clapha, work, seconds, vocab_path, start, out):
 
 def run(args, procs):
     ctx = mp.get_context('fork')
-    start, out = ctx.Barrier(procs + 1), ctx.Queue()
-    workers = [ctx.Process(target=worker, args=(args.clapha, args.work, args.seconds, args.vocab, start, out))
-               for _ in range(procs)]
+    booting, start, out = ctx.Semaphore(4), ctx.Event(), ctx.Queue()
+    workers = [ctx.Process(target=worker, args=(i, args.clapha, args.work, args.seconds, args.vocab, booting, start, out))
+               for i in range(procs)]
     for w in workers:
         w.start()
-    start.wait()
-    results = [out.get() for _ in workers]
+    booted = [out.get() for _ in workers]
+    failed = [why for kind, why in booted if kind == 'failed']
+    running = procs - len(failed)
+    start.set()
+    results = [out.get()[1] for _ in range(running)]
     for w in workers:
         w.join()
     games, decisions, ticks = map(sum, zip(*results))
     s = args.seconds
+    if failed:
+        print(f'    {len(failed)} of {procs} engines failed to boot (logs in runs/throughput-logs/): {failed[0]}')
+    procs = running
     print(f'{procs:3d} procs [{args.work}]: {games / s:6.2f} games/s ({games / s * 3600:8,.0f}/h)  '
           f'{decisions / s:9,.0f} decisions/s  {ticks / s:11,.0f} ticks/s  '
           f'= {ticks / s / procs:8,.0f} ticks/s per process', flush=True)
@@ -78,5 +95,6 @@ if __name__ == '__main__':
     parser.add_argument('--vocab', default='data/cache/vocab.json')
     args = parser.parse_args()
     print(f'cpus visible to this process: {len(os.sched_getaffinity(0))}', flush=True)
+    os.makedirs('runs/throughput-logs', exist_ok=True)
     for procs in map(int, args.procs.split(',')):
         run(args, procs)
