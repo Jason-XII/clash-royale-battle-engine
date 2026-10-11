@@ -184,6 +184,84 @@ class PPOServer(unittest.TestCase):
         finally:
             rl.REPLY_TIMEOUT = old
 
+def _reference_rows(states, owner, vocab):
+    """The rows Agent.observe built before il.fast_obs: a [previous, state] window through build_cache.encode and
+    data.features, with every play so far."""
+    from native_engine.build_cache import encode
+    previous, plays, out = None, [], []
+    for state in states:
+        raw = encode({'states': [previous or state, state], 'commands': [], 'receipts': [], 'winner_matches': 0,
+                      'crowns_matches': 0})
+        plays += [(1, p.tick, p.owner, p.card) for p in state.plays]
+        raw['plays'] = np.array(plays, np.int32).reshape(-1, 4)
+        previous = state
+        feats = D.features(raw, owner, vocab)
+        out.append({k: feats[k][1] for k in INPUT_KEYS})
+    return out
+
+
+def _random_states(seed, steps=300):
+    """States with what games have: units appearing, moving and dying, ids reused within a state, unknown values
+    (None), more than MAX_ENTITIES objects, both players' plays, short cycles, empty hand slots."""
+    import random
+    from native_engine.engine import CardPlay, Entity, HandCard, Player, State
+    rng = random.Random(seed)
+    cards = [26000000 + i for i in range(30)] + [28000000 + i for i in range(5)]
+    alive, next_id, seq, states = {}, 1, 0, []
+    for t in range(steps):
+        tick = 90 + 5 * t
+        for _ in range(rng.randrange(0, 4)):
+            alive[next_id] = [rng.randrange(2), rng.choice(cards + [-1]), rng.randrange(18000), rng.randrange(32000)]
+            next_id += 1
+        for k in list(alive):
+            if rng.random() < 0.03:
+                del alive[k]
+            else:
+                alive[k][2] = min(17999, max(0, alive[k][2] + rng.randrange(-900, 900)))
+                alive[k][3] = min(31999, max(0, alive[k][3] + rng.randrange(-900, 900)))
+        ents = []
+        for k, (o, c, x, y) in list(alive.items())[:90]:
+            hp = None if rng.random() < 0.1 else rng.randrange(0, 3000)
+            ents.append(Entity(k, o, c, x, y, hp, None if hp is None else rng.randrange(1, 4000),
+                               rng.choice([None, rng.randrange(1, next_id)]), rng.choice([None, 0, rng.randrange(6000)]),
+                               rng.choice(['troop', 'building', 'projectile', 'area']),
+                               rng.choice([None, 0, rng.randrange(6000)])))
+        if ents and rng.random() < 0.2:
+            ents.append(ents[0])                      # the same id twice in one state
+        plays = []
+        for o in (0, 1):
+            if rng.random() < 0.15:
+                seq += 1
+                plays.append(CardPlay(seq, tick, o, rng.choice(cards), rng.randrange(1, 8)))
+        players = tuple(Player(o, rng.randrange(0, 100001),
+                               tuple(HandCard(i, rng.choice(cards), rng.choice([-1, 1, 3, 9]), 0, 0)
+                                     for i in range(4) if rng.random() < 0.9),
+                               tuple(rng.choice(cards) for _ in range(rng.randrange(0, 6)))) for o in (0, 1))
+        states.append(State(1, tick, False, None, (rng.randrange(4), rng.randrange(4)), players, tuple(ents),
+                            tuple(plays), seq + 1))
+    return states
+
+
+class FastObserve(unittest.TestCase):
+    """il.fast_obs.Observer gives the rows the window-and-encode path gave, byte for byte."""
+
+    def test_same_rows_as_the_reference(self):
+        from .fast_obs import Observer
+        cards = [26000000 + i for i in range(30)] + [28000000 + i for i in range(5)]
+        vocab = {c: i + 2 for i, c in enumerate(cards[::2])}       # half the ids unknown (-> 1)
+        for seed in range(4):
+            states = _random_states(seed)
+            observer = Observer(vocab)
+            fast = [observer.observe(s) for s in states]
+            for owner in (0, 1):
+                for t, ref in enumerate(_reference_rows(states, owner, vocab)):
+                    for key in INPUT_KEYS:
+                        got = fast[t][owner][key]
+                        self.assertEqual(got.dtype, ref[key].dtype, f'{key} dtype')
+                        self.assertEqual(got.shape, ref[key].shape, f'{key} shape')
+                        self.assertEqual(got.tobytes(), ref[key].tobytes(), f'seed {seed} owner {owner} t={t} {key}')
+
+
 @unittest.skipUnless(engine_running() and PARQUET.exists(), 'needs the emulator engine and IL_Replay part 0')
 class EngineFeatures(unittest.TestCase):
     def test_agent_sees_what_training_sees(self):

@@ -134,7 +134,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
     actions from the decision server the learner names for each game (one of `servers`: a frozen opponent lives on
     one server, so its games go there). Local pipes or TCP connections (il.rl join) alike."""
     from native_engine import Play
-    from .model import Agent
+    from .fast_obs import Observer
     from .arena import make_match
     while True:
         learner.send(('new_game', index, None))
@@ -144,15 +144,14 @@ def play_games(index, delay, engine, vocab, learner, servers):
         match = make_match(spec['decks'], spec['seed'])
         models = spec['models']  # per seat: 'current' or a frozen opponent's key
         conn = servers[spec['server']]
-        agents = [Agent(None, vocab, owner) for owner in (0, 1)]
+        observer = Observer(vocab)  # both seats' rows, built once per state
         steps = [defaultdict(list) for _ in (0, 1)]
         state = engine.reset(match=match)
         crowns = (0, 0)
         timing = defaultdict(float)  # seconds per part of a decision, for the learner's log
         while True:
             t0 = time.perf_counter()
-            rows = hold_while_in_flight([{k: v[0, 0].numpy() for k, v in agents[o].observe(state).items()}
-                                         for o in (0, 1)], engine.pending)
+            rows = hold_while_in_flight(observer.observe(state), engine.pending)
             t1 = time.perf_counter()
             conn.send(('act', index, [((index, o), models[o], pack(rows[o])) for o in (0, 1)]))
             replies = receive(conn)

@@ -117,18 +117,13 @@ class Agent:
         self.reset()
 
     def reset(self):
-        self.lstm, self.previous, self.plays = None, None, []
+        from .fast_obs import Observer
+        self.lstm, self.observer = None, Observer(self.vocab, (self.owner,))
 
     def observe(self, state):
-        """Feature row for `state`; features only need the previous state and all plays so far."""
-        from native_engine.build_cache import encode  # Mac side only
-        window = [self.previous or state, state]
-        raw = encode({'states': window, 'commands': [], 'receipts': [], 'winner_matches': 0, 'crowns_matches': 0})
-        self.plays += [(1, p.tick, p.owner, p.card) for p in state.plays]  # state.plays: new since last capture
-        raw['plays'] = np.array(self.plays, np.int32).reshape(-1, 4)
-        self.previous = state
-        out = D.features(raw, self.owner, self.vocab)
-        return {k: torch.as_tensor(out[k][1:2])[None].to(self.device) for k in INPUT_KEYS}
+        """Feature row for `state` ([1, 1, ...] tensors); the observer keeps the previous state and the plays so far."""
+        row = self.observer.observe(state)[0]
+        return {k: torch.as_tensor(row[k])[None, None].to(self.device) for k in INPUT_KEYS}
 
     @torch.no_grad()
     def act(self, state):
