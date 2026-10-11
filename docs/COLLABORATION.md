@@ -1,0 +1,54 @@
+# Working with Arron (clapha)
+
+For Jason and his AI. Arron builds clapha (a Clash Royale bot console and clapha-engine, the engine this repo trains
+on) and sends fixes here as pull requests. This file says where things live, how training metrics reach Arron, and how
+lasting findings are recorded.
+
+## Where things live
+
+| What | Where | Public? |
+|---|---|---|
+| Training code, model, features | this repo | yes |
+| Pull requests from Arron (fixes, speed-ups) | this repo, from arronwang01/clash-royale-battle-engine | yes |
+| What the model's input lacks | [docs/MODEL_INPUTS.md](MODEL_INPUTS.md) | yes |
+| How the live client takes a play (deal, refill, elixir, timing) | [docs/GAME_INTEGRATION.md](GAME_INTEGRATION.md) | yes |
+| The engine: loader, per-build addresses, porting a new game build, engine reads per card | github.com/arronwang01/clapha-engine | **no** (Jason has access) |
+| Training metrics for Arron | this repo, branch `reports` (below) | yes |
+
+Rule of thumb: anything about the engine's insides (addresses, memory layouts, how a new game build is ported) goes to
+clapha-engine; everything else goes here.
+
+## Metrics for Arron
+
+    nohup python tools/report_metrics.py runs/ppo-general --every 900 > ~/report_metrics.out 2>&1 &
+
+Every 15 minutes it pushes the last 300 rows of `metrics.jsonl` plus host, time and `nvidia-smi` (GPU name,
+utilisation, memory) to the `reports` branch, from its own clone (~/.cr-reports): it never touches this checkout,
+`main` or unpushed work. When GitHub is unreachable it commits and pushes on the next round. Arron reads it with:
+
+    git fetch origin reports && git show origin/reports:reports/ppo-general.jsonl
+
+The fields that show where time goes (after PRs #3-#5): `collected_per_hour` vs `games_per_hour` (collectors or
+learner the limit?), `backlog` / `held_s`, `collector_ms`, `server_ms_per_call`, `mean_batch`, `update_s`, `wait_s`.
+
+## Lasting findings
+
+A finding is worth keeping when the next model, the next game build or the next person needs it: a game rule, a
+measured timing, a card's special state, an engine read. Each one is written down with **what it is, how it was
+measured or checked, on which build and date**, and **how to check it again**:
+
+- game and client rules → docs/GAME_INTEGRATION.md (here);
+- model input requirements → docs/MODEL_INPUTS.md (here);
+- engine reads, per-card engine states, porting notes → clapha-engine (private).
+
+Nothing is written as fact before it is checked; open questions are marked as open.
+
+## How docs/GAME_INTEGRATION.md is kept
+
+- It is measured on the live client with Arron's tap probe (in clapha) and each section says where its numbers come
+  from. The current numbers are from build 160402012 (October); Null's Royale runs the August build, where some
+  timings may differ (marked where known).
+- After a game update, or to test a new idea about the client: run the probe again, compare, and change the section
+  with its new date and evidence; old numbers move to the changelog at the end.
+- Arron edits it in clapha, next to the probe, and sends the same text here in the same change, so the two copies
+  never differ.
