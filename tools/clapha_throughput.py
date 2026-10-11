@@ -14,21 +14,21 @@ import random
 import time
 
 
-def worker(index, clapha, work, seconds, vocab_path, booting, start, out):
+def worker(index, clapha, work, seconds, vocab_path, start, out):
     log = os.open(f'runs/throughput-logs/worker-{index}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     os.dup2(log, 1)  # the engine's own chatter goes to the worker's log
     os.dup2(log, 2)
     from native_engine import Play
     from native_engine.clapha import ClaphaEngine
+    time.sleep(index // 4 * 8)  # boot 4 at a time: 16 at once crashed some (seen on a busy node)
     try:
-        with booting:  # many engines booting at once can crash one (seen at 16 on a busy node)
-            engine = ClaphaEngine(clapha)
+        engine = ClaphaEngine(clapha)
     except Exception as error:
-        out.put(('failed', repr(error)))
+        out.put(('failed', index, repr(error)))
         out.close()
         out.join_thread()
         os._exit(1)
-    out.put(('ready', None))
+    out.put(('ready', index, None))
     if work == 'features':
         from il import data as D
         from il.agent import Agent
@@ -56,31 +56,53 @@ def worker(index, clapha, work, seconds, vocab_path, booting, start, out):
             decisions += 1
         ticks += state.tick - first
         games += state.finalized
-    out.put(('done', (games, decisions, ticks)))
+    out.put(('done', index, (games, decisions, ticks)))
     out.close()
     out.join_thread()
     os._exit(0)  # the engine segfaults in its exit-time destructors
 
 
+def collect(out, workers, kind, timeout):
+    """Messages of `kind` from {index: process}; a worker that dies or stays silent counts as failed."""
+    import queue
+    got, failed, pending = {}, [], set(workers)
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        try:
+            tag, index, value = out.get(timeout=1)
+        except queue.Empty:
+            for i in [i for i in pending if workers[i].exitcode is not None]:
+                pending.discard(i)
+                failed.append((i, f'exit {workers[i].exitcode}'))
+            continue
+        pending.discard(index)
+        if tag == kind:
+            got[index] = value
+        else:
+            failed.append((index, value))
+    failed += [(i, 'timed out') for i in pending]
+    return got, failed
+
+
 def run(args, procs):
     ctx = mp.get_context('fork')
-    booting, start, out = ctx.Semaphore(4), ctx.Event(), ctx.Queue()
-    workers = [ctx.Process(target=worker, args=(i, args.clapha, args.work, args.seconds, args.vocab, booting, start, out))
+    start, out = ctx.Event(), ctx.Queue()
+    workers = [ctx.Process(target=worker, args=(i, args.clapha, args.work, args.seconds, args.vocab, start, out))
                for i in range(procs)]
     for w in workers:
         w.start()
-    booted = [out.get() for _ in workers]
-    failed = [why for kind, why in booted if kind == 'failed']
-    running = procs - len(failed)
+    ready, failed = collect(out, dict(enumerate(workers)), 'ready', timeout=60 + procs // 4 * 8)
+    print(f'    {len(ready)} of {procs} engines booted', flush=True)
     start.set()
-    results = [out.get()[1] for _ in range(running)]
+    results, lost = collect(out, {i: workers[i] for i in ready}, 'done', timeout=args.seconds + 60)
+    failed += lost
     for w in workers:
-        w.join()
-    games, decisions, ticks = map(sum, zip(*results))
+        w.join(timeout=5)
+    games, decisions, ticks = map(sum, zip(*results.values())) if results else (0, 0, 0)
     s = args.seconds
     if failed:
-        print(f'    {len(failed)} of {procs} engines failed to boot (logs in runs/throughput-logs/): {failed[0]}')
-    procs = running
+        print(f'    {len(failed)} workers failed or died (logs in runs/throughput-logs/): {failed[:3]}')
+    procs = max(len(results), 1)
     print(f'{procs:3d} procs [{args.work}]: {games / s:6.2f} games/s ({games / s * 3600:8,.0f}/h)  '
           f'{decisions / s:9,.0f} decisions/s  {ticks / s:11,.0f} ticks/s  '
           f'= {ticks / s / procs:8,.0f} ticks/s per process', flush=True)
@@ -94,7 +116,7 @@ if __name__ == '__main__':
     parser.add_argument('--work', choices=('state', 'features'), default='state')
     parser.add_argument('--vocab', default='data/cache/vocab.json')
     args = parser.parse_args()
-    print(f'cpus visible to this process: {len(os.sched_getaffinity(0))}', flush=True)
+    print(f'cpus visible to this process: {len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count()}', flush=True)
     os.makedirs('runs/throughput-logs', exist_ok=True)
     for procs in map(int, args.procs.split(',')):
         run(args, procs)
