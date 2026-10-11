@@ -179,6 +179,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
                 break
             t3 = time.perf_counter()
             transition = engine.step(plays, 5, delay=delay)
+            timing['dropped'] += transition.executed.count(False)  # plays the engine refused
             state = transition.state
             timing['engine'] += time.perf_counter() - t3
             for o in (0, 1):  # crowns taken minus crowns lost since the last decision
@@ -796,6 +797,7 @@ def main():
         outcomes = [t['outcome'] for t in trajectories if t['opponent'] != 'current']
         row = dict(update=step, collectors=len(conns), trajectories=played, games_per_hour=round(3600 * len(timed) / max(collect_time, 1e-9)),
                    collector_ms={k: round(1000 * sum(t[k] for t in timed) / decisions, 2) for k in ('features', 'wait', 'engine')},
+                   dropped_per_game=round(sum(t.get('dropped', 0) for t in timed) / max(len(timed), 1), 2),
                    server_s={k: round(served[k] / args.servers, 1) for k in ('receive', 'decide', 'reply')},
                    mean_batch=round(served['requests'] / max(served['batches'], 1), 1),
                    hours=(time.time() - started) / 3600, cycle_s=collect_time, wait_s=waited, update_s=time.time() - update_start,
