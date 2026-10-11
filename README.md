@@ -23,7 +23,7 @@ clapha.py                ClaphaEngine: the same interface and State on clapha-en
 emulator.py              build / install the probe, start the headless emulator, bootstrap, benchmark (Mac)
 build_cache.py           rebuild IL_Replay games (FirstLight's converter), cache raw states, build the deck pool
 prebuilt/libcrprobe.so   the probe, built from vendor/firstlight/probe (FirstLight's source + our live mode)
-il/data.py               features and labels from raw states (cache or live)
+il/data.py               features and labels from raw states (cache), and `Observer` (engine states, both seats)
 il/model.py              the policy and Agent (plays a checkpoint in any engine)
 il/train.py              imitation learning
 il/rl.py                 PPO: collectors, decision servers, learner; `il.rl join` for collectors in another job
@@ -85,7 +85,8 @@ nohup nice -n 10 env PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/ru
   --lr 2e-4 --games-per-update 256 --lam 0.98 --kl-coef 0.01 > ~/cr-engine/runs/ppo-general.out 2>&1 &
 ```
 
-With `--remote`, more collectors can join from another job (`sbatch tools/collectors.sbatch`, or
+With two GPUs in the job, `--server-device cuda:1` puts the decision servers on the second one, so the learner's
+update and the servers stop sharing a GPU (one A100 was 96% busy). With `--remote`, more collectors can join from another job (`sbatch tools/collectors.sbatch`, or
 `python -m il.rl join <run>`); they find the learner through `<run>/endpoint.json`, reconnect when it restarts
 and give up on a peer silent for 180 s. Not needed now: the decision servers, not the collectors, limit us.
 

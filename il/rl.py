@@ -134,7 +134,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
     actions from the decision server the learner names for each game (one of `servers`: a frozen opponent lives on
     one server, so its games go there). Local pipes or TCP connections (il.rl join) alike."""
     from native_engine import Play
-    from .fast_obs import Observer
+    from .data import Observer
     from .arena import make_match
     while True:
         learner.send(('new_game', index, None))
@@ -397,7 +397,9 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
     os.dup2(log, 1)
     os.dup2(log, 2)
     torch.set_num_threads(1)
-    device = pick_device(args.device)
+    device = pick_device(args.server_device or args.device)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)  # CUDA graphs and streams use the current device
     model, _ = load_policy(args.init, device)  # the architecture; weights come from `shared`
 
     def refresh():
@@ -620,6 +622,8 @@ def main():
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
     parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--device', default='auto', help="'auto': cuda if available, decided in each process after forking")
+    parser.add_argument('--server-device', help="the decision servers' device (default: --device), e.g. cuda:1 "
+                        "with two GPUs: the learner's update and the servers stop sharing one")
     parser.add_argument('--remote', action='store_true',
                         help='accept collectors from other jobs (python -m il.rl join <out>); address in <out>/endpoint.json')
     args = parser.parse_args()

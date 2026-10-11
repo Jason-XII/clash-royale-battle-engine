@@ -1,6 +1,5 @@
 """Small recurrent policy: entities scattered onto the 32x18 tile grid, a conv tower, one LSTM,
 and a joint (wait | ability | hand slot x cell) action head (~0.9M parameters); `Agent` plays a checkpoint in any engine."""
-import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -117,7 +116,7 @@ class Agent:
         self.reset()
 
     def reset(self):
-        from .fast_obs import Observer
+        from .data import Observer
         self.lstm, self.observer = None, Observer(self.vocab, (self.owner,))
 
     def observe(self, state):

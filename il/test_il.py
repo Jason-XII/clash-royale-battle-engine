@@ -185,7 +185,7 @@ class PPOServer(unittest.TestCase):
             rl.REPLY_TIMEOUT = old
 
 def _reference_rows(states, owner, vocab):
-    """The rows Agent.observe built before il.fast_obs: a [previous, state] window through build_cache.encode and
+    """The rows Agent.observe built before il.data.Observer: a [previous, state] window through build_cache.encode and
     data.features, with every play so far."""
     from native_engine.build_cache import encode
     previous, plays, out = None, [], []
@@ -243,10 +243,10 @@ def _random_states(seed, steps=300):
 
 
 class FastObserve(unittest.TestCase):
-    """il.fast_obs.Observer gives the rows the window-and-encode path gave, byte for byte."""
+    """il.data.Observer gives the rows the window-and-encode path gave, byte for byte."""
 
     def test_same_rows_as_the_reference(self):
-        from .fast_obs import Observer
+        from .data import Observer
         cards = [26000000 + i for i in range(30)] + [28000000 + i for i in range(5)]
         vocab = {c: i + 2 for i, c in enumerate(cards[::2])}       # half the ids unknown (-> 1)
         for seed in range(4):
