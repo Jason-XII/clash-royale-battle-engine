@@ -141,7 +141,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
             t0 = time.perf_counter()
             rows = [{k: v[0, 0].numpy() for k, v in agents[o].observe(state).items()} for o in (0, 1)]
             t1 = time.perf_counter()
-            conn.send(('act', index, [((index, o), models[o], rows[o]) for o in (0, 1)]))
+            conn.send(('act', index, [((index, o), models[o], pack(rows[o])) for o in (0, 1)]))
             replies = receive(conn)
             t2 = time.perf_counter()
             timing['features'] += t1 - t0
@@ -191,115 +191,150 @@ def load_policy(path, device):
     return model.to(device), saved
 
 
-GRAPH_BUCKETS = (8, 16, 32, 64, 128)  # batch sizes a recorded forward pass is padded to
+GRAPH_BUCKETS = (8, 16, 32, 64, 128)  # batch sizes a recorded decision is padded to
+
+# A feature row travels as one byte row (8-byte aligned: int64 fields, then float32, then bool), so a server copies
+# a model's whole batch to the GPU at once and views the fields back out of it.
+LAYOUT = [(k, np.int64, (D.MAX_ENTITIES,)) for k in ('ent_obj', 'ent_side', 'ent_type', 'ent_cell')] + [
+    ('rev_card', np.int64, (D.REVEALED,)), ('hand_card', np.int64, (4,)), ('next_card', np.int64, ()),
+    ('ent_float', np.float32, (D.MAX_ENTITIES, D.ENTITY_FLOATS)), ('rev_age', np.float32, (D.REVEALED,)),
+    ('scalars', np.float32, (D.SCALARS,)), ('hand_cost', np.float32, (4,)), ('slot_ok', np.bool_, (4,))]
+assert sorted(k for k, _, _ in LAYOUT) == sorted(INPUT_KEYS)
 
 
-class GraphedForward:
-    """One model's forward pass for a fixed batch, recorded as a CUDA graph and replayed with one launch (an eager
-    call costs ~4 ms of kernel launches whatever its batch). Weights are read from the model's own tensors, which
-    load_state_dict updates in place; autocast's weight cache is off so no stale bf16 copy is recorded."""
+def _fields():
+    fields, start = [], 0
+    for key, dtype, shape in LAYOUT:
+        end = start + int(np.prod(shape)) * np.dtype(dtype).itemsize
+        fields.append((key, dtype, shape, start, end))
+        start = end
+    return fields, -(-start // 8) * 8
 
-    def __init__(self, model, batch, example):
-        device = example['scalars'].device
-        self.x = {k: v[:1].repeat(batch, *[1] * (v.dim() - 1)).contiguous() for k, v in example.items()}
-        self.h = torch.zeros(1, batch, model.config['core'], device=device)
-        self.c = torch.zeros_like(self.h)
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side), torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
-            for _ in range(3):
-                model(self.x, (self.h, self.c))
-        torch.cuda.current_stream().wait_stream(side)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph), torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
-            self.out = model(self.x, (self.h, self.c))
 
-    def __call__(self, x, h, c):
-        n = h.shape[1]
-        for k, v in x.items():
-            self.x[k][:n].copy_(v)
-        self.h[:, :n].copy_(h)
-        self.c[:, :n].copy_(c)
-        self.graph.replay()
-        logits, value, (h, c) = self.out
-        return logits[:n], value[:n], (h[:, :n], c[:, :n])
+FIELDS, ROW_BYTES = _fields()  # (key, dtype, shape, start byte, end byte); bytes per row
+TORCH_DTYPES = {np.int64: torch.int64, np.float32: torch.float32, np.bool_: torch.bool}
+
+
+def pack(row):
+    """A feature row (dict of arrays, il.data.features) -> one uint8 array of ROW_BYTES."""
+    out = np.zeros(ROW_BYTES, np.uint8)
+    for key, dtype, shape, start, end in FIELDS:
+        out[start:end] = np.ascontiguousarray(row[key], dtype).reshape(-1).view(np.uint8)
+    return out
+
+
+def unpack(rows):
+    """[n, ROW_BYTES] uint8 tensor -> model inputs ([n, 1, ...] views of it, no copy)."""
+    return {key: rows[:, start:end].view(TORCH_DTYPES[dtype]).reshape(len(rows), 1, *shape)
+            for key, dtype, shape, start, end in FIELDS}
 
 
 class Server:
-    """Batched decisions for every collector. Each seat's LSTM state lives in one row of a preallocated GPU
-    tensor (gathered and written back by index); results come back to the CPU in one transfer per call. On a
-    GPU, forward passes replay recorded CUDA graphs (checked against an eager pass when recorded; a failed check
-    falls back to eager calls)."""
+    """Batched decisions for every collector. Each seat's LSTM state lives in one row of a preallocated GPU tensor
+    (the last row is a scratch row for padding). One decision of one model - gather the seats' states, forward,
+    write the states back, sample, log-prob - is one function; on a GPU it is recorded as a CUDA graph per batch
+    bucket (checked against an eager pass when recorded; a failed check falls back to eager calls), so a model's
+    share of a round is one input copy, one graph launch and one copy back."""
 
-    def __init__(self, models, device, core):
+    def __init__(self, models, device, core, capacity=256):
         self.models, self.device, self.core = models, device, core
         self.rows = {}  # seat -> row in self.h / self.c
-        self.h = self.c = torch.zeros(1, 0, core, device=device)
-        self.graphs = {} if device.type == 'cuda' else None  # (model key, bucket) -> GraphedForward
+        self._allocate(capacity)
 
-    def _forward(self, key, x, h, c):
-        model, n = self.models[key], h.shape[1]
-        bucket = next((b for b in GRAPH_BUCKETS if b >= n), None)
-        if self.graphs is not None and bucket:
-            if (key, bucket) not in self.graphs:
-                self.graphs[(key, bucket)] = self._record(model, bucket, x, h, c)
-            graphed = self.graphs.get((key, bucket))
-            if graphed is not None:
-                return graphed(x, h, c)
-        with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda'):
-            return model(x, (h, c))
+    def _allocate(self, capacity):
+        h = torch.zeros(1, capacity + 1, self.core, device=self.device)
+        c = torch.zeros_like(h)
+        if hasattr(self, 'h'):
+            h[:, :self.capacity], c[:, :self.capacity] = self.h[:, :self.capacity], self.c[:, :self.capacity]
+        self.h, self.c, self.capacity = h, c, capacity
+        self.graphs = {} if self.device.type == 'cuda' else None  # (model key, bucket) -> recorded decision
 
-    def _record(self, model, bucket, x, h, c):
-        """A recorded forward pass for `bucket`, or None (logged) if recording fails or disagrees with eager."""
+    def _decide(self, model, rows, index):
+        """Decisions for `rows` (uint8 [n, ROW_BYTES]) of seats in state rows `index`: [n, 3] (action, logp, value)."""
+        h, c = self.h.index_select(1, index), self.c.index_select(1, index)
+        # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
+        with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda', cache_enabled=False):
+            logits, value, (h, c) = model(unpack(rows), (h, c))
+        self.h.index_copy_(1, index, h.float())
+        self.c.index_copy_(1, index, c.float())
+        dist = distribution(logits[:, 0])
+        action = sample(dist)
+        return torch.stack([action.float(), log_prob(dist, action), value[:, 0].float()], 1), logits, value
+
+    def _record(self, model, rows, index):
+        """`rows` / `index` padded to a bucket -> a recorded decision for that bucket, or None (logged)."""
+        saved = self.h.clone(), self.c.clone()
+
+        def restore():
+            self.h.copy_(saved[0])
+            self.c.copy_(saved[1])
         try:
-            graphed = GraphedForward(model, bucket, x)
-            got = [t.float() for t in (graphed(x, h, c)[0], graphed(x, h, c)[1])]
-            with torch.autocast('cuda', torch.bfloat16):
-                want = [t.float() for t in model(x, (h, c))[:2]]
+            g = {'rows': rows.clone(), 'index': index.clone(), 'graph': torch.cuda.CUDAGraph()}
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    self._decide(model, g['rows'], g['index'])
+            torch.cuda.current_stream().wait_stream(side)
+            restore()
+            with torch.cuda.graph(g['graph']):
+                g['out'], logits, value = self._decide(model, g['rows'], g['index'])
+            g['graph'].replay()
+            got = logits.float().clone(), value.float().clone()
+            restore()
+            want = [t.float() for t in self._decide(model, rows, index)[1:]]
+            restore()
             finite = torch.isfinite(want[0])
             same = (torch.equal(finite, torch.isfinite(got[0]))
                     and torch.allclose(got[0][finite], want[0][finite], atol=0.05, rtol=0.05)
                     and torch.allclose(got[1], want[1], atol=0.05, rtol=0.05))
-            print(f'CUDA graph for batch {bucket}: {"ok" if same else "MISMATCH, using eager calls"}', flush=True)
-            return graphed if same else None
+            print(f'CUDA graph for batch {len(index)}: {"ok" if same else "MISMATCH, using eager calls"}', flush=True)
+            return g if same else None
         except Exception as error:  # noqa: BLE001 - any recording failure: keep the eager path
-            print(f'CUDA graph for batch {bucket} failed ({error!r}); using eager calls', flush=True)
+            restore()
+            print(f'CUDA graph for batch {len(index)} failed ({error!r}); using eager calls', flush=True)
             return None
 
     def _rows(self, seats):
         for seat in seats:
             if seat not in self.rows:
                 self.rows[seat] = len(self.rows)
-        if len(self.rows) > self.h.shape[1]:  # grow, keeping the existing rows
-            grow = torch.zeros(1, max(64, len(self.rows)), self.core, device=self.device)
-            self.h, self.c = torch.cat([self.h, grow], 1), torch.cat([self.c, grow.clone()], 1)
-        return torch.tensor([self.rows[seat] for seat in seats], device=self.device)
+        if len(self.rows) > self.capacity:  # more seats than rows: grow (recorded graphs point at the old rows)
+            self._allocate(2 * len(self.rows))
+        return np.array([self.rows[seat] for seat in seats], np.int64)
 
     @torch.no_grad()
     def act(self, requests):
-        """requests: [(seat, model key, feature row)] -> [(action, logp, value)] in the same order."""
-        out = [None] * len(requests)
+        """requests: [(seat, model key, packed feature row)] -> [(action, logp, value)] in the same order."""
         by_model = defaultdict(list)
         for i, (seat, key, row) in enumerate(requests):
             by_model[key].append(i)
-        # every input of the round stacked and copied once; each model then takes its own rows on the device
-        everything = {k: torch.from_numpy(np.stack([r[2][k] for r in requests]))[:, None].to(self.device, non_blocking=True)
-                      for k in INPUT_KEYS}
-        whole = len(by_model) == 1
-        for key, idx in by_model.items():
-            rows = self._rows([requests[i][0] for i in idx])
-            pick = None if whole else torch.tensor(idx, device=self.device)
-            x = everything if whole else {k: v.index_select(0, pick) for k, v in everything.items()}
-            # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
-            logits, value, (h, c) = self._forward(key, x, self.h[:, rows], self.c[:, rows])
-            self.h[:, rows], self.c[:, rows] = h.float(), c.float()
-            dist = distribution(logits[:, 0])
-            action = sample(dist)
-            result = torch.stack([action.float(), log_prob(dist, action), value[:, 0].float()], 1).cpu().tolist()
-            for j, i in enumerate(idx):
-                a, logp, v = result[j]
-                out[i] = (int(a), logp, v)
-        return out
+        pending = []
+        for key, idx in by_model.items():  # every model's share launched before the first copy back waits
+            n, index = len(idx), self._rows([requests[i][0] for i in idx])
+            bucket = next((b for b in GRAPH_BUCKETS if b >= n), None) if self.graphs is not None else None
+            rows = np.stack([requests[i][2] for i in idx])
+            if bucket:
+                rows = np.concatenate([rows, np.zeros((bucket - n, ROW_BYTES), np.uint8)])
+                index = np.concatenate([index, np.full(bucket - n, self.capacity)])  # padding uses the scratch row
+            rows = torch.from_numpy(rows).to(self.device, non_blocking=True)
+            index = torch.from_numpy(index).to(self.device, non_blocking=True)
+            if bucket and (key, bucket) not in self.graphs:
+                self.graphs[(key, bucket)] = self._record(self.models[key], rows, index)
+            g = self.graphs.get((key, bucket)) if bucket else None
+            if g is None:
+                out = self._decide(self.models[key], rows, index)[0]
+            else:
+                g['rows'].copy_(rows)
+                g['index'].copy_(index)
+                g['graph'].replay()
+                out = g['out']
+            pending.append((idx, out[:n]))
+        results = [None] * len(requests)
+        for idx, out in pending:
+            for i, (a, logp, v) in zip(idx, out.cpu().tolist()):
+                results[i] = (int(a), logp, v)
+        return results
 
     def reset(self, seats):
         """A seat's game ended: its next game starts from a zero LSTM state."""
@@ -664,48 +699,67 @@ def main():
         print(f'published weights version {version.value}: first parameter sum '
               f'{next(model.parameters()).sum().item():.6f}', flush=True)
 
-    buffer, played, started = [], 0, time.time()
+    ready, failed = queue.Queue(), []  # finished trajectories; why collecting stopped
+    played = 0
+
+    def serve_collectors():
+        """A thread that keeps the collectors busy (new games, trajectories) while the main thread trains."""
+        nonlocal next_remote, self_play_games, played
+        try:
+            while True:
+                while not arrivals.empty():
+                    conns.append(arrivals.get())
+                if not conns:
+                    if not args.remote:
+                        raise RuntimeError('every collector died')
+                    time.sleep(0.5)
+                    continue
+                for conn in wait(conns, timeout=1):
+                    try:
+                        kind, index, payload = conn.recv()
+                    except (EOFError, OSError):  # a collector died, or a remote one's job ended; its log says why
+                        conns.remove(conn)
+                        print(f'a collector left ({len(conns)} connected); see {out}/logs/', flush=True)
+                        continue
+                    if kind == 'hello':  # a remote collector: its number
+                        conn.send({'index': next_remote})
+                        next_remote += 1
+                    elif kind == 'new_game':
+                        # A frozen opponent's games all go to its home server (pool position % servers): a server
+                        # then runs the current model and its own opponents, not every model of the pool, each round.
+                        learner_seat = random.randrange(2)
+                        models = ['current', 'current']
+                        if random.random() >= args.self_play:
+                            models[1 - learner_seat] = pick_opponent()
+                            server = frozen.index(models[1 - learner_seat]) % args.servers
+                        else:
+                            server = self_play_games % args.servers
+                            self_play_games += 1
+                        conn.send(dict(decks=random.choice(deck_pairs), seed=random.randrange(1 << 30),
+                                       models=models, server=server))
+                    elif kind == 'trajectory':
+                        if payload['opponent'] != 'current':
+                            results[payload['opponent']].append(payload['outcome'])
+                        played += 1
+                        ready.put(payload)
+        except BaseException as error:  # noqa: BLE001 - reported by the main thread
+            failed.append(error)
+
+    threading.Thread(target=serve_collectors, daemon=True).start()
+    started = last = time.time()
     metrics = open(out / 'metrics.jsonl', 'a')
     for update_index in range(start_update, args.updates):
-        collect_start = time.time()
-        while len(buffer) < args.games_per_update:
-            while not arrivals.empty():
-                conns.append(arrivals.get())
-            if not conns:
-                if not args.remote:
-                    raise RuntimeError('every collector died')
-                time.sleep(0.5)
-                continue
-            for conn in wait(conns, timeout=1):
-                try:
-                    kind, index, payload = conn.recv()
-                except (EOFError, OSError):  # a collector died, or a remote one's job ended; its log says why
-                    conns.remove(conn)
-                    print(f'a collector left ({len(conns)} connected); see {out}/logs/', flush=True)
-                    continue
-                if kind == 'hello':  # a remote collector: its number
-                    conn.send({'index': next_remote})
-                    next_remote += 1
-                elif kind == 'new_game':
-                    # A frozen opponent's games all go to its home server (pool position % servers): a server then
-                    # runs the current model and its own opponents, not every model of the pool, in each round.
-                    learner_seat = random.randrange(2)
-                    models = ['current', 'current']
-                    if random.random() >= args.self_play:
-                        models[1 - learner_seat] = pick_opponent()
-                        server = frozen.index(models[1 - learner_seat]) % args.servers
-                    else:
-                        server = self_play_games % args.servers
-                        self_play_games += 1
-                    conn.send(dict(decks=random.choice(deck_pairs), seed=random.randrange(1 << 30), models=models,
-                                   server=server))
-                elif kind == 'trajectory':
-                    buffer.append(payload)
-                    if payload['opponent'] != 'current':
-                        results[payload['opponent']].append(payload['outcome'])
-                    played += 1
-        collect_time = time.time() - collect_start
-        trajectories, buffer = buffer[:args.games_per_update], buffer[args.games_per_update:]
+        # Games keep being played (with the previous weights) while an update runs; PPO's ratio uses the log-probs
+        # they were played with.
+        trajectories = []
+        while len(trajectories) < args.games_per_update:
+            if failed:
+                raise failed[0]
+            try:
+                trajectories.append(ready.get(timeout=1))
+            except queue.Empty:
+                pass
+        collect_time = time.time() - last  # wall clock since the last update: collection overlaps updates
         update_start = time.time()
         model.train()
         stats_row = update(model, reference, optimizer, trajectories, args, device)
@@ -713,6 +767,7 @@ def main():
         publish()
         step = update_index + 1
         save(out / 'latest.pt', model, saved, optimizer, {'update': step})
+        last = time.time()
         if step % args.snapshot_every == 0:
             path = out / 'pool' / f'update-{step:05d}.pt'
             save(path, model, saved)
@@ -734,7 +789,7 @@ def main():
                    plays_per_game=float(np.mean([(t['action'] >= 2).sum() for t in trajectories])),
                    full_elixir=float(np.mean(np.concatenate([t['full'] for t in trajectories]))),
                    score_vs_pool=float(np.mean(outcomes)) if outcomes else None,
-                   pool={k: round(float(np.mean(v)), 3) for k, v in results.items() if v}, **stats_row)
+                   pool={k: round(float(np.mean(v)), 3) for k, v in list(results.items()) if v}, **stats_row)
         metrics.write(json.dumps(row) + '\n')
         metrics.flush()
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()}), flush=True)

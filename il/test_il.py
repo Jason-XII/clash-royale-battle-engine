@@ -118,7 +118,7 @@ class PPOServer(unittest.TestCase):
     """il.rl.Server keeps every seat's LSTM state apart: interleaved seats see what one full-sequence pass sees."""
 
     def test_interleaved_seats_match_full_sequences(self):
-        from .rl import Server
+        from .rl import Server, pack
         torch.manual_seed(0)
         shard = D.Shard(CACHE)
         vocab = D.build_vocab([CACHE])
@@ -127,23 +127,23 @@ class PPOServer(unittest.TestCase):
         T = 12
         with torch.no_grad():
             full = [model({k: torch.as_tensor(s[k][:T])[None] for k in INPUT_KEYS})[1][0] for s in seqs]
-        server = Server({'current': model}, torch.device('cpu'), model.config['core'])
+        server = Server({'current': model}, torch.device('cpu'), model.config['core'], capacity=1)  # grows
         got = [[] for _ in seqs]
         for t in range(T):
             order = [2, 0, 1] if t % 2 else [0, 1, 2]  # requests arrive in varying order
-            reqs = [((g, 0), 'current', {k: seqs[g][k][t] for k in INPUT_KEYS}) for g in order]
+            reqs = [((g, 0), 'current', pack({k: seqs[g][k][t] for k in INPUT_KEYS})) for g in order]
             for g, (_, _, value) in zip(order, server.act(reqs)):
                 got[g].append(value)
         for g in range(3):
             self.assertTrue(torch.allclose(torch.tensor(got[g]), full[g], atol=1e-4))
         server.reset([(0, 0)])  # a new game for seat 0 starts from zero state again
-        _, _, value = server.act([((0, 0), 'current', {k: seqs[0][k][0] for k in INPUT_KEYS})])[0]
+        _, _, value = server.act([((0, 0), 'current', pack({k: seqs[0][k][0] for k in INPUT_KEYS}))])[0]
         self.assertAlmostEqual(value, full[0][0].item(), places=4)
 
 
     def test_mixed_models_in_one_round(self):
         """Requests for two models in one round: each model gets exactly its own rows."""
-        from .rl import Server
+        from .rl import Server, pack
         torch.manual_seed(1)
         shard = D.Shard(CACHE)
         vocab = D.build_vocab([CACHE])
@@ -156,7 +156,7 @@ class PPOServer(unittest.TestCase):
         server = Server(models, torch.device('cpu'), models['a'].config['core'])
         got = [[] for _ in seqs]
         for t in range(T):
-            reqs = [((g, 0), keys[g], {k: seqs[g][k][t] for k in INPUT_KEYS}) for g in (3, 0, 2, 1)]
+            reqs = [((g, 0), keys[g], pack({k: seqs[g][k][t] for k in INPUT_KEYS})) for g in (3, 0, 2, 1)]
             for g, (_, _, value) in zip((3, 0, 2, 1), server.act(reqs)):
                 got[g].append(value)
         for g in range(4):

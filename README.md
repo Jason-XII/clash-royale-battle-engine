@@ -116,9 +116,13 @@ towards the IL policy. Decks: real ladder deck pairs with evolutions and the gam
 `approx_kl` / `clip_frac`, `value_ev_mc` / `value_ev_gae` (is the value head an informative baseline?),
 `plays_per_game`, `full_elixir`, and where time goes: `collector_ms`, `server_s`, `mean_batch`, `games_per_hour`.
 
-**Throughput** on our allocation (8 physical cores / 16 hyper-threads, one A100): ~13.5k games per hour. The
-engine steps at ~59k ticks/s per core, so the ceiling is the decision servers (Python per batch, GPU mostly
-idle), not the engines.
+**Throughput** on our allocation (8 physical cores / 16 hyper-threads, one A100): ~9.2k games per hour of wall
+clock before the changes below (the log's `games_per_hour` then left out the PPO update, during which collectors
+stalled). Now the learner keeps receiving games while it trains (`collect_s` and `games_per_hour` are wall clock
+per update), and a server call is one packed input copy, one CUDA graph (state gather, forward, sampling) and one
+copy back per model: 1.7 ms instead of 3.2 ms, and 2.3 ms instead of 9.0 ms when a frozen opponent shares the
+round. Per game, collectors spend ~1.5 CPU-s on features and ~0.8 CPU-s in the engine, so the node's CPUs are the
+next limit; more collectors in a second job (`tools/collectors.sbatch`) add CPUs.
 
 ## 4. Evaluation
 
