@@ -18,7 +18,10 @@ import argparse
 from collections import defaultdict, deque
 import json
 import multiprocessing as mp
-from multiprocessing.connection import wait
+from multiprocessing.connection import Listener, wait
+import queue
+import socket
+import threading
 import os
 from pathlib import Path
 import random
@@ -81,20 +84,32 @@ def sample(dist):
 
 
 # ---- collectors ---------------------------------------------------------------------------------------------------------
-def collector(index, args, learner, conn):
-    """Plays games; asks its decision server (`conn`) for actions and the learner for games and trajectories."""
-    log = os.open(f'{args.out}/logs/collector-{index}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+def collector_engine(name, out, clapha, stagger):
+    """A collector process's log, CPU priority and booted engine (+ the run's vocab)."""
+    log = os.open(f'{out}/logs/collector-{name}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     os.dup2(log, 1)
     os.dup2(log, 2)
-    time.sleep(index // 4 * 8)  # boot 4 engines at a time
+    time.sleep(stagger)  # engines boot a few at a time
     os.nice(5)  # the decision servers are the bottleneck on a busy node: let them run first
     torch.set_num_threads(1)
-    from native_engine import Play
     from native_engine.clapha import ClaphaEngine
+    return ClaphaEngine(clapha), D.load_vocab(Path(out) / 'vocab.json')
+
+
+def collector(index, args, learner, conn):
+    """A collector on the learner's node, connected by pipes."""
+    engine, vocab = collector_engine(index, args.out, args.clapha, index // 4 * 8)
+    play_games(index, args.delay, engine, vocab, learner, conn)
+    conn.close()
+    os._exit(0)  # the engine segfaults in its exit-time destructors
+
+
+def play_games(index, delay, engine, vocab, learner, conn):
+    """Plays the learner's games until it sends None: actions from the decision server (`conn`), games and
+    trajectories through the learner (`learner`). Local pipes or TCP connections (il.collect) alike."""
+    from native_engine import Play
     from .agent import Agent
     from .arena import make_match
-    engine = ClaphaEngine(args.clapha)
-    vocab = D.load_vocab(Path(args.out) / 'vocab.json')
     while True:
         learner.send(('new_game', index, None))
         spec = learner.recv()
@@ -135,7 +150,7 @@ def collector(index, args, learner, conn):
             if state.finalized or state.tick >= 7200:
                 break
             t3 = time.perf_counter()
-            transition = engine.step(plays, 5, delay=args.delay)
+            transition = engine.step(plays, 5, delay=delay)
             state = transition.state
             timing['engine'] += time.perf_counter() - t3
             for o in (0, 1):  # crowns taken minus crowns lost since the last decision
@@ -151,8 +166,6 @@ def collector(index, args, learner, conn):
                 learner.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o], timing=timing)))
                 timing = {}  # counted once per game
         conn.send(('reset', index, [(index, 0), (index, 1)]))
-    conn.close()
-    os._exit(0)  # the engine segfaults in its exit-time destructors
 
 
 # ---- learner ------------------------------------------------------------------------------------------------------------
@@ -284,10 +297,33 @@ def pick_device(name):
     return torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if name == 'auto' else name)
 
 
+def accept_into(listener, arrivals):
+    """A daemon thread putting every connection `listener` accepts into the queue `arrivals`."""
+    def run():
+        while True:
+            try:
+                arrivals.put(listener.accept())
+            except Exception as error:  # noqa: BLE001 - a failed handshake (wrong key, port scan) is not fatal
+                print(f'refused a connection: {error!r}', flush=True)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def reachable_ip():
+    """This node's address on the cluster network (no packet is sent)."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(('10.255.255.255', 1))
+        return probe.getsockname()[0]
+    except OSError:
+        return socket.gethostbyname(socket.gethostname())
+    finally:
+        probe.close()
+
+
 STATS = ('receive', 'decide', 'reply', 'batches', 'requests')  # per decision server, summed into the log
 
 
-def decision_server(sid, args, conns, shared, version, lock, snapshots, stats):
+def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, listener=None):
     """Answers its collectors' decisions in batched GPU calls with the learner's latest weights (`shared`,
     re-read whenever `version` changes) and the frozen opponents (`snapshots` announces new ones)."""
     log = os.open(f'{args.out}/logs/server-{sid}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
@@ -309,7 +345,15 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats):
     server = Server({'current': model.eval(), **{k: load_policy(v, device)[0].eval() for k, v in pool.items()}},
                     device, model.config['core'])
     owners, first, window = [], None, args.batch_ms / 1000  # [(collector pipe, its requests)]
-    while conns:
+    arrivals = queue.Queue()  # remote collectors (il.collect) joining at any time
+    if listener is not None:
+        accept_into(listener, arrivals)
+    while True:
+        while not arrivals.empty():
+            conns.append(arrivals.get())
+        if not conns:
+            time.sleep(0.05)
+            continue
         if version.value != seen:
             seen = refresh()
         while not snapshots.empty():
@@ -320,7 +364,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats):
         for conn in wait(conns, timeout=timeout):
             try:
                 kind, index, payload = conn.recv()
-            except EOFError:  # its collector died or finished
+            except (EOFError, OSError):  # its collector died, finished or (remote) lost its job
                 conns.remove(conn)
                 owners = [(c, r) for c, r in owners if c is not conn]
                 continue
@@ -342,7 +386,6 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats):
             for j, value in enumerate((0, t2 - t1, time.perf_counter() - t2, 1, len(requests))):
                 stats[sid * len(STATS) + j] += value
             owners, first = [], None
-    os._exit(0)
 
 
 def advantages(trajectory, gamma, lam):
@@ -429,6 +472,8 @@ def main():
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (tools/build_deck_pool.py)')
     parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--device', default='auto', help="'auto': cuda if available, decided in each process after forking")
+    parser.add_argument('--remote', action='store_true',
+                        help='accept collectors from other jobs (python -m il.collect <out>); address in <out>/endpoint.json')
     args = parser.parse_args()
     out = Path(args.out)
     from native_engine.clapha import raise_thread_limit
@@ -446,6 +491,12 @@ def main():
     if torch.cuda.is_initialized():
         raise RuntimeError('CUDA started before forking the decision servers; they could not use it')
     ctx = mp.get_context('fork')
+    if args.remote:  # listeners before forking: each server inherits its own
+        authkey = os.urandom(16)
+        learner_listener = Listener(('0.0.0.0', 0), authkey=authkey)
+        server_listeners = [Listener(('0.0.0.0', 0), authkey=authkey) for _ in range(args.servers)]
+    else:
+        learner_listener, server_listeners = None, [None] * args.servers
     shared = {k: v.clone().share_memory_() for k, v in cpu_model.state_dict().items()}
     version, lock = ctx.Value('i', 0), ctx.Lock()
     stats = ctx.Array('d', args.servers * len(STATS))
@@ -464,10 +515,23 @@ def main():
 
     for sid in range(args.servers):
         mine = [to_server[i][0] for i in range(args.collectors) if i % args.servers == sid]
-        start(decision_server, mine, sid, args, mine, shared, version, lock, snapshot_queues[sid], stats)
+        start(decision_server, mine, sid, args, mine, shared, version, lock, snapshot_queues[sid], stats,
+              server_listeners[sid])
     for i in range(args.collectors):
         start(collector, [to_learner[i][1], to_server[i][1]], i, args, to_learner[i][1], to_server[i][1])
     conns = [learner_end for learner_end, _ in to_learner]
+    arrivals, next_remote = queue.Queue(), 100000  # remote collectors' numbers start here
+    if args.remote:
+        accept_into(learner_listener, arrivals)
+        ip = reachable_ip()
+        endpoint = {'learner': [ip, learner_listener.address[1]],
+                    'servers': [[ip, listener.address[1]] for listener in server_listeners],
+                    'authkey': authkey.hex(), 'host': socket.gethostname(), 'clapha': args.clapha,
+                    'out': str(out.resolve()), 'delay': args.delay, 'started': time.time()}
+        path = out / 'endpoint.json'
+        path.write_text(json.dumps(endpoint))
+        path.chmod(0o600)  # the key admits collectors
+        print(f'remote collectors: python -m il.collect {out.resolve()} (learner at {ip}:{endpoint["learner"][1]})', flush=True)
     for c in every:
         if not any(c is k for k in conns):
             c.close()
@@ -503,16 +567,24 @@ def main():
     for update_index in range(start_update, args.updates):
         collect_start = time.time()
         while len(buffer) < args.games_per_update:
+            while not arrivals.empty():
+                conns.append(arrivals.get())
+            if not conns:
+                if not args.remote:
+                    raise RuntimeError('every collector died')
+                time.sleep(0.5)
+                continue
             for conn in wait(conns, timeout=1):
                 try:
                     kind, index, payload = conn.recv()
-                except EOFError:  # the collector died; its log says why
+                except (EOFError, OSError):  # a collector died, or a remote one's job ended; its log says why
                     conns.remove(conn)
-                    print(f'a collector died ({len(conns)} left); see {out}/logs/', flush=True)
-                    if not conns:
-                        raise RuntimeError('every collector died')
+                    print(f'a collector left ({len(conns)} connected); see {out}/logs/', flush=True)
                     continue
-                if kind == 'new_game':
+                if kind == 'hello':  # a remote collector: its number and its decision server
+                    conn.send({'index': next_remote, 'server': next_remote % args.servers})
+                    next_remote += 1
+                elif kind == 'new_game':
                     learner_seat = random.randrange(2)
                     models = ['current', 'current']
                     if random.random() >= args.self_play:
@@ -544,7 +616,7 @@ def main():
         timed = [t['timing'] for t in trajectories if t['timing']]
         decisions = sum(t['decisions'] for t in timed) or 1
         outcomes = [t['outcome'] for t in trajectories if t['opponent'] != 'current']
-        row = dict(update=step, trajectories=played, games_per_hour=round(3600 * len(timed) / max(collect_time, 1e-9)),
+        row = dict(update=step, collectors=len(conns), trajectories=played, games_per_hour=round(3600 * len(timed) / max(collect_time, 1e-9)),
                    collector_ms={k: round(1000 * sum(t[k] for t in timed) / decisions, 2) for k in ('features', 'wait', 'engine')},
                    server_s={k: round(served[k] / args.servers, 1) for k in ('receive', 'decide', 'reply')},
                    mean_batch=round(served['requests'] / max(served['batches'], 1), 1),
