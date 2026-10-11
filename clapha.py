@@ -6,22 +6,38 @@ emulator). Same interface and State as Engine, so il/ agents and features run un
     transition = engine.step([Play(owner, slot, x, y)], 5)
 
 Differences from the probe, each filled to match it:
-  - card costs: card_costs.json (built from the cache); variable-cost cards ask the engine's card selection
+  - card costs: COSTS (from the cache); variable-cost cards ask the engine's card selection
   - card plays: the probe logs them as consumed; here a card that left a hand between snapshots was played
   - projectile vs area (objects without hitpoints): by the class of the object's data global id
 """
 import ctypes
-import json
 from pathlib import Path
 import resource
 import sys
 import tempfile
 from types import SimpleNamespace
 
-from .engine import Transition
-from .protocol import CardPlay, Entity, HandCard, Player, State
+from .engine import Transition, standard_match
+from .engine import CardPlay, Entity, HandCard, Player, State
 
-COSTS = {int(k): v for k, v in json.loads(Path(__file__).with_name('card_costs.json').read_text()).items()}
+# Elixir cost of every fixed-cost card in the IL cache (Mirror 28000006 and 28000025 vary: the engine is asked).
+COSTS = {
+    26000000: 3, 26000001: 3, 26000002: 2, 26000003: 5, 26000004: 7, 26000005: 3, 26000006: 5, 26000007: 5,
+    26000008: 5, 26000009: 8, 26000010: 1, 26000011: 4, 26000012: 3, 26000013: 2, 26000014: 4, 26000015: 4,
+    26000016: 5, 26000017: 5, 26000018: 4, 26000019: 2, 26000020: 6, 26000021: 4, 26000022: 5, 26000023: 3,
+    26000024: 6, 26000025: 3, 26000026: 3, 26000027: 4, 26000028: 9, 26000029: 7, 26000030: 1, 26000031: 1,
+    26000032: 3, 26000033: 6, 26000034: 5, 26000035: 4, 26000036: 4, 26000037: 4, 26000038: 2, 26000039: 3,
+    26000040: 3, 26000041: 3, 26000042: 4, 26000043: 6, 26000044: 4, 26000045: 5, 26000046: 3, 26000047: 7,
+    26000048: 4, 26000049: 2, 26000050: 3, 26000051: 5, 26000052: 4, 26000053: 5, 26000054: 5, 26000055: 7,
+    26000056: 3, 26000057: 4, 26000058: 2, 26000059: 5, 26000060: 6, 26000061: 3, 26000062: 4, 26000063: 5,
+    26000064: 3, 26000065: 4, 26000067: 3, 26000068: 4, 26000069: 4, 26000072: 5, 26000074: 4, 26000077: 5,
+    26000080: 4, 26000083: 4, 26000084: 1, 26000085: 7, 26000087: 4, 26000093: 3, 26000095: 4, 26000096: 5,
+    26000097: 2, 26000099: 5, 26000101: 4, 26000102: 2, 26000103: 6, 26000106: 5, 27000000: 3, 27000001: 4,
+    27000002: 4, 27000003: 5, 27000004: 4, 27000005: 6, 27000006: 4, 27000007: 6, 27000008: 6, 27000009: 3,
+    27000010: 4, 27000012: 4, 27000013: 4, 28000000: 4, 28000001: 3, 28000002: 2, 28000003: 6, 28000004: 3,
+    28000005: 4, 28000007: 6, 28000008: 2, 28000009: 4, 28000010: 5, 28000011: 2, 28000012: 3, 28000013: 3,
+    28000014: 3, 28000015: 2, 28000016: 1, 28000017: 2, 28000018: 3, 28000023: 5, 28000024: 2, 28000026: 3,
+}
 ENGINE_CPUS = 2  # what the engine is told about the machine: it sized its thread pool from all 128 CPUs (~70 threads)
 WAIT_LIMIT = 60  # ticks a delayed play waits for elixir before it is dropped (ponytail: the game's own limit is unknown)
 PROJECTILE_CLASS = 10  # data global id // 1e6 of LogicProjectileData (the probe checks type 0x0a); measured
@@ -67,8 +83,7 @@ class ClaphaEngine:
 
     def reset(self, seed=1, match=None):
         if match is None:
-            match = json.loads(Path(__file__).with_name('standard_match.json').read_text())
-            match['rndSeed'] = seed
+            match = standard_match(seed)
         self.env.create_match(match)
         self.generation += 1
         self.hands, self.pending = None, []

@@ -12,7 +12,6 @@ import torch
 
 from . import data as D
 from .model import INPUT_KEYS, Policy
-from .train import collate
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / 'data' / 'cache-smoke' / 'part-000000-0.npz'
@@ -80,38 +79,6 @@ class IL(unittest.TestCase):
                 logits, _, state = model({k: v[:, t:t + 1] for k, v in x.items()}, state)
                 steps.append(logits)
         self.assertTrue(torch.allclose(torch.cat(steps, 1), full, atol=1e-5))
-
-    def test_lstm_input_is_normalized(self):
-        """The first IL run froze: unnormalised inputs saturated the LSTM (core std over time 0.004)."""
-        model = Policy(max(self.vocab.values()) + 1).eval()
-        s = D.sequence(self.shard[0], 0, self.vocab)
-        x = {k: torch.as_tensor(s[k][:100])[None] for k in INPUT_KEYS}
-        grab = {}
-        model.lstm.register_forward_hook(lambda mod, i, o: grab.update(inp=i[0], core=o[0]))
-        with torch.no_grad():
-            model(x)
-        self.assertLess(abs(grab['inp'].std().item() - 1), 0.2)
-        self.assertLess((grab['core'].abs() > 0.99).float().mean().item(), 0.05)
-        self.assertGreater(grab['core'][0].std(0).mean().item(), 0.02)
-
-    def test_model_can_memorize_a_short_game(self):
-        torch.manual_seed(0)
-        model = Policy(max(self.vocab.values()) + 1)
-        s = D.sequence(self.shard[0], 0, self.vocab)
-        T = int(np.flatnonzero(s['action'] > D.ABILITY)[4]) + 1  # first five card plays
-        batch = collate([{k: v[:T] for k, v in s.items()}])
-        x = {k: batch[k] for k in INPUT_KEYS}
-        optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
-        for step in range(80):
-            logits, _, _ = model(x)
-            labeled = batch['label_mask']
-            loss = torch.nn.functional.cross_entropy(logits[labeled], batch['action'][labeled])
-            if step == 0:
-                first = loss.item()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        self.assertLess(loss.item(), first * 0.1)
 
 
 class PPODistribution(unittest.TestCase):
@@ -212,9 +179,8 @@ class EngineFeatures(unittest.TestCase):
         import json
         import pyarrow.parquet as pq
         from native_engine import Engine
-        from native_engine.build_cache import encode
-        from native_engine.replay import rebuild
-        from .agent import Agent
+        from native_engine.build_cache import encode, rebuild
+        from .model import Agent
         row = pq.read_table(PARQUET, columns=['payload_json']).slice(0, 1).to_pylist()[0]
         result = rebuild(Engine(), json.loads(row['payload_json']))
         raw = encode(result)

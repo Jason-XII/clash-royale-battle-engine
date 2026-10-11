@@ -1,5 +1,5 @@
-"""Independent native battle client; no Firstlight Python imports."""
-from .batch import ActionReceipt, Batch, stop_resident
-from .engine import Engine, Play, RenderedEngine
+"""The native Clash Royale battle engine as a Python API: `Engine` / `RenderedEngine` (the emulator, Mac) and
+`clapha.ClaphaEngine` (x86_64 Linux), all returning the same `State`."""
+from .engine import Engine, Play, RenderedEngine, State
 
-__all__ = ['ActionReceipt', 'Batch', 'Engine', 'Play', 'RenderedEngine', 'stop_resident']
+__all__ = ['Engine', 'Play', 'RenderedEngine', 'State']

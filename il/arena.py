@@ -39,10 +39,11 @@ LEVEL = 16  # 75% of IL_Replay games: lvlcap = cardlvlmin = 16 (the rest 11); le
 
 
 def make_match(pair, seed):
-    """A native match. `pair` is a deck pool entry (tools/build_deck_pool.py: cards with their evolution flags and
+    """A native match. `pair` is a deck pool entry (build_cache --deck-pool: cards with their evolution flags and
     the real game's levels) or two lists of 8 card ids (no evolutions, all at LEVEL). The template alone plays
     everything at level 1; the king tower level is separate (human games: 7728 hp at 16; level 1: 2400)."""
-    match = json.loads((Path(__file__).parents[1] / 'standard_match.json').read_text())
+    from native_engine.engine import standard_match
+    match = standard_match(seed)
     battle = match['battle']
     if isinstance(pair, dict):
         sp, cap, card_min, kt, exp = pair['decks'], pair['lvlcap'], pair['cardlvlmin'], pair['kt'], pair['exp']
@@ -53,7 +54,6 @@ def make_match(pair, seed):
         battle[f'deck{owner}']['sp'] = sp[owner]
         battle[f'avatar{owner}']['expLevel'] = exp[owner]
         battle['hbd'][owner]['kt'] = kt[owner]
-    match['rndSeed'] = seed
     return match
 
 
@@ -76,7 +76,7 @@ def worker(index, args, jobs, out):
     import torch
     from native_engine import Play
     from native_engine.clapha import ClaphaEngine
-    from .agent import Agent, load
+    from .model import Agent, load
     torch.set_num_threads(1)
     engine = ClaphaEngine(args.clapha)
     models = [load(args.a), load(args.b)]
@@ -157,7 +157,7 @@ def main():
                         help="policy: il.rl's training policy (wait with p(wait), else card x cell at its temperature)")
     parser.add_argument('--deck', help='8 comma-separated cards, id or id:el (el = evolution flag as in replays): '
                         'both players use this deck at level 16 (mirror match)')
-    parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (tools/build_deck_pool.py)')
+    parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
     parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', default='runs/arena.jsonl')

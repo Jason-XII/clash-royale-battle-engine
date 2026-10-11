@@ -1,12 +1,13 @@
-"""Play live Nulls Royale battles with a checkpoint (Mac side).
+"""Play live Nulls Royale battles with a checkpoint (Mac side), or watch it play itself in the emulator engine.
 
-    python bootstrap_emulator.py --online      # game with network access, probe on port 26789
-    python -m il.live runs/il-002-best.pt --deck 26000000,26000001,...   # then start a battle by hand
+    python -m native_engine.emulator bootstrap --online      # game with network access, probe on port 26789
+    python -m il.live runs/il-002/best.pt --deck 26000043,26000020 --games 10 --queue   # --queue starts each battle
+    python -m il.live runs/il-002/best.pt --watch data/IL_Replay/replays/part-000051.parquet --games 2 --render
 
 The probe's live mode captures the battle the game itself runs, so the model sees exactly the
 training features. Cards are played by tapping the screen (card, then tile) through one adb
 shell. Our seat is the player whose 8 cards match --deck (or --owner). Each battle is logged to
-runs/live/<time>.jsonl.
+runs/live/<time>.jsonl. --watch: self-play with the decks of human replays, drawn in the game UI with --render.
 """
 import argparse
 import dataclasses
@@ -19,11 +20,11 @@ from pathlib import Path
 
 import torch
 
-from native_engine import Engine
-from native_engine.protocol import State
+from native_engine import Engine, Play, RenderedEngine
+from native_engine.engine import State
 
 from . import data as D
-from .agent import Agent, load
+from .model import Agent, load
 
 # Pixel_9_2 emulator screen (1080x2424), measured in clash-simulator-refactored/minimal_visualizer.py:
 # the 30 inner arena rows span y 295..1714, so 32 rows span one row more at each end.
@@ -152,10 +153,42 @@ def connect(args):
 def restart_game(args, taps):
     """The game died. Bring it back online and on the home screen."""
     print('game lost; restarting it', flush=True)
-    subprocess.run([sys.executable, 'bootstrap_emulator.py', '--online'], check=True)
+    subprocess.run([sys.executable, '-m', 'native_engine.emulator', 'bootstrap', '--online'], check=True)
     time.sleep(10)
     taps.tap(*BATTLE_TAB)
     return connect(args)
+
+
+def watch(args):
+    """Self-play in the emulator engine with the decks of the first --games replays of a parquet part."""
+    import pyarrow.parquet as pq
+    from native_engine.build_cache import DECISION_TICKS, match_dict, prepare
+    model, vocab = load(args.checkpoint)
+    agents = [Agent(model, vocab, owner, decode=args.decode) for owner in (0, 1)]
+    engine = (RenderedEngine if args.render else Engine)(port=args.port)
+    pace = DECISION_TICKS / 20 if args.render else 0.0
+    for row in pq.read_table(args.watch, columns=['payload_json']).slice(0, args.games).to_pylist():
+        replay = prepare(json.loads(row['payload_json'])).replay
+        c = replay.episode_config
+        state = engine.reset(match=match_dict(replay, (c.deck0, c.deck1), c.seed))
+        for agent in agents:
+            agent.reset()
+        tried, done = {0: 0, 1: 0}, {0: 0, 1: 0}
+        while not state.finalized and state.tick < 7200:
+            plays = []
+            for agent in agents:
+                choice = agent.act(state)
+                if choice[0] == 'card':  # ponytail: ability choices are skipped
+                    plays.append(Play(agent.owner, *choice[1:]))
+                    tried[agent.owner] += 1
+            started = time.monotonic()
+            transition = engine.step(plays, DECISION_TICKS)
+            time.sleep(max(0.0, pace - (time.monotonic() - started)))
+            for play, ok in zip(plays, transition.executed):
+                done[play.owner] += ok
+            state = transition.state
+        print(json.dumps({'result': state.result, 'crowns': state.crowns, 'tick': state.tick, 'plays': tried,
+                          'executed': done}), flush=True)
 
 
 def main():
@@ -168,11 +201,15 @@ def main():
     parser.add_argument('--port', type=int, default=26789)
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each game')
+    parser.add_argument('--watch', type=Path, help='a replay parquet part: self-play with its decks instead')
+    parser.add_argument('--render', action='store_true', help='--watch: draw in the game UI at real-time speed')
     args = parser.parse_args()
+    torch.set_num_threads(2)
+    if args.watch:
+        return watch(args)
     if args.deck is None and args.owner is None:
         parser.error('give --deck (or --owner)')
     deck = {int(c) for c in args.deck.split(',')} if args.deck else None
-    torch.set_num_threads(2)
     model, vocab = load(args.checkpoint)
     engine = connect(args)
     taps = Taps(args.serial)

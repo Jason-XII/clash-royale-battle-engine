@@ -12,5 +12,3 @@ requires-python = ">=3.9"
 packages = ["native_engine"]
 package-dir = {native_engine = "."}
 
-[tool.setuptools.package-data]
-native_engine = ["standard_match.json", "card_costs.json"]

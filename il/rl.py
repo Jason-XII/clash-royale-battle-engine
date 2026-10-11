@@ -1,6 +1,8 @@
 """PPO self-play on clapha engines (x86_64 Linux), starting from an IL checkpoint.
 
     PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/il-002/best.pt ~/cr-engine/runs/ppo-general --collectors 24 --servers 4
+    PYTHONPATH=. python -m il.rl join ~/cr-engine/runs/ppo-general --collectors 30   # more collectors from another job
+                                                                                     # (the learner needs --remote)
 
 One process per collector plays games on its own engine with the live deploy delay. Decision servers
 (--servers processes, GPU) answer their share of collectors in batches and keep each seat's LSTM state;
@@ -18,9 +20,10 @@ import argparse
 from collections import defaultdict, deque
 import json
 import multiprocessing as mp
-from multiprocessing.connection import Listener, wait
+from multiprocessing.connection import Client, Listener, wait
 import queue
 import socket
+import sys
 import threading
 import os
 from pathlib import Path
@@ -37,7 +40,7 @@ from .train import collate
 
 TEMPERATURE = 0.5
 REPLY_TIMEOUT = 180  # s; the learner can be busy with an update (~20 s). A node that dies sends nothing, so a
-                     # collector that waits longer treats the connection as gone and reconnects (il.collect).
+                     # collector that waits longer treats the connection as gone and reconnects (il.rl join).
 CROWN_REWARD = 0.1
 OVERFLOW_PENALTY = 0.002
 
@@ -117,9 +120,9 @@ def receive(conn):
 def play_games(index, delay, engine, vocab, learner, servers):
     """Plays the learner's games until it sends None: games and trajectories through the learner (`learner`),
     actions from the decision server the learner names for each game (one of `servers`: a frozen opponent lives on
-    one server, so its games go there). Local pipes or TCP connections (il.collect) alike."""
+    one server, so its games go there). Local pipes or TCP connections (il.rl join) alike."""
     from native_engine import Play
-    from .agent import Agent
+    from .model import Agent
     from .arena import make_match
     while True:
         learner.send(('new_game', index, None))
@@ -361,7 +364,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
     server = Server({'current': model.eval(), **{k: load_policy(v, device)[0].eval() for k, v in pool.items()}},
                     device, model.config['core'])
     owners, first, window = [], None, args.batch_ms / 1000  # [(collector pipe, its requests)]
-    arrivals = queue.Queue()  # remote collectors (il.collect) joining at any time
+    arrivals = queue.Queue()  # remote collectors (il.rl join) joining at any time
     if listener is not None:
         accept_into(listener, arrivals)
     while True:
@@ -475,13 +478,76 @@ def update(model, reference, optimizer, trajectories, args, device):
 
 
 def save(path, model, saved, optimizer=None, extra=None):
-    """Same layout as IL checkpoints (il.agent.load / il.arena read it); only latest.pt keeps the optimizer."""
+    """Same layout as IL checkpoints (il.model.load reads it); only latest.pt keeps the optimizer."""
     base = {k: v for k, v in saved.items() if k not in ('optimizer', 'update')}
     torch.save(dict(base, model=model.state_dict(), **({'optimizer': optimizer.state_dict()} if optimizer else {}),
                     **(extra or {})), path)
 
 
+def endpoint(run):
+    """Remote collectors: The learner's current address and key, waiting until a learner has written them."""
+    path = run / 'endpoint.json'
+    while True:
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            time.sleep(10)
+
+
+def remote(slot, run):
+    """One remote collector, for good."""
+    from native_engine.clapha import raise_thread_limit
+    raise_thread_limit()
+    first = endpoint(run)
+    name = f'{socket.gethostname()}-{os.getppid()}-{slot}'
+    engine, vocab = collector_engine(name, first['out'], first['clapha'], slot // 4 * 8)
+    while True:
+        learner, servers = None, []
+        try:
+            ep = endpoint(run)
+            key = bytes.fromhex(ep['authkey'])
+            learner = Client(tuple(ep['learner']), authkey=key)
+            learner.send(('hello', None, None))
+            hello = receive(learner)
+            servers = [Client(tuple(address), authkey=key) for address in ep['servers']]
+            print(f'connected to {ep["host"]} as collector {hello["index"]}', flush=True)
+            play_games(hello['index'], ep['delay'], engine, vocab, learner, servers)
+            print('the learner stopped; waiting for the next one', flush=True)
+        except (OSError, EOFError) as error:  # learner gone, restarting, or not up yet
+            print(f'not connected ({error!r}); retrying', flush=True)
+        finally:
+            for c in [learner, *servers]:
+                if c is not None:
+                    c.close()
+        time.sleep(15)
+
+
+def join():
+    """Collectors in another job: they find the learner through <run>/endpoint.json (written by il.rl --remote on a
+    shared file system), connect over the cluster network and play its games. When the learner stops or restarts
+    they wait and reconnect, re-reading the file; the learner simply loses them when this job ends."""
+    parser = argparse.ArgumentParser(prog='python -m il.rl join')
+    parser.add_argument('run', help='the il.rl --remote output directory (on the shared file system)')
+    parser.add_argument('--collectors', type=int, default=30)
+    args = parser.parse_args(sys.argv[2:])
+    run = Path(args.run).expanduser().resolve()
+    ctx = mp.get_context('fork')
+    workers = [ctx.Process(target=remote, args=(i, run), daemon=True) for i in range(args.collectors)]
+    for w in workers:
+        w.start()
+    print(f'{args.collectors} collectors for {run}; logs in {run}/logs/collector-{socket.gethostname()}-*', flush=True)
+    while True:  # keep the job alive; restart any collector that dies outright
+        for i, w in enumerate(workers):
+            if w.exitcode is not None:
+                print(f'collector {i} exited ({w.exitcode}); restarting it', flush=True)
+                workers[i] = ctx.Process(target=remote, args=(i, run), daemon=True)
+                workers[i].start()
+        time.sleep(30)
+
+
 def main():
+    if sys.argv[1:2] == ['join']:
+        return join()
     parser = argparse.ArgumentParser()
     parser.add_argument('clapha')
     parser.add_argument('init', help='IL checkpoint to start from (also the KL reference and first frozen opponent)')
@@ -503,11 +569,11 @@ def main():
     parser.add_argument('--value-coef', type=float, default=0.5)
     parser.add_argument('--entropy', type=float, default=0.002)
     parser.add_argument('--kl-coef', type=float, default=0.05)
-    parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (tools/build_deck_pool.py)')
+    parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
     parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--device', default='auto', help="'auto': cuda if available, decided in each process after forking")
     parser.add_argument('--remote', action='store_true',
-                        help='accept collectors from other jobs (python -m il.collect <out>); address in <out>/endpoint.json')
+                        help='accept collectors from other jobs (python -m il.rl join <out>); address in <out>/endpoint.json')
     args = parser.parse_args()
     out = Path(args.out)
     from native_engine.clapha import raise_thread_limit
@@ -567,7 +633,7 @@ def main():
         path = out / 'endpoint.json'
         path.write_text(json.dumps(endpoint))
         path.chmod(0o600)  # the key admits collectors
-        print(f'remote collectors: python -m il.collect {out.resolve()} (learner at {ip}:{endpoint["learner"][1]})', flush=True)
+        print(f'remote collectors: python -m il.rl join {out.resolve()} (learner at {ip}:{endpoint["learner"][1]})', flush=True)
     for c in every:
         if not any(c is k for k in conns):
             c.close()

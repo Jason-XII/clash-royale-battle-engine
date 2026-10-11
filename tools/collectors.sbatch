@@ -19,5 +19,5 @@
 
 ulimit -u 65536
 cd "$HOME/cr-engine"
-exec nice -n 10 env PYTHONPATH=. /public/app/miniconda3/py312_24.4.0-0/bin/python -m il.collect \
+exec nice -n 10 env PYTHONPATH=. /public/app/miniconda3/py312_24.4.0-0/bin/python -m il.rl join \
   "${RUN:-$HOME/cr-engine/runs/ppo-general}" --collectors "${COLLECTORS:-30}"

@@ -1,11 +1,81 @@
-"""Small synchronous client. One controller owns one battle."""
+"""The emulator engine (Mac): a synchronous client of the probe in the game (`Engine`, headless; `RenderedEngine`,
+drawn by the game UI), and the battle `State` every part of the project uses (clapha.py produces the same)."""
 from dataclasses import dataclass
 import json
-from pathlib import Path
 import socket
 import time
 
-from .protocol import State
+# The Training Camp standard deck at level 1 for both players; il.arena.make_match sets real decks and levels.
+STANDARD_MATCH = '''{"battle":{"gmt":1,"plt":1,"t1s":0,"t2s":0,"gamemode":72000006,"hm":false,"lvlcap":0,"cardlvlmin":0,"stp":0,"trail":170000000,"te":-1,"tps":1,"deck0":{"hdr":"BD01","sp":[{"d":26000000},{"d":26000001},{"d":26000005},{"d":28000001},{"d":28000000},{"d":26000003},{"d":26000014},{"d":26000018}],"sc":[{"d":159000000,"l":1,"t":0,"c":1}]},"deck1":{"hdr":"BD01","sp":[{"d":26000000},{"d":26000001},{"d":26000005},{"d":28000001},{"d":28000000},{"d":26000003},{"d":26000014},{"d":26000018}],"sc":[{"d":159000000,"l":1,"t":0,"c":1}]},"avatar0":{"accountID.lo":1,"accountID.hi":0,"expLevel":1,"name":"Native-0","arena":54000001,"welo":-1,"scr":0,"lti":0,"npc":false},"avatar1":{"accountID.lo":2,"accountID.hi":0,"expLevel":1,"name":"Native-1","arena":54000001,"welo":-1,"scr":0,"lti":0,"npc":false},"location":15000199,"arena":54000001,"hbd":[{"em":{"ce":[],"de":[]},"sk":{"os":[],"ss":[],"rnd":false},"bn":{"bg":0,"fg":0},"kt":1},{"em":{"ce":[],"de":[]},"sk":{"os":[],"ss":[],"rnd":false},"bn":{"bg":0,"fg":0},"kt":1}]},"endTick":7200,"cmd":[],"evt":[],"rndSeed":1,"time":-1}'''
+
+
+def standard_match(seed=1):
+    match = json.loads(STANDARD_MATCH)
+    match['rndSeed'] = seed
+    return match
+
+
+@dataclass(frozen=True)
+class HandCard:
+    slot: int
+    card: int
+    cost: int
+    parameter: int  # Native command encoding; never a policy feature.
+    form_card: int  # Card id of the form that would be played (evolution/hero), else == card.
+
+
+@dataclass(frozen=True)
+class Player:
+    owner: int
+    elixir: int  # Fixed-point native units: 10,000 = one elixir.
+    hand: tuple[HandCard, ...]
+    cycle: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Entity:
+    id: int
+    owner: int
+    card: int  # -1 for towers.
+    x: int
+    y: int
+    hp: int | None
+    max_hp: int | None
+    target_id: int | None  # Stable entity ID held by the native attack component.
+    attack_cooldown_ms: int | None  # Zero means ready; rounded up to a 50 ms tick.
+    entity_type: str  # troop, building, projectile or area
+    deployment_remaining_ms: int | None
+
+
+@dataclass(frozen=True)
+class CardPlay:
+    sequence: int
+    tick: int
+    owner: int
+    card: int
+    cost: int
+
+
+@dataclass(frozen=True)
+class State:
+    generation: int
+    tick: int
+    finalized: bool
+    result: int | None
+    crowns: tuple[int, int]
+    players: tuple[Player, ...]
+    entities: tuple[Entity, ...]
+    plays: tuple[CardPlay, ...]
+    next_sequence: int
+
+    @classmethod
+    def decode(cls, data):
+        players = tuple(Player(p['owner'], p['elixir'], tuple(HandCard(*c) for c in p['hand']),
+                               tuple(p['cycle'])) for p in data['players'])
+        entities = tuple(Entity(*e) for e in data['entities'])
+        return cls(data['generation'], data['tick'], data['finalized'], data['result'],
+                   tuple(data['crowns']), players, entities,
+                   tuple(CardPlay(*e) for e in data['plays']), data['next'])
 
 
 @dataclass(frozen=True)
@@ -79,17 +149,16 @@ class Engine:
         return self._state(f'minimal {generation} {cursor}')
 
     def reset(self, seed=1, match=None):
-        """Start a battle. `match` is a native replay dict (see standard_match.json); its
+        """Start a battle. `match` is a native replay dict (STANDARD_MATCH's layout); its
         rndSeed wins over `seed`. Defaults to the Training Camp standard deck."""
         self.state = None
         status = self.request('status')
         if status.get('mode') != 'headless':
             raise RuntimeError(
                 f"headless reset requires headless mode, found {status.get('mode')!r}; "
-                'run python bootstrap_emulator.py to restart the game before training')
+                'run python -m native_engine.emulator bootstrap to restart the game')
         if match is None:
-            match = json.loads(Path(__file__).with_name('standard_match.json').read_text())
-            match['rndSeed'] = seed
+            match = standard_match(seed)
         configured = self.request('configure ' + json.dumps(match, separators=(',', ':')))
         if not configured.get('ok'):
             raise RuntimeError(configured.get('error', 'headless configuration failed'))
@@ -172,11 +241,10 @@ class RenderedEngine(Engine):
     def reset(self, seed=1, match=None):
         self.state = None
         if match is None:
-            match = json.loads(Path(__file__).with_name('standard_match.json').read_text())
-            match['rndSeed'] = seed
+            match = standard_match(seed)
         status = self.request('status')
         if status.get('mode') == 'resident-headless':
-            raise RuntimeError('close the active Batch and call stop_resident() first')
+            raise RuntimeError('the lane is in resident mode; restart the game (python -m native_engine.emulator bootstrap)')
         accepted = self.request('configure-native ' + json.dumps(match, separators=(',', ':')))
         if not accepted.get('ok'):
             raise RuntimeError(accepted.get('error', 'native renderer rejected the match'))
