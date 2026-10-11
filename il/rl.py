@@ -414,6 +414,8 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     if 'optimizer' in saved:
         optimizer.load_state_dict(saved['optimizer'])
+        for group in optimizer.param_groups:  # the saved state would restore the old learning rate
+            group['lr'] = args.lr
     start_update = saved.get('update', 0)
     frozen = ['il'] + [q.stem for q in sorted((out / 'pool').glob('*.pt'))]
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> recent learner outcomes
