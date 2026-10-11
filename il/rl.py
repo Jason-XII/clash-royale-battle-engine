@@ -212,6 +212,12 @@ class Server:
             self.c[:, rows] = 0
 
 
+def pick_device(name):
+    """Called only after the fork: a process that touched CUDA (even torch.cuda.is_available()) cannot fork
+    children that use CUDA ('Cannot re-initialize CUDA in forked subprocess')."""
+    return torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if name == 'auto' else name)
+
+
 STATS = ('receive', 'decide', 'reply', 'batches', 'requests')  # per decision server, summed into the log
 
 
@@ -222,7 +228,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats):
     os.dup2(log, 1)
     os.dup2(log, 2)
     torch.set_num_threads(1)
-    device = torch.device(args.device)
+    device = pick_device(args.device)
     model, _ = load_policy(args.init, device)  # the architecture; weights come from `shared`
 
     def refresh():
@@ -356,7 +362,7 @@ def main():
     parser.add_argument('--kl-coef', type=float, default=0.05)
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (tools/build_deck_pool.py)')
     parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--device', default='auto', help="'auto': cuda if available, decided in each process after forking")
     args = parser.parse_args()
     out = Path(args.out)
     from native_engine.clapha import raise_thread_limit
@@ -371,6 +377,8 @@ def main():
     deck_pairs = sample_decks(args.pool, args.cache, 30000, seed=random.randrange(1 << 20))
 
     # Every child is forked before CUDA starts here; the servers start CUDA themselves.
+    if torch.cuda.is_initialized():
+        raise RuntimeError('CUDA started before forking the decision servers; they could not use it')
     ctx = mp.get_context('fork')
     shared = {k: v.clone().share_memory_() for k, v in cpu_model.state_dict().items()}
     version, lock = ctx.Value('i', 0), ctx.Lock()
@@ -399,7 +407,7 @@ def main():
             c.close()
 
     torch.set_num_threads(2)
-    device = torch.device(args.device)
+    device = pick_device(args.device)
     model = cpu_model.to(device)
     reference, _ = load_policy(args.init, device)
     reference.eval().requires_grad_(False)
