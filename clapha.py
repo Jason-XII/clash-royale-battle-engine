@@ -166,8 +166,14 @@ class ClaphaEngine:
     # ---- snapshot -> State --------------------------------------------------------------------------------------------
     def _capture(self):
         env = self.env
-        objects = env.reader.objects(env.battle)
-        crowns, ended, winner = env._result(objects)
+        if hasattr(env.reader, 'entities'):  # clapha's lean reader: the same fields as objects(), as tuples
+            rows = env.reader.entities(env.battle)
+            crowns, ended, winner = env._result([{'nativeObjectId': r[0], 'hp': r[5]} for r in rows])
+            entities = tuple(self._entity_row(r) for r in rows)
+        else:
+            objects = env.reader.objects(env.battle)
+            crowns, ended, winner = env._result(objects)
+            entities = tuple(self._entity(o) for o in objects)
         tick = env.tick()
         players, plays, hands = [], [], {}
         for owner, (hand, cycle, elixir) in enumerate(self._players()):
@@ -180,7 +186,6 @@ class ClaphaEngine:
                         self.sequence += 1
                         plays.append(CardPlay(self.sequence, tick, owner, card, COSTS.get(card, -1)))
         self.hands = hands
-        entities = tuple(self._entity(o) for o in objects)
         return State(self.generation, tick, bool(ended), winner, (crowns[0], crowns[1]),
                      tuple(players), entities, tuple(plays), self.sequence + 1)
 
@@ -190,6 +195,17 @@ class ClaphaEngine:
             chosen = self.env._selection(owner, deck_slot)
             cost = chosen[1] >> 28 if chosen else -1
         return cost
+
+    @staticmethod
+    def _entity_row(r):
+        """_entity for a row of clapha's Reader.entities (the same values)."""
+        oid, owner, card, x, y, hp, max_hp, target, load, deploy, global_id = r
+        if hp is None:
+            kind = 'projectile' if global_id // 1000000 == PROJECTILE_CLASS else 'area'
+            return Entity(oid, owner, card, x, y, None, None, None, None, kind, None)
+        attack = load is not None  # load and deploy are read exactly when there is an attack component
+        return Entity(oid, owner, card, x, y, hp, max_hp, target if attack else None, _ms(load) if attack else None,
+                      'building' if card == -1 else 'troop', _ms(deploy))
 
     @staticmethod
     def _entity(o):

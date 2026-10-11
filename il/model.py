@@ -49,10 +49,34 @@ class Policy(nn.Module):
         zeros = torch.zeros(1, batch, self.config['core'], device=device)
         return zeros, zeros.clone()
 
-    def forward(self, x, state=None):
+    def forward(self, x, state=None, valid=None):
         """x: dict of [B, T, ...] tensors (INPUT_KEYS). Returns masked logits [B, T, ACTIONS],
-        value [B, T] and the new LSTM state."""
+        value [B, T] and the new LSTM state.
+
+        valid: optional [B, T] bool (the PPO update's time mask). The per-step parts (entities, grid, convs, cell
+        scores) then run on the valid steps only and padded steps get what a padded step gives anyway (no playable
+        card: every cell -inf); valid steps' values are the same as without it. Only the LSTM sees every step."""
         B, T = x['scalars'].shape[:2]
+        if valid is None:
+            grid, g = self._steps(x, B, T)
+            core, state = self.lstm(self.lstm_norm(F.relu(self.globals(self.global_norm(g)))), state)  # [B, T, core]
+            cells = self._cells(grid, core, x, B, T)
+        else:
+            idx = valid.reshape(-1).nonzero().squeeze(1)  # valid steps, as rows of the flattened [B * T]
+            n = len(idx)
+            rows = {k: v.reshape(B * T, *v.shape[2:]).index_select(0, idx).unsqueeze(1) for k, v in x.items()}
+            grid, g = self._steps(rows, n, 1)  # [n, ...]: each valid step as a sequence of one
+            g = g.new_zeros(B * T, g.shape[-1]).index_copy(0, idx, g[:, 0]).reshape(B, T, -1)
+            core, state = self.lstm(self.lstm_norm(F.relu(self.globals(self.global_norm(g)))), state)
+            picked = core.reshape(B * T, -1).index_select(0, idx).unsqueeze(1)
+            part = self._cells(grid, picked, rows, n, 1)[:, 0]
+            cells = part.new_full((B * T, 4, CELLS), float('-inf')).index_copy(0, idx, part).reshape(B, T, 4, CELLS)
+        logits = torch.cat([self.wait_ability(core), cells.flatten(2)], -1)
+        value = self.value(torch.cat([core, x['scalars']], -1)).squeeze(-1)
+        return logits, value, state
+
+    def _steps(self, x, B, T):
+        """Per-step part before the LSTM: the conv grid [B * T, C, H, W] and the LSTM's input [B, T, ...]."""
         N = B * T
         # Entities -> per-cell sums on the grid.
         ent = self.card(x['ent_obj']) + self.side(x['ent_side']) + self.kind(x['ent_type'])
@@ -70,16 +94,15 @@ class Policy(nn.Module):
         hand = torch.cat([self.card(x['hand_card']), x['hand_cost'].unsqueeze(-1)], -1)  # [B, T, 4, d+1]
         nxt = torch.cat([self.card(x['next_card']), torch.zeros_like(x['next_card'], dtype=hand.dtype).unsqueeze(-1)], -1)
         rev = torch.cat([self.card(x['rev_card']), x['rev_age'].unsqueeze(-1)], -1)
-        g = torch.cat([pooled, x['scalars'], hand.flatten(2), nxt, rev.flatten(2)], -1)
-        core, state = self.lstm(self.lstm_norm(F.relu(self.globals(self.global_norm(g)))), state)  # [B, T, core]
-        # Per hand slot: condition the grid on (core, card) and score every cell.
+        return grid, torch.cat([pooled, x['scalars'], hand.flatten(2), nxt, rev.flatten(2)], -1)
+
+    def _cells(self, grid, core, x, B, T):
+        """Per hand slot: condition the grid on (core, card) and score every cell -> [B, T, 4, CELLS], masked."""
+        N, C = B * T, grid.shape[1]
         film = self.film(torch.cat([core.unsqueeze(2).expand(-1, -1, 4, -1), self.card(x['hand_card'])], -1))
         scale, shift = film.reshape(N, 4, 2 * C, 1, 1).chunk(2, 2)
         cells = self.cell(F.relu(grid.unsqueeze(1) * (1 + scale) + shift).reshape(N * 4, C, H, W))
-        cells = cells.reshape(B, T, 4, CELLS).masked_fill(~x['slot_ok'].unsqueeze(-1), float('-inf'))
-        logits = torch.cat([self.wait_ability(core), cells.flatten(2)], -1)
-        value = self.value(torch.cat([core, x['scalars']], -1)).squeeze(-1)
-        return logits, value, state
+        return cells.reshape(B, T, 4, CELLS).masked_fill(~x['slot_ok'].unsqueeze(-1), float('-inf'))
 
 
 def decode(action):
