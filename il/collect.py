@@ -13,7 +13,7 @@ from pathlib import Path
 import socket
 import time
 
-from .rl import collector_engine, play_games
+from .rl import collector_engine, play_games, receive
 
 
 def endpoint(run):
@@ -33,21 +33,21 @@ def remote(slot, run):
     name = f'{socket.gethostname()}-{os.getppid()}-{slot}'
     engine, vocab = collector_engine(name, first['out'], first['clapha'], slot // 4 * 8)
     while True:
-        learner = server = None
+        learner, servers = None, []
         try:
             ep = endpoint(run)
             key = bytes.fromhex(ep['authkey'])
             learner = Client(tuple(ep['learner']), authkey=key)
             learner.send(('hello', None, None))
-            hello = learner.recv()
-            server = Client(tuple(ep['servers'][hello['server']]), authkey=key)
+            hello = receive(learner)
+            servers = [Client(tuple(address), authkey=key) for address in ep['servers']]
             print(f'connected to {ep["host"]} as collector {hello["index"]}', flush=True)
-            play_games(hello['index'], ep['delay'], engine, vocab, learner, server)
+            play_games(hello['index'], ep['delay'], engine, vocab, learner, servers)
             print('the learner stopped; waiting for the next one', flush=True)
         except (OSError, EOFError) as error:  # learner gone, restarting, or not up yet
             print(f'not connected ({error!r}); retrying', flush=True)
         finally:
-            for c in (learner, server):
+            for c in [learner, *servers]:
                 if c is not None:
                     c.close()
         time.sleep(15)

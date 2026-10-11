@@ -98,11 +98,12 @@ def collector_engine(name, out, clapha, stagger):
     return ClaphaEngine(clapha), D.load_vocab(Path(out) / 'vocab.json')
 
 
-def collector(index, args, learner, conn):
-    """A collector on the learner's node, connected by pipes."""
+def collector(index, args, learner, servers):
+    """A collector on the learner's node, connected by pipes (one to every decision server)."""
     engine, vocab = collector_engine(index, args.out, args.clapha, index // 4 * 8)
-    play_games(index, args.delay, engine, vocab, learner, conn)
-    conn.close()
+    play_games(index, args.delay, engine, vocab, learner, servers)
+    for conn in servers:
+        conn.close()
     os._exit(0)  # the engine segfaults in its exit-time destructors
 
 
@@ -113,9 +114,10 @@ def receive(conn):
     return conn.recv()
 
 
-def play_games(index, delay, engine, vocab, learner, conn):
-    """Plays the learner's games until it sends None: actions from the decision server (`conn`), games and
-    trajectories through the learner (`learner`). Local pipes or TCP connections (il.collect) alike."""
+def play_games(index, delay, engine, vocab, learner, servers):
+    """Plays the learner's games until it sends None: games and trajectories through the learner (`learner`),
+    actions from the decision server the learner names for each game (one of `servers`: a frozen opponent lives on
+    one server, so its games go there). Local pipes or TCP connections (il.collect) alike."""
     from native_engine import Play
     from .agent import Agent
     from .arena import make_match
@@ -126,6 +128,7 @@ def play_games(index, delay, engine, vocab, learner, conn):
             break
         match = make_match(spec['decks'], spec['seed'])
         models = spec['models']  # per seat: 'current' or a frozen opponent's key
+        conn = servers[spec['server']]
         agents = [Agent(None, vocab, owner) for owner in (0, 1)]
         steps = [defaultdict(list) for _ in (0, 1)]
         state = engine.reset(match=match)
@@ -515,8 +518,8 @@ def main():
     stats = ctx.Array('d', args.servers * len(STATS))
     snapshot_queues = [ctx.Queue() for _ in range(args.servers)]
     to_learner = [ctx.Pipe() for _ in range(args.collectors)]  # (learner end, collector end)
-    to_server = [ctx.Pipe() for _ in range(args.collectors)]   # (server end, collector end)
-    every = [c for pair in to_learner + to_server for c in pair]
+    to_server = [[ctx.Pipe() for _ in range(args.servers)] for _ in range(args.collectors)]  # [collector][server]
+    every = [c for pair in to_learner + [p for row in to_server for p in row] for c in pair]
 
     def start(target, keep, *target_args):
         def run():
@@ -527,13 +530,15 @@ def main():
         ctx.Process(target=run, daemon=True).start()
 
     for sid in range(args.servers):
-        mine = [to_server[i][0] for i in range(args.collectors) if i % args.servers == sid]
+        mine = [to_server[i][sid][0] for i in range(args.collectors)]
         start(decision_server, mine, sid, args, mine, shared, version, lock, snapshot_queues[sid], stats,
               server_listeners[sid])
     for i in range(args.collectors):
-        start(collector, [to_learner[i][1], to_server[i][1]], i, args, to_learner[i][1], to_server[i][1])
+        ends = [pipe[1] for pipe in to_server[i]]
+        start(collector, [to_learner[i][1], *ends], i, args, to_learner[i][1], ends)
     conns = [learner_end for learner_end, _ in to_learner]
     arrivals, next_remote = queue.Queue(), 100000  # remote collectors' numbers start here
+    self_play_games = 0  # spreads self-play games over the servers
     if args.remote:
         accept_into(learner_listener, arrivals)
         ip = reachable_ip()
@@ -594,15 +599,22 @@ def main():
                     conns.remove(conn)
                     print(f'a collector left ({len(conns)} connected); see {out}/logs/', flush=True)
                     continue
-                if kind == 'hello':  # a remote collector: its number and its decision server
-                    conn.send({'index': next_remote, 'server': next_remote % args.servers})
+                if kind == 'hello':  # a remote collector: its number
+                    conn.send({'index': next_remote})
                     next_remote += 1
                 elif kind == 'new_game':
+                    # A frozen opponent's games all go to its home server (pool position % servers): a server then
+                    # runs the current model and its own opponents, not every model of the pool, in each round.
                     learner_seat = random.randrange(2)
                     models = ['current', 'current']
                     if random.random() >= args.self_play:
                         models[1 - learner_seat] = pick_opponent()
-                    conn.send(dict(decks=random.choice(deck_pairs), seed=random.randrange(1 << 30), models=models))
+                        server = frozen.index(models[1 - learner_seat]) % args.servers
+                    else:
+                        server = self_play_games % args.servers
+                        self_play_games += 1
+                    conn.send(dict(decks=random.choice(deck_pairs), seed=random.randrange(1 << 30), models=models,
+                                   server=server))
                 elif kind == 'trajectory':
                     buffer.append(payload)
                     if payload['opponent'] != 'current':
