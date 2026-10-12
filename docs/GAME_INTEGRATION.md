@@ -187,10 +187,13 @@ Times from one play with the console's gesture (two 16 ms touches, 8 ms apart):
     kind of opponent: readable before the first play in 0 of 515 battles, at the end in 97% of real-player battles.
     From that data an opponent evolution is known once played (the unit's form id), or guessed from a deck prior
     (RoyaleAPI, or the deck the other console publishes); a HUD must show the guess as a guess.
-  - **Open:** a separate record outside the battle (found by scanning the game's memory, `deck_vector_scan`; it looks
-    like what the result screen / chat card is drawn from) held the opponent's whole deck **before the first play** in
-    a friendly and in Training Camp (2026-09-24). Not tested in ladder battles, and not checked for evolution / hero
-    forms per slot. If it holds both in ladder battles, opponent evolutions are known at the start.
+  - **A separate record outside the battle** (found by scanning the game's memory, `deck_vector_scan`; it looks like
+    what the result screen / chat card is drawn from) held the opponent's whole deck before the first play in a friendly
+    and in Training Camp (2026-09-24), **but not in a ladder battle** (2026-10-12, one battle, `tools/deck_record_probe.py`):
+    scans at ticks 0, 430, 842, 1252 and 1665 found no 8-card group holding the six cards the opponent had played by tick
+    1273; the record appeared only at the end (tick 1820, the result screen), with their whole deck. So in ladder the
+    opponent's deck and evolutions are not readable at the start; the friendly / Training Camp case is the exception.
+    One ladder battle so far: a second one would make it firmer.
   - **Their hero and champion are known from the start**: their ability controller names the card, and every
     controller seen was there before the first play (132 of 132). Our table of controller characters lacked Hero
     Ice Wizard (character 1741956296, 14 battles) and Goblinstein (4047250230, 3 battles).
@@ -275,3 +278,4 @@ In ordinary games, with the bot playing: `il/timing.py` (lateness of every play)
   the August client; its double / triple elixir periods are not measured on our build yet (section 13).
 - 2026-10-11: section 9, the opponent's evolution and hero slots: what is readable when (515 recorded battles);
   the out-of-battle deck record (friendly / Training Camp only so far) added as open.
+- 2026-10-12: section 9, the out-of-battle deck record tested in a ladder battle: absent until the result screen.
