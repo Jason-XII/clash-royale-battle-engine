@@ -345,7 +345,7 @@ class EngineFeatures(unittest.TestCase):
             agent = Agent(None, vocab, owner)
             for t, state in enumerate(result['states'][:400]):
                 online = agent.observe(state)
-                for key in INPUT_KEYS:
+                for key in set(INPUT_KEYS) - {'ability_ok'}:  # unknown in the cache, so unmasked there
                     np.testing.assert_allclose(online[key][0, 0].numpy(), cached[key][t], err_msg=f'{key} t={t}')
 
 
