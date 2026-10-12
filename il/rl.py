@@ -1,8 +1,8 @@
 """PPO self-play on clapha engines (x86_64 Linux), starting from an IL checkpoint.
 
     PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/il-002/best.pt ~/cr-engine/runs/ppo-general --collectors 24 --servers 4
-    PYTHONPATH=. python -m il.rl join ~/cr-engine/runs/ppo-general --collectors 30   # more collectors from another job
-                                                                                     # (the learner needs --remote)
+    PYTHONPATH=. python -m il.rl join ~/cr-engine/runs/ppo-general --collectors 36 --servers 3   # another (GPU) job's
+                                       # collectors and decision servers (the learner needs --remote); tools/*.sbatch
 
 One process per collector plays games on its own engine with the live deploy delay. Decision servers
 (--servers processes, GPU) answer their share of collectors in batches and keep each seat's LSTM state;
@@ -31,6 +31,8 @@ import threading
 import os
 from pathlib import Path
 import random
+import shutil
+import subprocess
 import time
 
 import numpy as np
@@ -183,7 +185,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
             break
         match = make_match(spec['decks'], spec['seed'])
         models = spec['models']  # per seat: 'current' or a frozen opponent's key
-        conn = servers[spec['server']]
+        conn = servers[spec['server'] % len(servers)]  # il.rl join --servers may run fewer servers than the learner
         observer = Observer(vocab)  # both seats' rows, built once per state
         steps = [defaultdict(list) for _ in (0, 1)]
         state = engine.reset(match=match)
@@ -421,6 +423,21 @@ def pick_device(name):
     return torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if name == 'auto' else name)
 
 
+def start_mps():
+    """NVIDIA MPS for the decision servers (the learner stays outside it). Processes sharing a GPU otherwise take turns:
+    4 servers on an A100 answered 12.4k decisions/s, the same as one; under MPS their small CUDA graphs run side by
+    side (24.7k; 8 servers 34.6k). One daemon per job, left running for the job's next run (it ends with the job);
+    a server finding no daemon runs without MPS. Returns its pipe directory, or None on a node without MPS."""
+    if not shutil.which('nvidia-cuda-mps-control'):
+        return None
+    root = Path(f"/tmp/cr-mps-{os.environ.get('SLURM_JOB_ID', os.getuid())}")
+    for d in ('pipe', 'log'):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    subprocess.run(['nvidia-cuda-mps-control', '-d'], capture_output=True,  # fails harmlessly if already running
+                   env=dict(os.environ, CUDA_MPS_PIPE_DIRECTORY=str(root / 'pipe'), CUDA_MPS_LOG_DIRECTORY=str(root / 'log')))
+    return str(root / 'pipe')
+
+
 def accept_into(listener, arrivals):
     """A daemon thread putting every connection `listener` accepts into the queue `arrivals`."""
     def run():
@@ -450,10 +467,12 @@ STATS = ('receive', 'decide', 'reply', 'batches', 'requests')  # per decision se
 def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, listener=None):
     """Answers its collectors' decisions in batched GPU calls with the learner's latest weights (`shared`,
     re-read whenever `version` changes) and the frozen opponents (`snapshots` announces new ones)."""
-    log = os.open(f'{args.out}/logs/server-{sid}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    log = os.open(f'{args.out}/logs/server-{socket.gethostname()}-{sid}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     os.dup2(log, 1)
     os.dup2(log, 2)
     torch.set_num_threads(1)
+    if args.mps:  # before CUDA starts in this process
+        os.environ['CUDA_MPS_PIPE_DIRECTORY'] = args.mps
     device = pick_device(args.server_device or args.device)
     if device.type == 'cuda':
         if device.index is None:  # 'cuda' (--device auto): torch.cuda.set_device needs an index
@@ -512,6 +531,8 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
         stats[sid * len(STATS)] += t1 - t0
         if owners and (t1 - first >= window or len(owners) >= len(active)):
             requests = [r for _, payload in owners for r in payload]
+            for key in {r[1] for r in requests} - server.models.keys():  # a snapshot newer than this server (il.rl join)
+                server.models[key] = load_policy(opponent_dir(args) / f'{key}.pt', device)[0].eval()
             replies = server.act(requests)
             t2 = time.perf_counter()
             k = 0
@@ -647,8 +668,9 @@ def endpoint(run):
             time.sleep(10)
 
 
-def remote(slot, run):
-    """One remote collector, for good."""
+def remote(slot, run, local=None):
+    """One remote collector, for good. `local`: pipes to this job's decision servers (il.rl join --servers), else it
+    uses the learner's over the network."""
     from native_engine.clapha import raise_thread_limit
     raise_thread_limit()
     first = endpoint(run)
@@ -662,40 +684,103 @@ def remote(slot, run):
             learner = Client(tuple(ep['learner']), authkey=key)
             learner.send(('hello', None, None))
             hello = receive(learner)
-            servers = [Client(tuple(address), authkey=key) for address in ep['servers']]
+            servers = local or [Client(tuple(address), authkey=key) for address in ep['servers']]
             print(f'connected to {ep["host"]} as collector {hello["index"]}', flush=True)
             play_games(hello['index'], ep['delay'], engine, vocab, learner, servers)
             print('the learner stopped; waiting for the next one', flush=True)
         except (OSError, EOFError) as error:  # learner gone, restarting, or not up yet
             print(f'not connected ({error!r}); retrying', flush=True)
         finally:
-            for c in [learner, *servers]:
+            for c in [learner, *([] if local else servers)]:
                 if c is not None:
                     c.close()
         time.sleep(15)
 
 
+WEIGHTS_POLL = 5  # s between il.rl join --servers' asks for newer weights (an update takes ~30 s)
+
+
+def local_servers(ctx, run, args):
+    """il.rl join --servers: decision servers in this job, on its GPU, so its collectors' decisions take nothing from
+    the learner's node. They keep the learner's latest weights in shared memory, as the learner's own servers do; the
+    weights come over the network (no file: a shared file system may serve a stale latest.pt for a while). Returns each
+    collector's pipes to the servers and fetch(), which copies newer weights in (call it every WEIGHTS_POLL s)."""
+    link = {'conn': None, 'seen': None}  # connection to the learner, its weights version we hold
+
+    def fetch():
+        """Newer weights from the learner -> (ep, numpy state dict), or None (none newer, or not connected)."""
+        try:
+            if link['conn'] is None:
+                ep = endpoint(run)
+                link['conn'] = Client(tuple(ep['learner']), authkey=bytes.fromhex(ep['authkey']))
+                link['seen'], link['ep'] = None, ep  # a new learner: its versions count from 0
+            link['conn'].send(('weights', None, link['seen']))
+            reply = receive(link['conn'])
+        except (OSError, EOFError):  # learner gone or restarting
+            link['conn'] = None
+            return None
+        if reply is None:
+            return None
+        link['seen'] = reply[0]
+        return link['ep'], reply[1]
+
+    while (first := fetch()) is None:
+        time.sleep(WEIGHTS_POLL)
+    link['conn'].close()  # reconnected after the fork: the children must not hold this socket
+    link['conn'] = None
+    ep, weights = first
+    shared = {k: torch.from_numpy(v).share_memory_() for k, v in weights.items()}
+    version, lock = ctx.Value('i', 0), ctx.Lock()
+    mps = start_mps() if args.mps else None
+    server_args = argparse.Namespace(out=ep['out'], init=ep['init'], il=ep['il'], opponent_pool=ep['opponent_pool'],
+                                     batch_ms=ep['batch_ms'], server_device=args.server_device, device='auto', mps=mps)
+    pipes = [[ctx.Pipe() for _ in range(args.servers)] for _ in range(args.collectors)]  # [collector][server]
+    stats = ctx.Array('d', args.servers * len(STATS))  # read by nobody: the learner logs its own servers
+    for sid in range(args.servers):
+        ctx.Process(target=decision_server, daemon=True, args=(
+            sid, server_args, [row[sid][0] for row in pipes], shared, version, lock, ctx.Queue(), stats)).start()
+
+    def update():
+        got = fetch()
+        if got is not None:
+            with lock:
+                for k, v in got[1].items():
+                    shared[k].copy_(torch.from_numpy(v))
+                version.value += 1
+    print(f"{args.servers} decision servers on {args.server_device}{' (MPS)' if mps else ''}", flush=True)
+    return [[row[sid][1] for sid in range(args.servers)] for row in pipes], update
+
+
 def join():
     """Collectors in another job: they find the learner through <run>/endpoint.json (written by il.rl --remote on a
     shared file system), connect over the cluster network and play its games. When the learner stops or restarts
-    they wait and reconnect, re-reading the file; the learner simply loses them when this job ends."""
+    they wait and reconnect, re-reading the file; the learner simply loses them when this job ends. With --servers
+    (a GPU job) their decisions come from this job's own decision servers, else from the learner's."""
     parser = argparse.ArgumentParser(prog='python -m il.rl join')
     parser.add_argument('run', help='the il.rl --remote output directory (on the shared file system)')
     parser.add_argument('--collectors', type=int, default=30)
+    parser.add_argument('--servers', type=int, default=0, help="this job's own decision servers; 0: the learner's")
+    parser.add_argument('--server-device', default='cuda')
+    parser.add_argument('--mps', action=argparse.BooleanOptionalAction, default=True, help='NVIDIA MPS for --servers')
     args = parser.parse_args(sys.argv[2:])
     run = Path(args.run).expanduser().resolve()
     ctx = mp.get_context('fork')
-    workers = [ctx.Process(target=remote, args=(i, run), daemon=True) for i in range(args.collectors)]
+    local, update = [None] * args.collectors, None
+    if args.servers:
+        local, update = local_servers(ctx, run, args)
+    workers = [ctx.Process(target=remote, args=(i, run, local[i]), daemon=True) for i in range(args.collectors)]
     for w in workers:
         w.start()
     print(f'{args.collectors} collectors for {run}; logs in {run}/logs/collector-{socket.gethostname()}-*', flush=True)
-    while True:  # keep the job alive; restart any collector that dies outright
+    while True:  # keep the job alive; restart any collector that dies outright; keep this job's servers' weights fresh
         for i, w in enumerate(workers):
             if w.exitcode is not None:
                 print(f'collector {i} exited ({w.exitcode}); restarting it', flush=True)
-                workers[i] = ctx.Process(target=remote, args=(i, run), daemon=True)
+                workers[i] = ctx.Process(target=remote, args=(i, run, local[i]), daemon=True)
                 workers[i].start()
-        time.sleep(30)
+        if update:
+            update()
+        time.sleep(WEIGHTS_POLL)
 
 
 def main():
@@ -744,7 +829,10 @@ def main():
                         "with two GPUs: the learner's update and the servers stop sharing one")
     parser.add_argument('--remote', action='store_true',
                         help='accept collectors from other jobs (python -m il.rl join <out>); address in <out>/endpoint.json')
+    parser.add_argument('--mps', action=argparse.BooleanOptionalAction, default=True,
+                        help='NVIDIA MPS for the decision servers (where the node has it)')
     args = parser.parse_args()
+    args.mps = start_mps() if args.mps else None
     out = Path(args.out)
     from native_engine.clapha import raise_thread_limit
     raise_thread_limit()  # before any engine process starts, so every process (the learner too) gets it
@@ -800,7 +888,10 @@ def main():
         endpoint = {'learner': [ip, learner_listener.address[1]],
                     'servers': [[ip, listener.address[1]] for listener in server_listeners],
                     'authkey': authkey.hex(), 'host': socket.gethostname(), 'clapha': args.clapha,
-                    'out': str(out.resolve()), 'delay': args.delay, 'started': time.time()}
+                    'out': str(out.resolve()), 'delay': args.delay, 'started': time.time(),
+                    # for il.rl join --servers: the models its servers load
+                    'init': str(Path(args.init).expanduser().resolve()), 'il': args.il and str(Path(args.il).expanduser().resolve()),
+                    'opponent_pool': str(opponent_dir(args).resolve()), 'batch_ms': args.batch_ms}
         path = out / 'endpoint.json'
         path.write_text(json.dumps(endpoint))
         path.chmod(0o600)  # the key admits collectors
@@ -932,6 +1023,12 @@ def main():
                     if kind == 'hello':  # a remote collector: its number
                         conn.send({'index': next_remote})
                         next_remote += 1
+                    elif kind == 'weights':  # il.rl join --servers: the current weights, unless it has them (payload)
+                        with lock:
+                            current = version.value
+                            weights = None if payload == current else {k: v.numpy().copy() for k, v in shared.items()}
+                        conn.send(None if weights is None else (current, weights))  # numpy: tensors would pickle
+                                                                                     # as shared-memory handles
                     elif kind == 'new_game':
                         if max_backlog and ready.qsize() >= max_backlog:
                             held.append((conn, time.time()))

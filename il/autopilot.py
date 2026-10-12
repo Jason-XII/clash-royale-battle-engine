@@ -1,6 +1,6 @@
 """Watches a PPO run (il.rl): evaluates every new snapshot, keeps the best one, rolls the learner back when it degrades.
 
-    sbatch tools/autopilot.sbatch          # a CPU-only job next to the training job (see the file for the settings)
+    sbatch tools/satellite.sbatch          # runs it next to the satellite's collectors (see the file for the settings)
 
 Every snapshot in <run>/pool plays the panel (--panel name=checkpoint, e.g. the General and IL models) with the live
 deploy delay and the training policy: --games per panel model, on the same real deck pairs every time, the snapshot

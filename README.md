@@ -30,7 +30,7 @@ il/rl.py                 PPO: collectors, decision servers, learner; `il.rl join
 il/arena.py, il/eval.py  model vs model; PPO snapshots vs a reference
 il/live.py               live Nulls games by adb taps; --watch: self-play in the emulator engine
 il/test_il.py            features/labels, PPO distribution, decision server, online = cached features
-tools/collectors.sbatch  a CPU-only Slurm job of extra collectors
+tools/train.sbatch       the learner's Slurm job (A100s); tools/satellite.sbatch: more games + the autopilot (RTX 5090)
 ```
 
 ## 1–2. Imitation learning
@@ -86,9 +86,11 @@ nohup nice -n 10 env PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/ru
 ```
 
 With two GPUs in the job, `--server-device cuda:1` puts the decision servers on the second one, so the learner's
-update and the servers stop sharing a GPU (one A100 was 96% busy). With `--remote`, more collectors can join from another job (`sbatch tools/collectors.sbatch`, or
-`python -m il.rl join <run>`); they find the learner through `<run>/endpoint.json`, reconnect when it restarts
-and give up on a peer silent for 180 s. Not needed now: the decision servers, not the collectors, limit us.
+update and the servers stop sharing a GPU (one A100 was 96% busy). The servers run under NVIDIA MPS (`--no-mps` turns
+it off). With `--remote`, another job can play games for the learner: `python -m il.rl join <run> --servers 3` runs
+its own collectors and decision servers on its GPU, with weights from the learner every 5 s (without `--servers` its
+collectors use the learner's servers over the network). Joined jobs find the learner through `<run>/endpoint.json`,
+reconnect when it restarts and give up on a peer silent for 180 s.
 
 **E-Barbs specialist** (the learning seat always plays our deck, the other seat a real ladder deck played by the IL
 model (40%) or the general model's snapshots (PFSP); a specialist plays other decks ever worse, so it is no sparring
@@ -99,16 +101,11 @@ deck, 30% hard decks (those we score under 55% against lately). The run `ppo-eba
 ```bash
 mkdir -p ~/cr-engine/runs/ppo-ebarbs2 && cp ~/cr-engine/runs/ppo-ebarbs/latest.pt ~/cr-engine/runs/ppo-ebarbs2/latest.pt
 cp ~/cr-engine/runs/ppo-ebarbs/latest.pt ~/cr-engine/runs/ebarbs-start.pt            # the autopilot's first best
-nohup nice -n 10 env PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/ppo-general/latest.pt ~/cr-engine/runs/ppo-ebarbs2 \
-  --il ~/cr-engine/runs/il-002/best.pt --il-share 0.4 --deck-mix 0.3,0.4,0.3 --shaping 0.1 \
-  --learner-deck 26000043:1,26000020,26000036:1,26000052,26000017:2,26000083,28000015,28000026 \
-  --self-play 0 --opponent-pool ~/cr-engine/runs/ppo-general/pool \
-  --collectors 40 --servers 4 --server-device cuda:1 --pool ~/cr-engine/data/deck_pool.json \
-  --lr 2e-4 --games-per-update 256 --lam 0.98 --kl-coef 0.01 > ~/cr-engine/runs/ppo-ebarbs2.out 2>&1 &
-cd ~/cr-engine && sbatch tools/autopilot.sbatch                                     
+cd ~/cr-engine && sbatch tools/train.sbatch && sbatch tools/satellite.sbatch    # learner (A100) + games and autopilot (5090)
+scancel --name=cr-ppo                                                          # stop both; a restart resumes latest.pt
 ```
 
-**Autopilot** (`il/autopilot.py`, a CPU-only Slurm job next to training): every new snapshot plays the panel (General
+**Autopilot** (`il/autopilot.py`, in the satellite job at nice 0: ~5 min of evaluation per snapshot, the collectors use its CPUs otherwise): every new snapshot plays the panel (General
 and IL, 200 games each, our deck vs the same real decks every time, live delay); one line per snapshot in
 `<run>/autopilot.jsonl`. A snapshot that beats `best.pt` on the panel without defending or playing less than the start
 is copied to `<run>/best.pt`, the checkpoint to play live. Two snapshots in a row 0.06 below the best (or entropy
@@ -160,7 +157,14 @@ stalled). Now the learner keeps receiving games while it trains (`cycle_s`, wall
 `games_per_hour` over it; `wait_s`: how long the learner waited for games after its update), and a server call is one packed input copy, one CUDA graph (state gather, forward, sampling) and one
 copy back per model: 1.7 ms instead of 3.2 ms, and 2.3 ms instead of 9.0 ms when a frozen opponent shares the
 round. Per game, collectors spend ~1.5 CPU-s on features and ~0.8 CPU-s in the engine, so the node's CPUs are the
-next limit: ~17.6k games/h measured (35 s per 256 trajectories, the update itself 28 s); more collectors in a second job (`tools/collectors.sbatch`) add CPUs.
+next limit: ~17.6k games/h measured (35 s per 256 trajectories, the update itself 28 s); more collectors in a second job add CPUs.
+
+At ~26k games/h (ppo-ebarbs2, 40 collectors, 4 servers on one A100) the servers were the limit again: collectors
+waited 9 ms per 1.4 ms of their own work, the GPU 100% busy. Processes sharing a GPU take turns, so 4 servers did no
+more than one (one A100, 3 models x 8 rows per round: 1 process 11.9k decisions/s, 4 processes 12.4k). Under MPS
+their small CUDA graphs run side by side: 4 processes 24.7k, 8 processes 34.6k (a game is ~1000 decisions). A game
+also costs ~1 CPU-s in a collector, and each QoS gives us 16 CPUs (qos_p107-a100, qos_p107-rtx5090, whatever the GPU
+count): hence the satellite job, whose RTX 5090 answers its own collectors, rather than more A100s.
 
 ## 4. Evaluation
 
@@ -272,7 +276,8 @@ Next: ppo-ebarbs2 under the autopilot; then alternate General and specialist run
 - **CUDA and fork.** Anything that touches CUDA before forking (even `torch.cuda.is_available()` in an argparse
   default) breaks forked GPU processes; `il.rl` picks the device after forking and refuses to fork otherwise.
 - **Slurm.** `qos_stu_cpu_long` is rejected (its association names partition `students`, the partition is
-  `Students`); `tools/collectors.sbatch` uses `qos_p107-rtx5090` without a GPU.
+  `Students`; every `stu` QoS is rejected the same way), so we have `qos_p107-a100` and `qos_p107-rtx5090`: 16 CPUs
+  and 4 GPUs per user each, 4 days.
 - **Git on the cluster.** GitHub is often unreachable from campus; we push to the node over SSH instead
   (`git push cluster main` with `receive.denyCurrentBranch updateInstead` there).
 - **OneDrive** flips file modes: `git config core.fileMode false`.
