@@ -392,7 +392,9 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
     os.dup2(log, 2)
     torch.set_num_threads(1)
     device = pick_device(args.server_device or args.device)
-    if device.type == 'cuda' and device.index is not None:
+    if device.type == 'cuda':
+        if device.index is None:  # 'cuda' (--device auto): torch.cuda.set_device needs an index
+            device = torch.device('cuda', torch.cuda.current_device())
         torch.cuda.set_device(device)  # CUDA graphs and streams use the current device
     model, _ = load_policy(args.init, device)  # the architecture; weights come from `shared`
 
@@ -408,6 +410,10 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
     server = Server({'current': model.eval(), **{k: load_policy(v, device)[0].eval() for k, v in pool.items()}},
                     device, model.config['core'])
     owners, first, window = [], None, args.batch_ms / 1000  # [(collector pipe, its requests)]
+    # Collectors with a game on this server (asked since their last reset). Every collector is connected to every
+    # server, so "all connections waiting" never happened and every round waited the whole window; a round is now
+    # sent as soon as every collector playing here waits.
+    active = set()
     arrivals = queue.Queue()  # remote collectors (il.rl join) joining at any time
     if listener is not None:
         accept_into(listener, arrivals)
@@ -429,16 +435,19 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
                 kind, index, payload = conn.recv()
             except (EOFError, OSError):  # its collector died, finished or (remote) lost its job
                 conns.remove(conn)
+                active.discard(conn)
                 owners = [(c, r) for c, r in owners if c is not conn]
                 continue
             if kind == 'act':
                 owners.append((conn, payload))
+                active.add(conn)
                 first = first or time.perf_counter()
             elif kind == 'reset':
                 server.reset(payload)
+                active.discard(conn)
         t1 = time.perf_counter()
         stats[sid * len(STATS)] += t1 - t0
-        if owners and (t1 - first >= window or len(owners) >= len(conns)):
+        if owners and (t1 - first >= window or len(owners) >= len(active)):
             requests = [r for _, payload in owners for r in payload]
             replies = server.act(requests)
             t2 = time.perf_counter()
