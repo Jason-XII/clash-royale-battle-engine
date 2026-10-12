@@ -46,14 +46,21 @@ def tower_hp(state):
             if e.card == -1 and e.entity_type == 'building'}
 
 
-def potential(state, start, owner):
-    """FirstLight's shaping potential for `owner` (see the module docstring); `start` is tower_hp at the start."""
+def damage(state, start, owner):
+    """(dealt, taken) for `owner`: crowns plus each tower's lost hp fraction (king x KING_WEIGHT), theirs and ours;
+    `start` is tower_hp at the start."""
     towers = tower_hp(state)
-    value = float(state.crowns[owner] - state.crowns[1 - owner])
+    out = [float(state.crowns[owner]), float(state.crowns[1 - owner])]
     for tid, (o, full, king) in start.items():
         lost = 1.0 - (towers[tid][1] / max(full, 1) if tid in towers else 0.0)
-        value += (KING_WEIGHT if king else 1.0) * lost * (1.0 if o != owner else -1.0)
-    return value
+        out[o == owner] += (KING_WEIGHT if king else 1.0) * lost
+    return tuple(out)
+
+
+def potential(state, start, owner):
+    """FirstLight's shaping potential for `owner` (see the module docstring)."""
+    dealt, taken = damage(state, start, owner)
+    return dealt - taken
 
 
 def opponent_dir(args):
@@ -138,6 +145,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
                 s['value'].append(value)
                 s['reward'].append(-OVERFLOW_PENALTY * full)
                 s['full'].append(full)
+                s['towers'].append(damage(state, start, o))  # il.rl's auxiliary targets
                 if action == D.ABILITY:
                     plays.append(Play(o, ABILITY, 0, 0))
                 elif action >= 2:

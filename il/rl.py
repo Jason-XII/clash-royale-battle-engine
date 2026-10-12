@@ -40,7 +40,8 @@ from .train import collate
 
 HOLD_LIMIT = 60  # s a collector's next game may be held back for a full backlog (well under REPLY_TIMEOUT)
 FOCUS_DECKS = 20  # --deck-mix 'focus': the most played ladder decks of the pool
-HARD_WIN_RATE, HARD_DECAY, HARD_TOP = 0.55, 0.8, 128  # FirstLight's hard-deck tracking
+HARD_DECAY, HARD_TOP, HARD_GAMES = 0.8, 10, 8  # hard cards: the HARD_TOP worst of those in >= HARD_GAMES decayed games
+AUX_HORIZONS = (40, 120)  # decisions (5 ticks each) ahead: the auxiliary head's tower-damage targets
 
 
 def rollback_scale(out):
@@ -60,8 +61,9 @@ class Matchmaker:
     PFSP over the snapshots otherwise. A frozen opponent's games all go to its home server (pool position % servers):
     a server then runs the current model and its own opponents, not every model of the pool, each round.
     Specialist (learner_deck): our seat plays it against a real ladder deck, by --deck-mix shares of the most played
-    ladder decks, any pool deck, and hard decks: those our seat scores worst against lately (results decay by
-    HARD_DECAY every update); only our seat's games train."""
+    ladder decks, any pool deck, and hard decks: a ladder deck with one of the cards our seat scores worst against
+    lately (results decay by HARD_DECAY every update; by card, as nearly every ladder deck is played once); only our
+    seat's games train."""
 
     def __init__(self, args, deck_pairs, learner_deck, frozen):
         self.args, self.deck_pairs, self.learner_deck, self.frozen = args, deck_pairs, learner_deck, frozen
@@ -72,7 +74,11 @@ class Matchmaker:
         self.by_key = {deck_key(d): d for d in ladder}
         self.played_keys = [deck_key(d) for d in ladder]
         self.focus = [k for k, _ in Counter(self.played_keys).most_common(FOCUS_DECKS)]
-        self.deck_results = {}  # deck key -> [decayed sum of outcomes, decayed games]
+        self.by_card = defaultdict(list)  # card -> the ladder decks with it, as often as they are played
+        for key in self.played_keys:
+            for card in key:
+                self.by_card[card].append(key)
+        self.card_results = {}  # card -> [decayed sum of outcomes, decayed games] against decks with it
 
     def pick_opponent(self):
         # the starting model and the --pool-size latest snapshots: older ones are beaten easily and each extra model
@@ -88,16 +94,19 @@ class Matchmaker:
         weights = [(1 - (np.mean(results[k]) + 1) / 2 if results[k] else 0.5) ** 2 + 0.05 for k in active]
         return random.choices(active, weights)[0]
 
-    def hard_decks(self):
-        rated = [(total / games, key) for key, (total, games) in list(self.deck_results.items())  # the serve thread adds
-                 if games >= 1 and (total / games + 1) / 2 < HARD_WIN_RATE]
-        return [key for _, key in sorted(rated)[:HARD_TOP]]
+    def hard_cards(self):
+        rated = [(total / games, card) for card, (total, games) in list(self.card_results.items())  # the serve thread adds
+                 if games >= HARD_GAMES]
+        return [card for _, card in sorted(rated)[:HARD_TOP]]
 
     def opponent_deck(self):
         kind = random.choices(('focus', 'pool', 'hard'), self.deck_mix)[0]
-        hard = self.hard_decks() if kind == 'hard' else []
-        key = random.choice(self.focus if kind == 'focus' else hard) if kind == 'focus' or hard else None
-        if key is None:
+        hard = self.hard_cards() if kind == 'hard' else []
+        if kind == 'focus':
+            key = random.choice(self.focus)
+        elif hard:
+            key = random.choice(self.by_card[random.choice(hard)])
+        else:
             key = random.choice(self.played_keys)
         return self.by_key[key], key
 
@@ -124,13 +133,14 @@ class Matchmaker:
         if trajectory['opponent'] != 'current':
             self.results[trajectory['opponent']].append(trajectory['outcome'])
         if trajectory.get('tag') is not None:
-            entry = self.deck_results.setdefault(trajectory['tag'], [0.0, 0.0])
-            entry[0] += trajectory['outcome']
-            entry[1] += 1
+            for card in trajectory['tag']:
+                entry = self.card_results.setdefault(card, [0.0, 0.0])
+                entry[0] += trajectory['outcome']
+                entry[1] += 1
 
     def decay(self):
-        """Once per update: older deck results count less."""
-        for entry in list(self.deck_results.values()):
+        """Once per update: older results count less."""
+        for entry in list(self.card_results.values()):
             entry[0] *= HARD_DECAY
             entry[1] *= HARD_DECAY
 
@@ -160,16 +170,24 @@ def explained(target, value):
     return float(1 - np.var(target - value) / max(np.var(target), 1e-8))
 
 
+def aux_targets(towers):
+    """[T, 2] damage dealt / taken so far (il.actors.damage) -> [T, 4]: how much more of each AUX_HORIZONS decisions
+    later (or at the game's end)."""
+    T = len(towers)
+    return np.concatenate([towers[np.minimum(np.arange(T) + h, T - 1)] - towers for h in AUX_HORIZONS], 1)
+
+
 def update(model, reference, optimizer, trajectories, args, device):
     for t in trajectories:
         t['adv'], t['ret'] = advantages(t, args.gamma, args.lam)
+        t['aux'] = aux_targets(t['towers'])
     flat = np.concatenate([t['adv'] for t in trajectories])
     mean, std = flat.mean(), flat.std() + 1e-8
     value = np.concatenate([t['value'] for t in trajectories])
     diagnostics = {  # how much the value head (the advantages' baseline) knows, before this update
         'value_ev_mc': explained(np.concatenate([discounted(t['reward'], args.gamma) for t in trajectories]), value),
         'value_ev_gae': explained(np.concatenate([t['ret'] for t in trajectories]), value)}
-    keys = INPUT_KEYS + ('action', 'logp', 'adv', 'ret')
+    keys = INPUT_KEYS + ('action', 'logp', 'adv', 'ret', 'aux')
     stats = defaultdict(list)
     # The reference (IL) policy's distribution, once per trajectory: it does not change during the update, so the
     # epochs need not run its forward pass again (it was a quarter of the update's GPU time).
@@ -191,7 +209,7 @@ def update(model, reference, optimizer, trajectories, args, device):
             m = batch['time_mask']
             x = {k: batch[k] for k in INPUT_KEYS}
             with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
-                logits, value, _ = model(x, valid=m)
+                logits, value, _, aux = model(x, valid=m, aux=True)
             dist = distribution(logits, explore=ABILITY_EXPLORE)
             ref = padded_ref(trajectories[i:i + args.minibatch], m.shape[1])
             new_logp = log_prob(dist, batch['action'])
@@ -199,9 +217,11 @@ def update(model, reference, optimizer, trajectories, args, device):
             adv = (batch['adv'] - mean) / std
             policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv)[m].mean()
             value_loss = F.mse_loss(value.float()[m], batch['ret'][m])
+            aux_loss = F.mse_loss(aux.float()[m], batch['aux'][m])
             ent = entropy(dist)[m].mean()
             kl_ref = kl(dist, ref)[m].mean()
-            loss = policy_loss + args.value_coef * value_loss - args.entropy * ent + args.kl_coef * kl_ref
+            loss = (policy_loss + args.value_coef * value_loss + args.aux_coef * aux_loss - args.entropy * ent
+                    + args.kl_coef * kl_ref)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -209,6 +229,7 @@ def update(model, reference, optimizer, trajectories, args, device):
             with torch.no_grad():
                 stats['policy_loss'].append(policy_loss.item())
                 stats['value_loss'].append(value_loss.item())
+                stats['aux_loss'].append(aux_loss.item())
                 stats['entropy'].append(ent.item())
                 stats['kl_ref'].append(kl_ref.item())
                 stats['approx_kl'].append(((ratio - 1) - ratio.log())[m].mean().item())
@@ -268,6 +289,7 @@ def main():
     parser.add_argument('--gamma', type=float, default=0.999)
     parser.add_argument('--lam', type=float, default=0.95)
     parser.add_argument('--value-coef', type=float, default=0.5)
+    parser.add_argument('--aux-coef', type=float, default=0.5, help="the auxiliary tower-damage head's loss weight")
     parser.add_argument('--entropy', type=float, default=0.002)
     parser.add_argument('--kl-coef', type=float, default=0.05)
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
@@ -514,7 +536,7 @@ def main():
                    full_elixir=float(np.mean(np.concatenate([t['full'] for t in trajectories]))),
                    score_vs_pool=float(np.mean(outcomes)) if outcomes else None,
                    pool={k: round(float(np.mean(v)), 3) for k, v in list(matchmaker.results.items()) if v},
-                   hard_decks=len(matchmaker.hard_decks()),
+                   hard_cards=[card[0] for card in matchmaker.hard_cards()],
                    lr=optimizer.param_groups[0]['lr'],
                    defense=defense.summary([t['defense'] for t in trajectories if t.get('defense')]), **stats_row)
         metrics.write(json.dumps(row) + '\n')

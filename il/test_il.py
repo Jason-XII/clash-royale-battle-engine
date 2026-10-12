@@ -462,15 +462,22 @@ class Matchmaking(unittest.TestCase):
             self.assertIn(opponent, m.frozen)
             self.assertEqual(spec['server'], m.frozen.index(opponent) % 4)
             self.assertEqual(spec['tag'], deck_key(spec['decks']['decks'][1 - seat]))
-        lost_to = deck_key(ladder[3])
-        self.assertEqual(m.hard_decks(), [])
-        for _ in range(3):
-            m.record({'opponent': 'il', 'outcome': -1.0, 'tag': lost_to})
-        self.assertEqual(m.hard_decks(), [lost_to])
-        self.assertTrue(all(m.spec()['tag'] == lost_to for _ in range(10)))  # deck mix: hard decks only
-        for _ in range(5):
-            m.decay()
-        self.assertEqual(m.hard_decks(), [])  # 3 * 0.8^5 < 1 game
+        lost_to = ladder[3][0]['d'], 0  # a card of one ladder deck only
+        self.assertEqual(m.hard_cards(), [])
+        for _ in range(8):
+            m.record({'opponent': 'il', 'outcome': -1.0, 'tag': deck_key(ladder[3])})
+        self.assertEqual(m.hard_cards()[0], lost_to)
+        self.assertTrue(all(m.spec()['tag'] == deck_key(ladder[3]) for _ in range(10)))  # deck mix: hard decks only
+        m.decay()
+        self.assertEqual(m.hard_cards(), [])  # 8 * 0.8 < HARD_GAMES
+
+    def test_aux_targets(self):
+        from .rl import AUX_HORIZONS, aux_targets
+        towers = np.stack([np.arange(200.0), np.zeros(200)], 1)  # one more damage dealt every decision
+        out = aux_targets(towers)
+        self.assertEqual(out.shape, (200, 4))
+        self.assertEqual(list(out[0]), [AUX_HORIZONS[0], 0, AUX_HORIZONS[1], 0])
+        self.assertEqual(list(out[-1]), [0, 0, 0, 0])  # nothing more after the end
 
 
 if __name__ == '__main__':

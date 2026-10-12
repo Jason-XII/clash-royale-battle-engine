@@ -96,7 +96,9 @@ reconnect when it restarts and give up on a peer silent for 180 s.
 **E-Barbs specialist** (the learning seat always plays our deck, the other seat a real ladder deck played by the IL
 model (40%) or the general model's snapshots (PFSP); a specialist plays other decks ever worse, so it is no sparring
 partner; only our seat's games train). Opponent decks as FirstLight: 30% the 20 most played ladder decks, 40% any pool
-deck, 30% hard decks (those we score under 55% against lately). The run `ppo-ebarbs2` continues the first specialist
+deck, 30% hard decks: a ladder deck with one of the 10 cards we score worst against lately (by card, since nearly every
+ladder deck is played once). An auxiliary head (KataGo) learns the tower damage dealt and taken over the next ~10 s and
+~30 s, a denser signal for the core than the outcome. The run `ppo-ebarbs2` continues the first specialist
 (its latest.pt copied in) with tower shaping; the KL reference stays the General:
 
 ```bash

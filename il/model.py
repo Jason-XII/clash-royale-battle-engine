@@ -53,6 +53,9 @@ class Policy(nn.Module):
         # and never reaches a decision).
         self.extras = nn.Linear(EXTRAS + 4 * card_dim, core)
         self.matchup = mlp(core + card_dim, 64, 1)
+        # Added in PPO (KataGo's auxiliary targets): tower damage dealt / taken over the next AUX_HORIZONS (il.rl),
+        # trained only, never read by a decision; its gradient gives the core a denser signal than the game's outcome.
+        self.aux = mlp(core + SCALARS, 128, 4)
         for layer in (self.extras, self.matchup[-1]):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
@@ -61,9 +64,9 @@ class Policy(nn.Module):
         zeros = torch.zeros(1, batch, self.config['core'], device=device)
         return zeros, zeros.clone()
 
-    def forward(self, x, state=None, valid=None):
+    def forward(self, x, state=None, valid=None, aux=False):
         """x: dict of [B, T, ...] tensors (INPUT_KEYS). Returns masked logits [B, T, ACTIONS],
-        value [B, T] and the new LSTM state.
+        value [B, T] and the new LSTM state (and, with aux, the auxiliary head's [B, T, 4]).
 
         valid: optional [B, T] bool (the PPO update's time mask). The per-step parts (entities, grid, convs, cell
         scores) then run on the valid steps only and padded steps get what a padded step gives anyway (no playable
@@ -88,8 +91,9 @@ class Policy(nn.Module):
         ability = wait_ability[..., 1:].masked_fill(~x['ability_ok'].unsqueeze(-1), float('-inf'))
         logits = torch.cat([wait_ability[..., :1], ability, cells.flatten(2)], -1)
         deck = self.card(x['opp_deck']).mean(2)
-        value = (self.value(torch.cat([core, x['scalars']], -1)) + self.matchup(torch.cat([core, deck], -1))).squeeze(-1)
-        return logits, value, state
+        summary = torch.cat([core, x['scalars']], -1)
+        value = (self.value(summary) + self.matchup(torch.cat([core, deck], -1))).squeeze(-1)
+        return (logits, value, state, self.aux(summary)) if aux else (logits, value, state)
 
     def _steps(self, x, B, T):
         """Per-step part before the LSTM: the conv grid [B * T, C, H, W] and the LSTM's input [B, T, ...]."""
@@ -139,9 +143,9 @@ assert ACTIONS == 2 + 4 * CELLS
 
 
 def load_weights(model, weights):
-    """A checkpoint from before the extras / matchup layers loads with them at their zero initialisation."""
+    """A checkpoint from before the extras / matchup / aux layers loads with them at their initialisation."""
     missing, unexpected = model.load_state_dict(weights, strict=False)
-    added = ('extras.', 'matchup.')
+    added = ('extras.', 'matchup.', 'aux.')
     if unexpected or any(not k.startswith(added) for k in missing):
         raise RuntimeError(f'checkpoint does not fit the model: missing {missing}, unexpected {unexpected}')
 
