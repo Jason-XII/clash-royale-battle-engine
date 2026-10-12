@@ -237,5 +237,7 @@ Next: General PPO until it plateaus, then an E-Barbs specialist from it, then cl
   (`git push cluster main` with `receive.denyCurrentBranch updateInstead` there).
 - **OneDrive** flips file modes: `git config core.fileMode false`.
 
+Docs: [model inputs still missing](docs/MODEL_INPUTS.md), [how the live client takes a play](docs/GAME_INTEGRATION.md), [working with Arron: metrics, where findings go](docs/COLLABORATION.md).
+
 Tests: `python -m unittest il.test_il` (needs `data/cache-smoke`, see `build_cache --parts 0 --limit 100`;
 the online-features test needs the emulator engine running).
