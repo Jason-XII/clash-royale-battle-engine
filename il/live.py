@@ -159,8 +159,17 @@ def play_battle(engine, agent, taps, state, args, log):
         screen = taps.play(slot, x, y, agent.owner)
         pending = (card.card, state.tick)
         log({'event': 'tap', 'tick': state.tick, 'card': card.card, 'slot': slot, 'world': [x, y],
-             'screen': screen, 'input_ms': round((time.perf_counter() - started) * 1000)})
+             'screen': screen, 'input_ms': round((time.perf_counter() - started) * 1000), **choice_odds(agent, me)})
     return state
+
+
+def choice_odds(agent, me):
+    """Our hand at a tap and how likely the training policy was to play each slot (summed over cells) or wait."""
+    from .rl import distribution
+    log_wait, log_play, cond = distribution(agent.last_logits[None])
+    slots = (cond[0].exp().view(4, D.CELLS).sum(-1) * log_play.exp()).tolist()
+    return {'hand': {c.slot: [c.card, c.cost] for c in me.hand}, 'p_wait': round(log_wait.exp().item(), 3),
+            'p_slot': [round(p, 3) for p in slots]}
 
 
 def connect(args):

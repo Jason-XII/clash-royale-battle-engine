@@ -128,6 +128,7 @@ class Agent:
     def act(self, state):
         logits, value, self.lstm = self.model(self.observe(state), self.lstm)
         logits = logits[0, 0].float()
+        self.last_logits = logits  # for logging (il.live)
         if self.decode == 'policy':  # il.rl's training policy
             from .rl import distribution, sample
             action = int(sample(distribution(logits[None]))[0])
