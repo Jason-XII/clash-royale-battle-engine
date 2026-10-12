@@ -17,8 +17,8 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
-from .engine import Transition, standard_match
-from .engine import CardPlay, Entity, HandCard, Player, State
+from .engine import ABILITY, Transition, standard_match
+from .engine import Ability, CardPlay, Entity, Evolution, HandCard, Player, State
 
 # Elixir cost of every fixed-cost card in the IL cache (Mirror 28000006 and 28000025 vary: the engine is asked).
 COSTS = {
@@ -102,10 +102,17 @@ class ClaphaEngine:
         before = self.state
         executed = []
         for a in actions:
+            free = all(p['owner'] != a.owner for p in self.pending)
+            due = before.tick + max(delay, 1)
+            if a.slot == ABILITY:  # a tap on the ability button: lands like a card, if a carrier is still ready then
+                ok = free and any(x.ready for x in before.players[a.owner].abilities)
+                if ok:
+                    self.pending.append(dict(due=due, until=due, owner=a.owner, slot=ABILITY, card=None, cost=0))
+                executed.append(ok)
+                continue
             card = next((h for h in before.players[a.owner].hand if h.slot == a.slot), None)
-            ok = card is not None and all(p['owner'] != a.owner for p in self.pending)
+            ok = card is not None and free
             if ok:
-                due = before.tick + max(delay, 1)
                 self.pending.append(dict(due=due, until=due + WAIT_LIMIT, owner=a.owner, slot=a.slot,
                                          card=card.card, cost=card.cost, x=a.x, y=a.y))
             executed.append(ok)
@@ -146,6 +153,10 @@ class ClaphaEngine:
             return
         players = self._players()
         for p in due:
+            if p['slot'] == ABILITY:
+                self.pending.remove(p)
+                self._activate(p['owner'])
+                continue
             hand, _, elixir = players[p['owner']]
             in_hand = hand.get(p['slot'], (None, None))[1] == p['card']
             if in_hand and elixir >= p['cost'] * 10000:
@@ -154,6 +165,34 @@ class ClaphaEngine:
             elif in_hand and now + 1 < p['until']:
                 continue  # wait for elixir
             self.pending.remove(p)
+
+    def _activate(self, owner):
+        """Activate the first ready hero / champion ability of `owner`, if any (a press on a button no longer ready
+        does nothing, as in the game)."""
+        r = self.env.reader
+        for row in r.abilities(r.player(r.logic(self.env.battle), owner)):
+            if row['buttonState'] in (2, 4) and row['remainingCooldownMs'] == 0 and row['remainingChargesRaw'] != 0:
+                for unit in row['championObjectIds']:
+                    try:
+                        self.env.queue_ability_action_at(SimpleNamespace(owner=owner, secondary_index=unit))
+                        return True
+                    except RuntimeError:  # that carrier died or is not the one ready
+                        continue
+        return False
+
+    def _runtime(self, owner):
+        """Hero / champion controllers (every capture) and evolution progress (cached until a card is played)."""
+        r = self.env.reader
+        player = r.player(r.logic(self.env.battle), owner)
+        abilities = tuple(Ability(a['buttonState'], a['remainingCooldownMs'], a['configuredCooldownMs'],
+                                  a['remainingChargesRaw'], a['maxCharges'] or 0, tuple(a['championObjectIds']))
+                          for a in r.abilities(player))
+        return abilities
+
+    def _evolution(self):
+        return [tuple(Evolution(e['deckSlot'], e['cardId'], e['evolvable'], e['cycleRequired'] or 0,
+                                e['cycleRemaining'] or 0, bool(e['ready'])) for e in p['evolutionRuntime'])
+                for p in self.env.reader.players_lean(self.env.battle)]
 
     def run(self, ticks, count):
         states = []
@@ -170,16 +209,21 @@ class ClaphaEngine:
         crowns, ended, winner = env._result(objects)
         tick = env.tick()
         players, plays, hands = [], [], {}
-        for owner, (hand, cycle, elixir) in enumerate(self._players()):
+        lean = self._players()
+        for owner, (hand, _, _) in enumerate(lean):
             hands[owner] = {i: card for i, (_, card) in hand.items()}
-            players.append(Player(owner, elixir, tuple(HandCard(i, card, self._cost(owner, slot, card), 0, card)
-                                                       for i, (slot, card) in sorted(hand.items())), cycle))
             if self.hands is not None:  # a card that left its slot since the last snapshot was played
                 for i, card in self.hands[owner].items():
                     if hands[owner].get(i) != card:
                         self.sequence += 1
                         plays.append(CardPlay(self.sequence, tick, owner, card, COSTS.get(card, -1)))
+        if self.hands is None or plays:
+            self.evolution = self._evolution()
         self.hands = hands
+        for owner, (hand, cycle, elixir) in enumerate(lean):
+            players.append(Player(owner, elixir, tuple(HandCard(i, card, self._cost(owner, slot, card), 0, card)
+                                                       for i, (slot, card) in sorted(hand.items())), cycle,
+                                  self._runtime(owner), self.evolution[owner]))
         entities = tuple(self._entity(o) for o in objects)
         return State(self.generation, tick, bool(ended), winner, (crowns[0], crowns[1]),
                      tuple(players), entities, tuple(plays), self.sequence + 1)

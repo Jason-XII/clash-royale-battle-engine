@@ -47,7 +47,7 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
   JsonWriter json(buffer, capacity, used);
   json.begin_object();
   json.field("ok", true);
-  json.field("schema", "cr-minimal.v3");
+  json.field("schema", "cr-minimal.v4");
   json.field("generation", capture.generation);
   json.field("tick", tick);
   json.field("finalized", result.finalized);
@@ -79,6 +79,30 @@ bool build_minimal_capture(char *buffer, std::size_t capacity, std::uint64_t gen
       CardStateView card;
       if (!read_card_state(player, cycle[i], false, &card)) return reject_minimal_capture("cycle-card");
       json.element(card.card_id);
+    }
+    json.end_array();
+    // Hero / champion controllers and evolution progress (as the rich capture's abilityRuntime / evolutionRuntime):
+    // abilities [buttonState, remainingCooldownMs, configuredCooldownMs, remainingChargesRaw, maxCharges, [unit ids]],
+    // evolution [deckSlot, cardId, evolvable, cycleRequired, cycleRemaining, ready].
+    static NativePlayerRuntimeView runtime;  // ~16 KB: off the game thread's stack; capture runs on that one thread
+    if (!read_native_player_runtime(world, object_manager, objects, count, owner, &runtime))
+      return reject_minimal_capture("player-runtime");
+    json.begin_array("abilities");
+    for (int a = 0; runtime.owner_root_valid && runtime.ability_runtime_valid && a < runtime.ability_count; ++a) {
+      const NativeChampionControllerView &ability = runtime.abilities[a];
+      json.append("%s[%d,%d,%d,%d,%d,[", a ? "," : "", ability.button_state, ability.remaining_cooldown_ms,
+                  ability.configured_cooldown_ms, ability.remaining_charges_raw, ability.max_charges);
+      for (int c = 0; c < ability.champion_count; ++c)
+        json.append("%s%u", c ? "," : "", ability.champions[c].native_object_id);
+      json.append("]]");
+    }
+    json.end_array();
+    json.begin_array("evolution");
+    for (int s = 0; runtime.evolution_runtime_valid && s < runtime.evolution_slot_count; ++s) {
+      const NativeEvolutionSlotView &evolution = runtime.evolution_slots[s];
+      json.append("%s[%d,%d,%d,%d,%d,%d]", s ? "," : "", evolution.deck_slot, evolution.card_id,
+                  evolution.evolvable ? 1 : 0, evolution.cycle_required, evolution.cycle_remaining,
+                  evolution.ready ? 1 : 0);
     }
     json.end_array();
     json.end_object();

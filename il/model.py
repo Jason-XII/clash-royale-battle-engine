@@ -5,10 +5,11 @@ from torch import nn
 import torch.nn.functional as F
 
 from . import data as D
-from .data import ACTIONS, CELLS, ENTITY_FLOATS, H, MAX_ENTITIES, REVEALED, SCALARS, W
+from .data import ACTIONS, CELLS, ENTITY_FLOATS, EXTRAS, H, MAX_ENTITIES, REVEALED, SCALARS, W
 
 INPUT_KEYS = ('ent_obj', 'ent_side', 'ent_type', 'ent_cell', 'ent_float', 'rev_card', 'rev_age',
-              'scalars', 'hand_card', 'hand_cost', 'next_card', 'slot_ok')
+              'scalars', 'hand_card', 'hand_cost', 'next_card', 'slot_ok',
+              'extras', 'cycle_card', 'pending_card', 'ability_ok', 'opp_deck')
 
 
 def mlp(*widths):
@@ -44,6 +45,15 @@ class Policy(nn.Module):
         self.film = nn.Linear(core + card_dim, 2 * channels)
         self.cell = nn.Conv2d(channels, 1, 1)
         self.value = mlp(core + SCALARS, 128, 1)  # scalars (crowns, time, elixir) read directly
+        # Added after IL (zero-initialised, so an older checkpoint plays exactly as before until PPO trains them):
+        # extras + our next three cycle cards + the card in flight, into the LSTM input; and the opponent's whole
+        # deck, into the value only (training-time information: it reduces the deck-matchup noise in advantages
+        # and never reaches a decision).
+        self.extras = nn.Linear(EXTRAS + 4 * card_dim, core)
+        self.matchup = mlp(core + card_dim, 64, 1)
+        for layer in (self.extras, self.matchup[-1]):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
 
     def initial_state(self, batch, device=None):
         zeros = torch.zeros(1, batch, self.config['core'], device=device)
@@ -71,14 +81,19 @@ class Policy(nn.Module):
         nxt = torch.cat([self.card(x['next_card']), torch.zeros_like(x['next_card'], dtype=hand.dtype).unsqueeze(-1)], -1)
         rev = torch.cat([self.card(x['rev_card']), x['rev_age'].unsqueeze(-1)], -1)
         g = torch.cat([pooled, x['scalars'], hand.flatten(2), nxt, rev.flatten(2)], -1)
-        core, state = self.lstm(self.lstm_norm(F.relu(self.globals(self.global_norm(g)))), state)  # [B, T, core]
+        added = torch.cat([x['extras'], self.card(x['cycle_card']).flatten(2), self.card(x['pending_card'])], -1)
+        h = F.relu(self.globals(self.global_norm(g))) + self.extras(added)
+        core, state = self.lstm(self.lstm_norm(h), state)  # [B, T, core]
         # Per hand slot: condition the grid on (core, card) and score every cell.
         film = self.film(torch.cat([core.unsqueeze(2).expand(-1, -1, 4, -1), self.card(x['hand_card'])], -1))
         scale, shift = film.reshape(N, 4, 2 * C, 1, 1).chunk(2, 2)
         cells = self.cell(F.relu(grid.unsqueeze(1) * (1 + scale) + shift).reshape(N * 4, C, H, W))
         cells = cells.reshape(B, T, 4, CELLS).masked_fill(~x['slot_ok'].unsqueeze(-1), float('-inf'))
-        logits = torch.cat([self.wait_ability(core), cells.flatten(2)], -1)
-        value = self.value(torch.cat([core, x['scalars']], -1)).squeeze(-1)
+        wait_ability = self.wait_ability(core)
+        ability = wait_ability[..., 1:].masked_fill(~x['ability_ok'].unsqueeze(-1), float('-inf'))
+        logits = torch.cat([wait_ability[..., :1], ability, cells.flatten(2)], -1)
+        deck = self.card(x['opp_deck']).mean(2)
+        value = (self.value(torch.cat([core, x['scalars']], -1)) + self.matchup(torch.cat([core, deck], -1))).squeeze(-1)
         return logits, value, state
 
 
@@ -94,10 +109,18 @@ def decode(action):
 assert ACTIONS == 2 + 4 * CELLS
 
 
+def load_weights(model, weights):
+    """A checkpoint from before the extras / matchup layers loads with them at their zero initialisation."""
+    missing, unexpected = model.load_state_dict(weights, strict=False)
+    added = ('extras.', 'matchup.')
+    if unexpected or any(not k.startswith(added) for k in missing):
+        raise RuntimeError(f'checkpoint does not fit the model: missing {missing}, unexpected {unexpected}')
+
+
 def load(checkpoint, device='cpu'):
     saved = torch.load(checkpoint, map_location=device, weights_only=False)
     model = Policy(**saved['config']).to(device).eval()
-    model.load_state_dict(saved['model'])
+    load_weights(model, saved['model'])
     return model, saved['vocab']
 
 
@@ -105,7 +128,7 @@ class Agent:
     """One player. `act(state)` returns ('wait',), ('ability',) or ('card', slot, x, y) in world units.
 
     decode: 'gate'   - play with probability 1 - p(wait), then the best card/cell/ability (default)
-            'policy' - il.rl's PPO policy: wait with p(wait), else card x cell sampled at its temperature
+            'policy' - il.rl's PPO policy: wait with p(wait), else (ability | card x cell) sampled at its temperature
             'sample' - sample the whole joint action
             'argmax' - joint argmax; almost never plays, because a decision to play is spread
                        over hundreds of card x cell options while WAIT is a single option
@@ -119,14 +142,15 @@ class Agent:
         from .data import Observer
         self.lstm, self.observer = None, Observer(self.vocab, (self.owner,))
 
-    def observe(self, state):
-        """Feature row for `state` ([1, 1, ...] tensors); the observer keeps the previous state and the plays so far."""
-        row = self.observer.observe(state)[0]
+    def observe(self, state, in_flight=()):
+        """Feature row for `state` ([1, 1, ...] tensors); the observer keeps the previous state and the plays so far.
+        `in_flight`: il.data.InFlight taps not landed yet."""
+        row = self.observer.observe(state, in_flight)[0]
         return {k: torch.as_tensor(row[k])[None, None].to(self.device) for k in INPUT_KEYS}
 
     @torch.no_grad()
-    def act(self, state):
-        logits, value, self.lstm = self.model(self.observe(state), self.lstm)
+    def act(self, state, in_flight=()):
+        logits, value, self.lstm = self.model(self.observe(state, in_flight), self.lstm)
         logits = logits[0, 0].float()
         self.last_logits = logits  # for logging (il.live)
         if self.decode == 'policy':  # il.rl's training policy

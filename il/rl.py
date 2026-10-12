@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 
 from . import data as D
-from .model import INPUT_KEYS, Policy
+from .model import INPUT_KEYS, Policy, load_weights
 from .train import collate
 
 TEMPERATURE = 0.5
@@ -47,23 +47,23 @@ OVERFLOW_PENALTY = 0.002
 
 # ---- the policy distribution -----------------------------------------------------------------------------------------
 def distribution(logits, temperature=TEMPERATURE):
-    """[..., ACTIONS] logits -> (log p(wait), log p(play), conditional log-probs over cards x cells [..., 4*CELLS]).
-    The ability action is excluded. A step with no playable card waits with probability 1."""
+    """[..., ACTIONS] logits -> (log p(wait), log p(play), conditional log-probs over the play options [..., 1 + 4*CELLS]:
+    the ability, then cards x cells). The model masks what cannot be played (-inf), the ability when it is not ready.
+    A step with nothing playable waits with probability 1."""
     logits = logits.float()
-    cards = logits[..., 2:]
-    joint = torch.cat([logits[..., :1], cards], -1)  # wait + cards, ability dropped
-    log_wait = joint.log_softmax(-1)[..., 0]
-    playable = torch.isfinite(cards).any(-1)
+    options = logits[..., 1:]
+    log_wait = logits.log_softmax(-1)[..., 0]
+    playable = torch.isfinite(options).any(-1)
     log_play = torch.where(playable, torch.log1p(-log_wait.exp().clamp(max=1 - 1e-6)), torch.full_like(log_wait, -1e9))
     log_wait = torch.where(playable, log_wait, torch.zeros_like(log_wait))
-    cond = torch.where(playable.unsqueeze(-1), cards / temperature, torch.zeros_like(cards)).log_softmax(-1)
+    cond = torch.where(playable.unsqueeze(-1), options / temperature, torch.zeros_like(options)).log_softmax(-1)
     return log_wait, log_play, cond
 
 
 def log_prob(dist, action):
     log_wait, log_play, cond = dist
-    card = (action - 2).clamp(min=0)
-    return torch.where(action == D.WAIT, log_wait, log_play + cond.gather(-1, card.unsqueeze(-1)).squeeze(-1))
+    option = (action - 1).clamp(min=0)
+    return torch.where(action == D.WAIT, log_wait, log_play + cond.gather(-1, option.unsqueeze(-1)).squeeze(-1))
 
 
 def entropy(dist):
@@ -84,23 +84,11 @@ def kl(dist, ref):
 def sample(dist):
     log_wait, log_play, cond = dist
     play = torch.rand_like(log_wait) < log_play.exp()
-    card = (cond - torch.empty_like(cond).exponential_().log()).argmax(-1)  # Gumbel-max: a draw from softmax(cond)
-    return torch.where(play, card + 2, torch.zeros_like(card))
+    option = (cond - torch.empty_like(cond).exponential_().log()).argmax(-1)  # Gumbel-max: a draw from softmax(cond)
+    return torch.where(play, option + 1, torch.zeros_like(option))
 
 
 # ---- collectors ---------------------------------------------------------------------------------------------------------
-def hold_while_in_flight(rows, pending):
-    """Feature rows of both seats, with no card playable for a player whose play is still on its way.
-    ClaphaEngine.step drops a second play while one is pending (executed False), but the trajectory would store it
-    as played (action, logp): PPO would credit or blame a play that never happened, about 4 decisions after every
-    play (22-tick delay, a decision every 5 ticks). With every slot_ok False the policy waits with probability 1
-    (logp 0), so what is stored is what happened."""
-    for o in (0, 1):
-        if any(p['owner'] == o for p in pending):
-            rows[o]['slot_ok'] = np.zeros_like(rows[o]['slot_ok'])
-    return rows
-
-
 def collector_engine(name, out, clapha, stagger):
     """A collector process's log, CPU priority and booted engine (+ the run's vocab)."""
     log = os.open(f'{out}/logs/collector-{name}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
@@ -133,8 +121,8 @@ def play_games(index, delay, engine, vocab, learner, servers):
     """Plays the learner's games until it sends None: games and trajectories through the learner (`learner`),
     actions from the decision server the learner names for each game (one of `servers`: a frozen opponent lives on
     one server, so its games go there). Local pipes or TCP connections (il.rl join) alike."""
-    from native_engine import Play
-    from .data import Observer
+    from native_engine import ABILITY, Play
+    from .data import InFlight, Observer
     from .arena import make_match
     while True:
         learner.send(('new_game', index, None))
@@ -151,7 +139,9 @@ def play_games(index, delay, engine, vocab, learner, servers):
         timing = defaultdict(float)  # seconds per part of a decision, for the learner's log
         while True:
             t0 = time.perf_counter()
-            rows = hold_while_in_flight(observer.observe(state), engine.pending)
+            # A player with a play or ability press in flight can do nothing else (ClaphaEngine drops it): the
+            # Observer masks everything for that seat, so what is stored is what happened (wait, log-prob 0).
+            rows = observer.observe(state, [InFlight(p['owner'], p['card'], p['cost'], p['due']) for p in engine.pending])
             t1 = time.perf_counter()
             conn.send(('act', index, [((index, o), models[o], pack(rows[o])) for o in (0, 1)]))
             replies = receive(conn)
@@ -170,7 +160,9 @@ def play_games(index, delay, engine, vocab, learner, servers):
                 s['value'].append(value)
                 s['reward'].append(-OVERFLOW_PENALTY * full)
                 s['full'].append(full)
-                if action >= 2:
+                if action == D.ABILITY:
+                    plays.append(Play(o, ABILITY, 0, 0))
+                elif action >= 2:
                     slot, cell = divmod(action - 2, D.CELLS)
                     x, y = D.cell_center(cell, o)
                     plays.append(Play(o, int(slot), int(x), int(y)))
@@ -188,7 +180,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
         for o in (0, 1):
             outcome = 0.0 if state.result not in (0, 1) else (1.0 if state.result == o else -1.0)
             steps[o]['reward'][-1] += outcome
-            if models[o] == 'current':
+            if o in spec.get('train', [s for s in (0, 1) if models[s] == 'current']):
                 trajectory = {k: np.array(v) for k, v in steps[o].items()}
                 trajectory = {k: v.astype(np.float32) if v.dtype == np.float64 else v for k, v in trajectory.items()}
                 learner.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o], timing=timing)))
@@ -200,7 +192,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
 def load_policy(path, device):
     saved = torch.load(path, map_location='cpu', weights_only=False)
     model = Policy(**saved['config'])
-    model.load_state_dict(saved['model'])
+    load_weights(model, saved['model'])
     return model.to(device), saved
 
 
@@ -210,8 +202,10 @@ GRAPH_BUCKETS = (8, 16, 32, 64, 128)  # batch sizes a recorded decision is padde
 # a model's whole batch to the GPU at once and views the fields back out of it.
 LAYOUT = [(k, np.int64, (D.MAX_ENTITIES,)) for k in ('ent_obj', 'ent_side', 'ent_type', 'ent_cell')] + [
     ('rev_card', np.int64, (D.REVEALED,)), ('hand_card', np.int64, (4,)), ('next_card', np.int64, ()),
+    ('cycle_card', np.int64, (3,)), ('pending_card', np.int64, ()), ('opp_deck', np.int64, (8,)),
     ('ent_float', np.float32, (D.MAX_ENTITIES, D.ENTITY_FLOATS)), ('rev_age', np.float32, (D.REVEALED,)),
-    ('scalars', np.float32, (D.SCALARS,)), ('hand_cost', np.float32, (4,)), ('slot_ok', np.bool_, (4,))]
+    ('scalars', np.float32, (D.SCALARS,)), ('hand_cost', np.float32, (4,)), ('extras', np.float32, (D.EXTRAS,)),
+    ('slot_ok', np.bool_, (4,)), ('ability_ok', np.bool_, ())]
 assert sorted(k for k, _, _ in LAYOUT) == sorted(INPUT_KEYS)
 
 
@@ -398,7 +392,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
     os.dup2(log, 2)
     torch.set_num_threads(1)
     device = pick_device(args.server_device or args.device)
-    if device.type == 'cuda':
+    if device.type == 'cuda' and device.index is not None:
         torch.cuda.set_device(device)  # CUDA graphs and streams use the current device
     model, _ = load_policy(args.init, device)  # the architecture; weights come from `shared`
 
@@ -624,6 +618,10 @@ def main():
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
     parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--device', default='auto', help="'auto': cuda if available, decided in each process after forking")
+    parser.add_argument('--learner-deck', help="specialist: the learning seat always plays this deck (8 cards, id or "
+                        "id:el, as il.arena --deck), against real ladder decks; only that seat's games train")
+    parser.add_argument('--pool-size', type=int, default=6, help='frozen opponents: the starting model + this many latest '
+                        'snapshots')
     parser.add_argument('--server-device', help="the decision servers' device (default: --device), e.g. cuda:1 "
                         "with two GPUs: the learner's update and the servers stop sharing one")
     parser.add_argument('--remote', action='store_true',
@@ -638,7 +636,8 @@ def main():
     start_from = resume if resume.exists() else args.init
     cpu_model, saved = load_policy(start_from, 'cpu')
     (out / 'vocab.json').write_text(json.dumps({str(k): v for k, v in saved['vocab'].items()}))
-    from .arena import deck_pairs as sample_decks
+    from .arena import deck_pairs as sample_decks, mirror
+    learner_deck = mirror(args.learner_deck)['decks'][0] if args.learner_deck else None
     deck_pairs = sample_decks(args.pool, args.cache, 30000, seed=random.randrange(1 << 20))
 
     # Every child is forked before CUDA starts here; the servers start CUDA themselves.
@@ -699,7 +698,10 @@ def main():
     reference.eval().requires_grad_(False)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     if 'optimizer' in saved:
-        optimizer.load_state_dict(saved['optimizer'])
+        try:
+            optimizer.load_state_dict(saved['optimizer'])
+        except ValueError:  # saved before the model gained layers: a fresh Adam
+            print('the saved optimizer state does not fit the model; starting Adam afresh', flush=True)
         for group in optimizer.param_groups:  # the saved state would restore the old learning rate
             group['lr'] = args.lr
     start_update = saved.get('update', 0)
@@ -707,8 +709,11 @@ def main():
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> recent learner outcomes
 
     def pick_opponent():
-        weights = [(1 - (np.mean(results[k]) + 1) / 2 if results[k] else 0.5) ** 2 + 0.05 for k in frozen]
-        return random.choices(frozen, weights)[0]
+        # the starting model and the --pool-size latest snapshots: older ones are beaten easily and each extra model
+        # in a server's round costs a graph launch and a copy back (14 frozen models cut throughput by a quarter)
+        active = frozen[:1] + frozen[1:][-args.pool_size:]
+        weights = [(1 - (np.mean(results[k]) + 1) / 2 if results[k] else 0.5) ** 2 + 0.05 for k in active]
+        return random.choices(active, weights)[0]
 
     def publish():
         with lock:
@@ -754,8 +759,14 @@ def main():
                         else:
                             server = self_play_games % args.servers
                             self_play_games += 1
-                        conn.send(dict(decks=random.choice(deck_pairs), seed=random.randrange(1 << 30),
-                                       models=models, server=server))
+                        decks, train = random.choice(deck_pairs), None
+                        if learner_deck is not None:  # specialist: our deck vs a real ladder deck; only our seat learns
+                            decks = dict(decks, decks=[None, None])
+                            decks['decks'][learner_seat] = learner_deck
+                            decks['decks'][1 - learner_seat] = random.choice(random.choice(deck_pairs)['decks'])
+                            train = [learner_seat]
+                        conn.send(dict(decks=decks, seed=random.randrange(1 << 30), models=models, server=server,
+                                       **({'train': train} if train else {})))
                     elif kind == 'trajectory':
                         if payload['opponent'] != 'current':
                             results[payload['opponent']].append(payload['outcome'])
@@ -808,6 +819,7 @@ def main():
                    hours=(time.time() - started) / 3600, cycle_s=collect_time, wait_s=waited, update_s=time.time() - update_start,
                    steps=int(sum(len(t['action']) for t in trajectories)),
                    plays_per_game=float(np.mean([(t['action'] >= 2).sum() for t in trajectories])),
+                   abilities_per_game=float(np.mean([(t['action'] == D.ABILITY).sum() for t in trajectories])),
                    full_elixir=float(np.mean(np.concatenate([t['full'] for t in trajectories]))),
                    score_vs_pool=float(np.mean(outcomes)) if outcomes else None,
                    pool={k: round(float(np.mean(v)), 3) for k, v in list(results.items()) if v}, **stats_row)

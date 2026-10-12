@@ -25,11 +25,39 @@ class HandCard:
 
 
 @dataclass(frozen=True)
+class Ability:
+    """A hero / champion controller (the probe's abilityRuntime)."""
+    button: int  # 1 no unit, 2 ready, 3 unit deploying, 4 limited availability, 6 no charges, 8 cooldown, 10 casting, ...
+    cooldown_ms: int
+    cooldown_total_ms: int
+    charges: int  # left; -1 unlimited
+    max_charges: int
+    units: tuple[int, ...]  # native object ids of the units carrying it
+
+    @property
+    def ready(self):
+        return self.button in (2, 4) and self.cooldown_ms == 0 and self.charges != 0 and bool(self.units)
+
+
+@dataclass(frozen=True)
+class Evolution:
+    """Evolution progress of one deck slot (the probe's evolutionRuntime)."""
+    deck_slot: int
+    card: int
+    evolvable: bool
+    required: int  # cycles
+    remaining: int
+    ready: bool  # its next play is evolved
+
+
+@dataclass(frozen=True)
 class Player:
     owner: int
     elixir: int  # Fixed-point native units: 10,000 = one elixir.
     hand: tuple[HandCard, ...]
     cycle: tuple[int, ...]
+    abilities: tuple[Ability, ...] = ()
+    evolution: tuple[Evolution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,8 +98,10 @@ class State:
 
     @classmethod
     def decode(cls, data):
-        players = tuple(Player(p['owner'], p['elixir'], tuple(HandCard(*c) for c in p['hand']),
-                               tuple(p['cycle'])) for p in data['players'])
+        players = tuple(Player(p['owner'], p['elixir'], tuple(HandCard(*c) for c in p['hand']), tuple(p['cycle']),
+                               tuple(Ability(*a[:5], tuple(a[5])) for a in p.get('abilities', ())),
+                               tuple(Evolution(s, c, bool(e), n, r, bool(ok)) for s, c, e, n, r, ok in p.get('evolution', ())))
+                        for p in data['players'])
         entities = tuple(Entity(*e) for e in data['entities'])
         return cls(data['generation'], data['tick'], data['finalized'], data['result'],
                    tuple(data['crowns']), players, entities,
@@ -81,9 +111,12 @@ class State:
 @dataclass(frozen=True)
 class Play:
     owner: int
-    slot: int
+    slot: int  # ABILITY: activate the hero / champion ability (x, y unused)
     x: int
     y: int
+
+
+ABILITY = -1
 
 
 @dataclass(frozen=True)

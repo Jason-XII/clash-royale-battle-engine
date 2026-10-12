@@ -23,6 +23,31 @@ DEPLOY_DELAY = 22
 # The game accepts a tap up to ~1 elixir short and lands the card once it is affordable; at the
 # board 22 ticks before execution humans were short by <= 0.8 elixir in 99.5% of plays.
 AFFORD_SLACK = 8000
+# Inputs the IL cache lacks (zeros there; PPO learns them): our play in flight (4), the hero / champion ability (5),
+# per hand slot "its next play is evolved" (4) and evolution progress (4), the opponent elixir estimate (1).
+EXTRAS = 18
+REGEN = 10000 / 56  # raw elixir per tick (1 per 2.8 s); x2 after tick 2400, x3 after 4800 (measured on the cache)
+
+
+def regen(a, b):
+    """Elixir (raw) regenerated over ticks (a, b]."""
+    return sum(max(0, min(b, end) - max(a, start)) * mult * REGEN
+               for start, end, mult in ((0, 2400, 1), (2400, 4800, 2), (4800, 1 << 30, 3)))
+
+
+class OpponentElixir:
+    """The opponent's elixir as a player tracks it: both start equal, it regenerates on the clock (capped at 10)
+    and every card the opponent plays costs its static cost (unknown / variable: 4)."""
+
+    def __init__(self):
+        self.value, self.tick = None, None
+
+    def update(self, tick, own_elixir, cards):
+        from native_engine.clapha import COSTS
+        self.value = float(own_elixir) if self.value is None else min(100000.0, self.value + regen(self.tick, tick))
+        self.value = max(0.0, self.value - sum(COSTS.get(int(c), 4) * 10000 for c in cards))
+        self.tick = tick
+        return self.value
 
 
 class Shard:
@@ -188,6 +213,22 @@ def features(replay, owner, vocab):
     out['hand_cost'] = (np.maximum(hand[..., 1], 0) / 10).astype(np.float32)
     out['next_card'] = lookup(vocab, replay['cycle'][:, owner, 0], empty=-1)
     out['slot_ok'] = (hand[..., 0] != -1) & (hand[..., 1] * 10000 <= replay['elixir'][:, owner, None] + AFFORD_SLACK)
+    out['cycle_card'] = lookup(vocab, replay['cycle'][:, owner, 1:4], empty=-1)
+    out['pending_card'] = np.zeros(T, np.int64)  # no play in flight in the cache
+    out['ability_ok'] = np.ones(T, bool)  # unknown in the cache: unmasked (IL labels include ability presses)
+    other = 1 - owner
+    out['opp_deck'] = lookup(vocab, np.concatenate([replay['hand'][:, other, :, 0], replay['cycle'][:, other]], 1),
+                             empty=-1)
+    extras = np.zeros((T, EXTRAS), np.float32)
+    opponent, plays = OpponentElixir(), [p for p in replay['plays'] if p[2] != owner]
+    k = 0
+    for i in range(T):
+        cards = []
+        while k < len(plays) and plays[k][0] <= i:
+            cards.append(plays[k][3])
+            k += 1
+        extras[i, -1] = opponent.update(int(replay['tick'][i]), replay['elixir'][0, owner], cards) / 100000
+    out['extras'] = extras
     return out
 
 
@@ -224,6 +265,14 @@ def _clip(a, low, high):
     return np.minimum(np.maximum(a, low), high)
 
 
+class InFlight:
+    """A tap whose play (card) or ability press (card None) has not landed yet."""
+    __slots__ = ('owner', 'card', 'cost', 'due')
+
+    def __init__(self, owner, card, cost, due):
+        self.owner, self.card, self.cost, self.due = owner, card, cost, due
+
+
 class Observer:
     """Both seats' feature rows for one decision, built once per state: what `features` gives on a [previous, state]
     window with every play so far (build_cache.encode), byte for byte (test_il.FastObserve), ~3.7x faster.
@@ -236,12 +285,17 @@ class Observer:
 
     def __init__(self, vocab, owners=(0, 1)):
         self.vocab, self.owners = vocab, tuple(owners)
+        self.opponent = {o: OpponentElixir() for o in self.owners}
+        self.first_elixir = None
         self.previous = None                   # {native id: (x, y)} of the previous state, first occurrence
         self.revealed = {o: {} for o in self.owners}   # opponent card -> index of its latest play (per seat)
         self.opp_plays = {o: 0 for o in self.owners}
 
-    def observe(self, state):
+    def observe(self, state, in_flight=()):
+        """`in_flight`: InFlight plays / ability presses tapped but not landed yet (either player)."""
         vocab = self.vocab
+        if self.first_elixir is None:
+            self.first_elixir = [pl.elixir for pl in state.players]
         ents = state.entities
         n = len(ents)
         # The columns build_cache.encode keeps, through int32 as it stores them.
@@ -329,5 +383,40 @@ class Observer:
             nc = int(cycle[0])
             row['next_card'] = np.array(0 if nc == -1 else vocab.get(nc, 1), np.int64)
             row['slot_ok'] = (hand[:, 0] != -1) & (hand[:, 1] * 10000 <= elixir + AFFORD_SLACK)
+            cycle_ids = cycle[1:4].tolist()
+            row['cycle_card'] = np.fromiter((0 if c == -1 else vocab.get(c, 1) for c in cycle_ids), np.int64, 3)
+            them = p[1 - owner]
+            deck = np.full(8, -1, np.int32)
+            for c in them.hand:
+                deck[c.slot] = c.card
+            deck[4:4 + min(4, len(them.cycle))] = them.cycle[:4]
+            row['opp_deck'] = np.fromiter((0 if c == -1 else vocab.get(c, 1) for c in deck.tolist()), np.int64, 8)
+
+            extras = np.zeros(EXTRAS, np.float32)
+            mine = [f for f in in_flight if f.owner == owner]
+            if mine:  # one action in flight per player (ClaphaEngine, il.live): nothing else can be played
+                f = mine[0]
+                extras[0:4] = (1, f.cost / 10, max(0, f.due - state.tick) / DEPLOY_DELAY,
+                               (int(elixir) - f.cost * 10000) / 100000)
+                row['slot_ok'] = np.zeros(4, bool)
+                row['pending_card'] = np.array(0 if f.card is None else vocab.get(f.card, 1), np.int64)
+            else:
+                row['pending_card'] = np.array(0, np.int64)
+            carriers = [a for a in me.abilities if a.units]
+            ready = any(a.ready for a in me.abilities)
+            if carriers:
+                a = carriers[0]
+                extras[4:9] = (1, ready, a.button == 10, 1 if a.charges < 0 else min(a.charges, 3) / 3,
+                               a.cooldown_ms / a.cooldown_total_ms if a.cooldown_total_ms > 0 else 0)
+            row['ability_ok'] = np.array(ready and not mine)
+            evolution = {e.card: e for e in me.evolution if e.evolvable}
+            for i, c in enumerate(hand[:, 0].tolist()):
+                e = evolution.get(c)
+                if e is not None:
+                    extras[9 + i] = e.ready
+                    extras[13 + i] = 1 - e.remaining / e.required if e.required > 0 else 0
+            cards = [pl.card for pl in state.plays if pl.owner != owner]
+            extras[-1] = self.opponent[owner].update(state.tick, self.first_elixir[owner], cards) / 100000
+            row['extras'] = extras
             rows.append(row)
         return rows

@@ -24,6 +24,7 @@ from native_engine import Engine, Play, RenderedEngine
 from native_engine.engine import State
 
 from . import data as D
+from .data import InFlight
 from .model import Agent, load
 
 # Pixel_9_2 emulator screen (1080x2424), measured in clash-simulator-refactored/minimal_visualizer.py:
@@ -35,6 +36,7 @@ BOTTOM = Y1 + TILE_H
 BUTTON = (440, 2035)
 BATTLE_TAB = (541, 2323)  # bottom bar; a restarted game opens on the trophy road page
 ROAD_OK = (539, 2345)  # OK at the bottom of the trophy road page after a new arena
+ABILITY_BUTTON = (973, 1954)  # hero / champion ability, bottom right above the hand (from a --shots screenshot)
 
 WIZARD = 26000017  # its hero form's ability button is still uncalibrated: --shots captures it
 
@@ -130,6 +132,10 @@ def play_battle(engine, agent, taps, state, args, log):
         for p in new.plays:
             if p.owner != agent.owner:
                 log({'event': 'opponent', 'tick': p.tick, 'card': p.card})
+        me = state.players[agent.owner]
+        if pending and pending[0] is None and not any(a.ready for a in me.abilities):
+            log({'event': 'ability_landed', 'tick': state.tick, 'delay_ticks': state.tick - pending[1]})
+            pending = None
         if pending and any(p.owner == agent.owner for p in new.plays):
             log({'event': 'landed', 'tick': state.tick, 'delay_ticks': state.tick - pending[1]})
             if pending[0] == WIZARD and args.shots:  # the hero ability button shows while our Wizard lives
@@ -141,23 +147,28 @@ def play_battle(engine, agent, taps, state, args, log):
             continue
         decided = state.tick
         # The agent sees every play since its last decision, as in training.
-        choice = agent.act(dataclasses.replace(state, plays=tuple(plays)))
+        in_flight = [InFlight(agent.owner, pending[0], pending[2], pending[1] + D.DEPLOY_DELAY)] if pending else []
+        choice = agent.act(dataclasses.replace(state, plays=tuple(plays)), in_flight)
         plays = []
         log({'event': 'decision', 'tick': state.tick, 'elixir': state.players[agent.owner].elixir,
              'crowns': state.crowns, 'choice': choice[0]})
         if pending and state.tick - pending[1] > 30:
             log({'event': 'unconfirmed', 'tick': state.tick, 'card': pending[0]})
             pending = None
+        if choice[0] == 'ability' and not pending:
+            taps.tap(*ABILITY_BUTTON)
+            pending = (None, state.tick, 0)
+            log({'event': 'tap', 'tick': state.tick, 'card': None, 'ability': True, **choice_odds(agent, me)})
+            continue
         if choice[0] != 'card' or pending:
-            continue  # ponytail: ability presses are ignored (no button calibration yet)
+            continue
         _, slot, x, y = choice
-        me = state.players[agent.owner]
         card = next((c for c in me.hand if c.slot == slot), None)
         if card is None or card.cost * 10000 > me.elixir + D.AFFORD_SLACK:
             continue  # the game waits for elixir only when the tap is almost affordable
         started = time.perf_counter()
         screen = taps.play(slot, x, y, agent.owner)
-        pending = (card.card, state.tick)
+        pending = (card.card, state.tick, card.cost)
         log({'event': 'tap', 'tick': state.tick, 'card': card.card, 'slot': slot, 'world': [x, y],
              'screen': screen, 'input_ms': round((time.perf_counter() - started) * 1000), **choice_odds(agent, me)})
     return state
@@ -167,9 +178,10 @@ def choice_odds(agent, me):
     """Our hand at a tap and how likely the training policy was to play each slot (summed over cells) or wait."""
     from .rl import distribution
     log_wait, log_play, cond = distribution(agent.last_logits[None])
-    slots = (cond[0].exp().view(4, D.CELLS).sum(-1) * log_play.exp()).tolist()
+    options = cond[0].exp() * log_play.exp()  # the ability, then cards x cells
+    slots = options[1:].view(4, D.CELLS).sum(-1).tolist()
     return {'hand': {c.slot: [c.card, c.cost] for c in me.hand}, 'p_wait': round(log_wait.exp().item(), 3),
-            'p_slot': [round(p, 3) for p in slots]}
+            'p_slot': [round(p, 3) for p in slots], 'p_ability': round(options[0].item(), 3)}
 
 
 def connect(args):

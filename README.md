@@ -90,6 +90,25 @@ update and the servers stop sharing a GPU (one A100 was 96% busy). With `--remot
 `python -m il.rl join <run>`); they find the learner through `<run>/endpoint.json`, reconnect when it restarts
 and give up on a peer silent for 180 s. Not needed now: the decision servers, not the collectors, limit us.
 
+**E-Barbs specialist** (from the general model; the learning seat always plays our deck, the other seat a real
+ladder deck played by the current model or a frozen one; only our seat's games train):
+
+```bash
+nohup nice -n 10 env PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/ppo-general/latest.pt ~/cr-engine/runs/ppo-ebarbs \
+  --learner-deck 26000043:1,26000020,26000036:1,26000052,26000017:2,26000083,28000015,28000026 \
+  --collectors 40 --servers 4 --server-device cuda:1 --pool ~/cr-engine/data/deck_pool.json \
+  --lr 2e-4 --games-per-update 256 --lam 0.98 --kl-coef 0.01 > ~/cr-engine/runs/ppo-ebarbs.out 2>&1 &
+```
+
+**Inputs added after IL** (zero-initialised, so older checkpoints play exactly as before; the cache lacks them, so
+PPO learns them): our play or ability press in flight (masks everything else, as the engine allows one action in
+flight), the hero / champion ability (ready, active, charges, cooldown; the ability is a play option only when
+ready), per hand slot whether its next play is evolved and the evolution progress, the opponent's elixir as a
+player tracks it (regeneration 1 per 2.8 s, x2 from tick 2400, x3 from 4800, measured on the cache), our next three
+cycle cards, and, for the value head only, the opponent's whole deck (training-time information: it takes the deck
+matchup out of the advantages and never reaches a decision). Live, the probe's minimal capture reports abilities and
+evolution (schema cr-minimal.v4) and `il.live` taps the ability button.
+
 **Processes.**
 - *Collectors* (one engine each): play games with the live deploy delay (a play lands 22 ticks after the
   decision; a slightly unaffordable card waits for elixir, as the game does; one play in flight per player),
