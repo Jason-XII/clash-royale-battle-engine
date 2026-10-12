@@ -41,6 +41,8 @@ from .train import collate
 HOLD_LIMIT = 60  # s a collector's next game may be held back for a full backlog (well under REPLY_TIMEOUT)
 FOCUS_DECKS = 20  # --deck-mix 'focus': the most played ladder decks of the pool
 HARD_DECAY, HARD_TOP, HARD_GAMES = 0.8, 10, 8  # hard cards: the HARD_TOP worst of those in >= HARD_GAMES decayed games
+ADAM_WARMUP = 20  # updates of learning-rate ramp after a fresh Adam: its first steps are full-size on every weight
+                  # (a fresh Adam at lr 2e-4 broke the specialist: approx_kl 0.06, 25x usual, and a collapse)
 AUX_HORIZONS = (40, 120)  # decisions (5 ticks each) ahead: the auxiliary head's tower-damage targets
 
 
@@ -289,7 +291,8 @@ def main():
     parser.add_argument('--gamma', type=float, default=0.999)
     parser.add_argument('--lam', type=float, default=0.95)
     parser.add_argument('--value-coef', type=float, default=0.5)
-    parser.add_argument('--aux-coef', type=float, default=0.5, help="the auxiliary tower-damage head's loss weight")
+    parser.add_argument('--aux-coef', type=float, default=0.02, help="the auxiliary tower-damage head's loss "
+                        "weight (its loss is ~35x the value loss: 0.5 swamped the policy gradient)")
     parser.add_argument('--entropy', type=float, default=0.002)
     parser.add_argument('--kl-coef', type=float, default=0.05)
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
@@ -390,15 +393,16 @@ def main():
     if device.type == 'cuda':  # convs in channels-last layout: no layout conversion before each conv (~7% of an update)
         model.to(memory_format=torch.channels_last)
         reference.to(memory_format=torch.channels_last)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr * rollback_scale(out))
+    base_lr = args.lr * rollback_scale(out)
+    optimizer = torch.optim.Adam(model.parameters(), lr=base_lr)
+    start_update = saved.get('update', 0)
+    fresh_at = start_update  # the update Adam started afresh at (warmed up from there), None: its state was loaded
     if 'optimizer' in saved:
         try:
             optimizer.load_state_dict(saved['optimizer'])
+            fresh_at = None
         except ValueError:  # saved before the model gained layers: a fresh Adam
             print('the saved optimizer state does not fit the model; starting Adam afresh', flush=True)
-        for group in optimizer.param_groups:  # the saved state would restore the old learning rate
-            group['lr'] = args.lr * rollback_scale(out)
-    start_update = saved.get('update', 0)
     frozen = ['il'] + [q.stem for q in sorted(opponent_dir(args).glob('*.pt'))]
     matchmaker = Matchmaker(args, deck_pairs, learner_deck, frozen)
 
@@ -487,11 +491,14 @@ def main():
         if rollback.exists():
             order = json.loads(rollback.read_text())
             load_weights(model, load_policy(order['checkpoint'], 'cpu')[1]['model'])
-            optimizer = torch.optim.Adam(model.parameters(), lr=optimizer.param_groups[0]['lr'] * order['lr_scale'])
+            base_lr *= order['lr_scale']
+            optimizer, fresh_at = torch.optim.Adam(model.parameters(), lr=base_lr), update_index + 1
             rollback.rename(out / f'rollback-done-{update_index}.json')
             publish()  # this batch was played by the weights we left: dropped
-            print(f"rolled back to {order['checkpoint']}, lr {optimizer.param_groups[0]['lr']:.2e}", flush=True)
+            print(f"rolled back to {order['checkpoint']}, lr {base_lr:.2e}", flush=True)
             continue
+        for group in optimizer.param_groups:  # the saved state would restore the old learning rate
+            group['lr'] = base_lr * (1 if fresh_at is None else min(1, (update_index - fresh_at + 1) / ADAM_WARMUP))
         matchmaker.decay()
         waited = time.time() - update_end  # the learner's wait for this batch after the last update
         backlog = ready.qsize()  # trajectories still waiting once this batch is taken
