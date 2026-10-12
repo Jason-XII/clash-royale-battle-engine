@@ -11,6 +11,13 @@ Where each missing piece comes from:
   says when one becomes available.
 - **(C) decision**: a choice about what the model may know (e.g. what a human player cannot see).
 
+**Update 2026-10-12** (commit e8f483b, Jason's AI): added as inputs (`extras`, `cycle_card`, `pending_card`, `ability_ok`;
+il/data.py), zero-initialised so older checkpoints play as before, learned by PPO (the IL cache lacks them): own play or
+ability press in flight, own hero / champion controller (ready, casting, charges, cooldown) and the ability as an
+action, evolution per hand slot (next play evolved, progress), the next three cycle cards, an opponent elixir estimate
+(regeneration measured on the cache: 1 per 2.8 s, x2 from tick 2400, x3 from 4800). The opponent's whole deck feeds the
+value head only (training-time information, never a decision). Rows below say "has (2026-10-12)" where this applies.
+
 Status words: **missing** (not in the features), **partial**, **has**. "Checked" means verified on the engine; anything
 not marked checked is from reading the code.
 
@@ -29,7 +36,7 @@ not marked checked is from reading the code.
 | **Invisible** (Royal Ghost, Archer Queen ability): can't be targeted, **can** take area damage | spells still hit it | missing | (B) |
 | **Underground** (Miner / Drill / Mighty Miner travelling, Tesla hidden): can't be targeted, **can't** be hurt | nothing hits it | missing | (B) |
 | Evolved or not, hero or not (per unit) | they behave differently | missing | (A) the unit's form id |
-| Hero / champion ability (英雄技能资讯): **whether it is in its ability now, how long the ability has lasted so far, whether the ability has been used already, Boss Bandit's number of uses**; plus cooldown and charges | ability timing; what is left of a hero | missing (abilities masked) | (A) own: cooldown, charges, button state; (B) per unit: in ability, time into it, used yet, use count |
+| Hero / champion ability (英雄技能资讯): **whether it is in its ability now, how long the ability has lasted so far, whether the ability has been used already, Boss Bandit's number of uses**; plus cooldown and charges | ability timing; what is left of a hero | partial (2026-10-12): own controller's ready / casting / charges / cooldown | (A) has; (B) per unit: in ability, time into it, used yet, use count |
 | Spell areas with a duration (Graveyard, Poison, Freeze, Tornado, Earthquake, …): time elapsed / left | how many more Skeletons, how long the freeze lasts | missing (position only) | (B) |
 | "Just happened": died, spawned, got hit, spell landed | events are part of the moment's state | missing | (A) derivable from the change between two decisions |
 | **Projectiles in flight**, including after their owner died (e.g. the Executioner's axe): direction, speed, where they will go | not placing a card into their path | partial (position + "projectile" only) | (B) |
@@ -47,7 +54,7 @@ the next card fills the empty slot (4 cards)**. Two plays close together: the re
 
 | What | Now | Source |
 |---|---|---|
-| Own pending play: card, where, time until it lands | missing (since PR #1 the model cannot play while one is pending, but it cannot see it) | (A) ClaphaEngine.pending |
+| Own pending play: card, where, time until it lands | has (2026-10-12): card, cost, time until it lands, elixir after it; not where | (A) ClaphaEngine.pending; live: il.live's tap |
 | Hand as the screen shows it: card out and elixir spent at the tap; the refilled slot can't be played until dealt | missing (the model sees the game's hand, where the card stays until it lands) | (A) rules in docs/GAME_INTEGRATION.md |
 | Enemy pending play | missing | (C) a human can't see it; the live client's command queue holds it 2-21 ticks before it lands (median 13) |
 
@@ -56,9 +63,9 @@ the next card fills the empty slot (4 cards)**. Two plays close together: the re
 | What | Now | Source |
 |---|---|---|
 | 4 cards in hand, next card | has | |
-| **Whole cycle order**: next, next-next, next-next-next, next-next-next-next | missing | (A) the reader gives the full cycle order (ClaphaEngine._players already reads it) |
+| **Whole cycle order**: next, next-next, next-next-next, next-next-next-next | has (2026-10-12) | (A) the reader gives the full cycle order (ClaphaEngine._players already reads it) |
 | Which slots are the active **evo / hero / wild** (at most 1 evo, 1 hero, 1 wild) | missing | (A) per-slot form flags (the deck pool has them); use the active slots, not "this card can evolve" |
-| Cycles until each evo is ready; ready | missing | (A) evolution progress per slot |
+| Cycles until each evo is ready; ready | has (2026-10-12), per hand slot | (A) evolution progress per slot |
 | Hero card vs normal card | missing | (A) |
 
 ## 4. Opponent cards
@@ -66,6 +73,7 @@ the next card fills the empty slot (4 cards)**. Two plays close together: the re
 | What | Now | Source |
 |---|---|---|
 | Cards seen | partial (last 8 different, with plays ago) | |
+| Elixir (estimate from their plays and the clock) | has (2026-10-12) | (A) |
 | **Card counting**: the order they were played, where each card is now (hand / cycle), plays until it is back | missing | (A) derived from their plays (the cycle is deterministic) |
 | Opponent active evo / hero: which, cycles until evo | missing | (A) once seen; (C) at battle start the engine knows their slots. Live: heroes and champions are readable from the start, evolutions only once played (docs/GAME_INTEGRATION.md section 9) |
 | A guessed deck (RoyaleAPI, live only; can be wrong, has no order) | missing | (C) e.g. "probably in their deck" flags with a confidence, kept apart from "seen", replaced by what the game shows |
@@ -78,10 +86,10 @@ left for what can't be counted (this opponent's habits).
 
 ## 6. Playing abilities
 
-The model cannot play hero or champion abilities now: IL learned one "ability" action from human presses (when, not
-which), PPO masks it out (il/rl.py), and il/live.py skips it. Needed: the engine taking ability commands (clapha-engine
-crx has `queue_ability_action_at`, not verified yet: engine work) and an ability action per hero / champion in the
-model's output.
+Has (2026-10-12): one ability action, a play option only while a controller is ready (`ability_ok`); ClaphaEngine
+presses it through `queue_ability_action_at` with the live delay; il.live taps the button at (973, 1954). Checked on
+clapha: hero Wizard ready -> pressed -> charge spent. Open: decks with two controllers (one action presses the first
+ready one), and which unit's ability when several carry one.
 
 ## 7. Timing
 

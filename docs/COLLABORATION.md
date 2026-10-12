@@ -13,7 +13,7 @@ lasting findings are recorded.
 | What the model's input lacks | [docs/MODEL_INPUTS.md](MODEL_INPUTS.md) | yes |
 | How the live client takes a play (deal, refill, elixir, timing) | [docs/GAME_INTEGRATION.md](GAME_INTEGRATION.md) | yes |
 | The engine: loader, per-build addresses, porting a new game build, engine reads per card | github.com/arronwang01/clapha-engine | **no** (Jason has access) |
-| Training metrics for Arron | this repo, branch `reports` (below) | yes |
+| Training metrics for Arron | sent by Jason on request (below) | no |
 | Arron's console: Mac app that plays on the MuMu emulator with a model (FirstLight's or this repo's), HUD, Wi-Fi phone | github.com/arronwang01/clapha-console (its README says what it is and what it needs) | **no** (Jason has access) |
 
 Rule of thumb: anything about the engine's insides (addresses, memory layouts, how a new game build is ported) goes to
@@ -21,16 +21,10 @@ clapha-engine; everything else goes here.
 
 ## Metrics for Arron
 
-    nohup python tools/report_metrics.py runs/ppo-general --every 900 > ~/report_metrics.out 2>&1 &
-
-Every 15 minutes it pushes the last 300 rows of `metrics.jsonl` plus host, time and `nvidia-smi` (GPU name,
-utilisation, memory) to the `reports` branch, from its own clone (~/.cr-reports): it never touches this checkout,
-`main` or unpushed work. When GitHub is unreachable it commits and pushes on the next round. Arron reads it with:
-
-    git fetch origin reports && git show origin/reports:reports/ppo-general.jsonl
-
-The fields that show where time goes (after PRs #3-#5): `collected_per_hour` vs `games_per_hour` (collectors or
-learner the limit?), `backlog` / `held_s`, `collector_ms`, `server_ms_per_call`, `mean_batch`, `update_s`, `wait_s`.
+Not pushed automatically: training logs stay private (Jason, 2026-10-12; PR #6's `tools/report_metrics.py` was not
+taken). Jason sends lines of `runs/<run>/metrics.jsonl` when they are needed. The fields that show where time goes:
+`collected_per_hour` vs `games_per_hour` (collectors or learner the limit?), `backlog` / `held_s`, `collector_ms`,
+`server_ms_per_call`, `mean_batch`, `update_s`, `wait_s`.
 
 ## Lasting findings
 
