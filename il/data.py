@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from native_engine.engine import hold_slack, regen
+
 W, H = 18, 32  # native tiles; 1 tile = 1000 world units
 CELLS = W * H
 WAIT, ABILITY = 0, 1
@@ -26,15 +28,6 @@ AFFORD_SLACK = 8000
 # Inputs the IL cache lacks (zeros there; PPO learns them): our play in flight (4), the hero / champion ability (5),
 # per hand slot "its next play is evolved" (4) and evolution progress (4), the opponent elixir estimate (1).
 EXTRAS = 18
-REGEN = 10000 / 56  # raw elixir per tick (1 per 2.8 s); x2 after tick 2400, x3 after 4800 (measured on the cache)
-
-
-def regen(a, b):
-    """Elixir (raw) regenerated over ticks (a, b]."""
-    return sum(max(0, min(b, end) - max(a, start)) * mult * REGEN
-               for start, end, mult in ((0, 2400, 1), (2400, 4800, 2), (4800, 1 << 30, 3)))
-
-
 class OpponentElixir:
     """The opponent's elixir as a player tracks it: both start equal, it regenerates on the clock (capped at 10)
     and every card the opponent plays costs its static cost (unknown / variable: 4)."""
@@ -197,8 +190,9 @@ def labels(replay, owner):
     return action, mask
 
 
-def features(replay, owner, vocab):
-    """Model inputs for one player over a whole replay (T decision states)."""
+def features(replay, owner, vocab, online=False):
+    """Model inputs for one player over a whole replay (T decision states). online: mask cards by the live client's hold
+    rule (engine.hold_slack, what Observer does), not by the IL labels' fixed AFFORD_SLACK."""
     T = len(replay['tick'])
     tick = replay['tick'].astype(np.float32)
     hand = replay['hand'][:, owner]
@@ -212,7 +206,8 @@ def features(replay, owner, vocab):
     out['hand_card'] = lookup(vocab, hand[..., 0], empty=-1)
     out['hand_cost'] = (np.maximum(hand[..., 1], 0) / 10).astype(np.float32)
     out['next_card'] = lookup(vocab, replay['cycle'][:, owner, 0], empty=-1)
-    out['slot_ok'] = (hand[..., 0] != -1) & (hand[..., 1] * 10000 <= replay['elixir'][:, owner, None] + AFFORD_SLACK)
+    slack = np.array([hold_slack(int(k)) for k in replay['tick']])[:, None] if online else AFFORD_SLACK
+    out['slot_ok'] = (hand[..., 0] != -1) & (hand[..., 1] * 10000 <= replay['elixir'][:, owner, None] + slack)
     out['cycle_card'] = lookup(vocab, replay['cycle'][:, owner, 1:4], empty=-1)
     out['pending_card'] = np.zeros(T, np.int64)  # no play in flight in the cache
     out['ability_ok'] = np.ones(T, bool)  # unknown in the cache: unmasked (IL labels include ability presses)
@@ -382,7 +377,7 @@ class Observer:
             cycle[:len(me.cycle)] = me.cycle[:4]
             nc = int(cycle[0])
             row['next_card'] = np.array(0 if nc == -1 else vocab.get(nc, 1), np.int64)
-            row['slot_ok'] = (hand[:, 0] != -1) & (hand[:, 1] * 10000 <= elixir + AFFORD_SLACK)
+            row['slot_ok'] = (hand[:, 0] != -1) & (hand[:, 1] * 10000 <= elixir + hold_slack(state.tick))
             cycle_ids = cycle[1:4].tolist()
             row['cycle_card'] = np.fromiter((0 if c == -1 else vocab.get(c, 1) for c in cycle_ids), np.int64, 3)
             them = p[1 - owner]

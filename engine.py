@@ -9,6 +9,24 @@ import time
 STANDARD_MATCH = '''{"battle":{"gmt":1,"plt":1,"t1s":0,"t2s":0,"gamemode":72000006,"hm":false,"lvlcap":0,"cardlvlmin":0,"stp":0,"trail":170000000,"te":-1,"tps":1,"deck0":{"hdr":"BD01","sp":[{"d":26000000},{"d":26000001},{"d":26000005},{"d":28000001},{"d":28000000},{"d":26000003},{"d":26000014},{"d":26000018}],"sc":[{"d":159000000,"l":1,"t":0,"c":1}]},"deck1":{"hdr":"BD01","sp":[{"d":26000000},{"d":26000001},{"d":26000005},{"d":28000001},{"d":28000000},{"d":26000003},{"d":26000014},{"d":26000018}],"sc":[{"d":159000000,"l":1,"t":0,"c":1}]},"avatar0":{"accountID.lo":1,"accountID.hi":0,"expLevel":1,"name":"Native-0","arena":54000001,"welo":-1,"scr":0,"lti":0,"npc":false},"avatar1":{"accountID.lo":2,"accountID.hi":0,"expLevel":1,"name":"Native-1","arena":54000001,"welo":-1,"scr":0,"lti":0,"npc":false},"location":15000199,"arena":54000001,"hbd":[{"em":{"ce":[],"de":[]},"sk":{"os":[],"ss":[],"rnd":false},"bn":{"bg":0,"fg":0},"kt":1},{"em":{"ce":[],"de":[]},"sk":{"os":[],"ss":[],"rnd":false},"bn":{"bg":0,"fg":0},"kt":1}]},"endTick":7200,"cmd":[],"evt":[],"rndSeed":1,"time":-1}'''
 
 
+REGEN = 10000 / 56  # raw elixir per tick (1 per 2.8 s); x2 after tick 2400, x3 after 4800 (measured on the IL cache)
+# A tap the elixir bar cannot pay for yet is held by the client until it can, for at most HOLD_TICKS, then issued (it
+# lands ~22 ticks later); held longer, it is dropped. Measured live on Nulls (2026-10-12, 18 short taps): every tap whose
+# shortfall regenerated within 22.4 ticks landed (36-46 ticks after the tap), none needing 24+ ticks did.
+HOLD_TICKS = 23
+
+
+def regen(a, b):
+    """Elixir (raw) regenerated over ticks (a, b]."""
+    return sum(max(0, min(b, end) - max(a, start)) * mult * REGEN
+               for start, end, mult in ((0, 2400, 1), (2400, 4800, 2), (4800, 1 << 30, 3)))
+
+
+def hold_slack(tick):
+    """How far short of a card's cost (raw elixir) a tap at `tick` may be and still be played."""
+    return regen(tick, tick + HOLD_TICKS)
+
+
 def standard_match(seed=1):
     match = json.loads(STANDARD_MATCH)
     match['rndSeed'] = seed

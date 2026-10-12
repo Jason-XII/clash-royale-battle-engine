@@ -91,11 +91,13 @@ update and the servers stop sharing a GPU (one A100 was 96% busy). With `--remot
 and give up on a peer silent for 180 s. Not needed now: the decision servers, not the collectors, limit us.
 
 **E-Barbs specialist** (from the general model; the learning seat always plays our deck, the other seat a real
-ladder deck played by the current model or a frozen one; only our seat's games train):
+ladder deck played by the general model or its snapshots (a specialist plays other decks ever worse, so it is no
+sparring partner); only our seat's games train):
 
 ```bash
 nohup nice -n 10 env PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/ppo-general/latest.pt ~/cr-engine/runs/ppo-ebarbs \
   --learner-deck 26000043:1,26000020,26000036:1,26000052,26000017:2,26000083,28000015,28000026 \
+  --self-play 0 --opponent-pool ~/cr-engine/runs/ppo-general/pool \
   --collectors 40 --servers 4 --server-device cuda:1 --pool ~/cr-engine/data/deck_pool.json \
   --lr 2e-4 --games-per-update 256 --lam 0.98 --kl-coef 0.01 > ~/cr-engine/runs/ppo-ebarbs.out 2>&1 &
 ```

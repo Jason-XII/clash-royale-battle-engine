@@ -25,6 +25,7 @@ from native_engine.engine import State
 
 from . import data as D
 from .data import InFlight
+from native_engine.engine import HOLD_TICKS, hold_slack, regen
 from .model import Agent, load
 
 # Pixel_9_2 emulator screen (1080x2424), measured in clash-simulator-refactored/minimal_visualizer.py:
@@ -116,7 +117,7 @@ def play_battle(engine, agent, taps, state, args, log):
     generation, cursor = state.generation, state.next_sequence
     plays = list(state.plays)
     decided = None  # tick of the last decision
-    pending = None  # (card, tick) of a tap whose play has not shown up yet
+    pending = None  # (card or None for the ability, tap tick, cost, expected landing tick) of a tap not shown up yet
     seen = time.monotonic()
     while not state.finalized:
         time.sleep(0.05)
@@ -147,29 +148,31 @@ def play_battle(engine, agent, taps, state, args, log):
             continue
         decided = state.tick
         # The agent sees every play since its last decision, as in training.
-        in_flight = [InFlight(agent.owner, pending[0], pending[2], pending[1] + D.DEPLOY_DELAY)] if pending else []
+        in_flight = [InFlight(agent.owner, pending[0], pending[2], pending[3])] if pending else []
         choice = agent.act(dataclasses.replace(state, plays=tuple(plays)), in_flight)
         plays = []
         ready = any(a.ready for a in me.abilities)
         log({'event': 'decision', 'tick': state.tick, 'elixir': me.elixir, 'crowns': state.crowns, 'choice': choice[0],
              **({'ability_ready': True, 'p_ability': choice_odds(agent, me)['p_ability']} if ready else {})})
-        if pending and state.tick - pending[1] > 30:
+        if pending and state.tick - pending[1] > HOLD_TICKS + D.DEPLOY_DELAY + 10:  # a held tap lands up to ~45 later
             log({'event': 'unconfirmed', 'tick': state.tick, 'card': pending[0]})
             pending = None
         if choice[0] == 'ability' and not pending:
             taps.tap(*ABILITY_BUTTON)
-            pending = (None, state.tick, 0)
+            pending = (None, state.tick, 0, state.tick + D.DEPLOY_DELAY)
             log({'event': 'tap', 'tick': state.tick, 'card': None, 'ability': True, **choice_odds(agent, me)})
             continue
         if choice[0] != 'card' or pending:
             continue
         _, slot, x, y = choice
         card = next((c for c in me.hand if c.slot == slot), None)
-        if card is None or card.cost * 10000 > me.elixir + D.AFFORD_SLACK:
-            continue  # the game waits for elixir only when the tap is almost affordable
+        if card is None or card.cost * 10000 > me.elixir + hold_slack(state.tick):
+            continue  # the client holds a short tap only until ~HOLD_TICKS of regeneration pays for it
         started = time.perf_counter()
         screen = taps.play(slot, x, y, agent.owner)
-        pending = (card.card, state.tick, card.cost)
+        short = card.cost * 10000 - me.elixir  # held until regeneration covers it, then issued; lands DEPLOY_DELAY later
+        wait = next(k for k in range(HOLD_TICKS + 1) if regen(state.tick, state.tick + k) >= short) if short > 0 else 0
+        pending = (card.card, state.tick, card.cost, state.tick + wait + D.DEPLOY_DELAY)
         log({'event': 'tap', 'tick': state.tick, 'card': card.card, 'slot': slot, 'world': [x, y],
              'screen': screen, 'input_ms': round((time.perf_counter() - started) * 1000), **choice_odds(agent, me)})
     return state

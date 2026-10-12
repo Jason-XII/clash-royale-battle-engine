@@ -17,7 +17,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
-from .engine import ABILITY, Transition, standard_match
+from .engine import ABILITY, HOLD_TICKS, Transition, hold_slack, standard_match
 from .engine import Ability, CardPlay, Entity, Evolution, HandCard, Player, State
 
 # Elixir cost of every fixed-cost card in the IL cache (Mirror 28000006 and 28000025 vary: the engine is asked).
@@ -39,7 +39,6 @@ COSTS = {
     28000014: 3, 28000015: 2, 28000016: 1, 28000017: 2, 28000018: 3, 28000023: 5, 28000024: 2, 28000026: 3,
 }
 ENGINE_CPUS = 2  # what the engine is told about the machine: it sized its thread pool from all 128 CPUs (~70 threads)
-WAIT_LIMIT = 60  # ticks a delayed play waits for elixir before it is dropped (ponytail: the game's own limit is unknown)
 PROJECTILE_CLASS = 10  # data global id // 1e6 of LogicProjectileData (the probe checks type 0x0a); measured
 
 
@@ -80,6 +79,7 @@ class ClaphaEngine:
         self.env = CrxEnv(clapha / 'engine', Path(workdir or tempfile.mkdtemp(prefix='clapha-')),
                           str(clapha / 'data' / 'assets'))
         self.state, self.generation, self.sequence, self.pending = None, 0, 0, []
+        self.expired = 0  # accepted plays that never landed (held too long, or the card gone): should stay ~0
 
     def reset(self, seed=1, match=None):
         if match is None:
@@ -96,8 +96,9 @@ class ClaphaEngine:
 
     def step(self, actions=(), ticks=5, delay=0):
         """Plays decided on the current state land `delay` ticks later (live: il.data.DEPLOY_DELAY), or on the
-        next tick with delay=0. As in the live game, a play that is not affordable when due waits for elixir
-        (up to WAIT_LIMIT ticks), and, as il.live does, a player with a play in flight cannot start another.
+        next tick with delay=0. As the live client does (engine.HOLD_TICKS), a play the elixir cannot pay for yet is held
+        until it can, for at most HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
+        for within that is refused. As il.live does, a player with a play in flight cannot start another.
         `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
         before = self.state
         executed = []
@@ -107,13 +108,15 @@ class ClaphaEngine:
             if a.slot == ABILITY:  # a tap on the ability button: lands like a card, if a carrier is still ready then
                 ok = free and any(x.ready for x in before.players[a.owner].abilities)
                 if ok:
-                    self.pending.append(dict(due=due, until=due, owner=a.owner, slot=ABILITY, card=None, cost=0))
+                    self.pending.append(dict(due=due, held=False, owner=a.owner, slot=ABILITY, card=None, cost=0))
                 executed.append(ok)
                 continue
-            card = next((h for h in before.players[a.owner].hand if h.slot == a.slot), None)
-            ok = card is not None and free
+            me = before.players[a.owner]
+            card = next((h for h in me.hand if h.slot == a.slot), None)
+            ok = card is not None and free and card.cost * 10000 <= me.elixir + hold_slack(before.tick)
             if ok:
-                self.pending.append(dict(due=due, until=due + WAIT_LIMIT, owner=a.owner, slot=a.slot,
+                self.pending.append(dict(due=due, delay=max(delay, 1), held=card.cost * 10000 > me.elixir,
+                                         hold_until=before.tick + HOLD_TICKS, owner=a.owner, slot=a.slot,
                                          card=card.card, cost=card.cost, x=a.x, y=a.y))
             executed.append(ok)
         for _ in range(ticks):
@@ -146,25 +149,34 @@ class ClaphaEngine:
         return out
 
     def _release(self):
-        """Hand the plays due on the next tick to the engine, if their card is still there and affordable."""
+        """Issue held plays once the elixir pays for them (or drop them after HOLD_TICKS), and hand the plays due on the
+        next tick to the engine if their card is still there."""
         now = self.env.tick()
-        due = [p for p in self.pending if p['due'] <= now + 1]
-        if not due:
+        if not any(p['held'] or p['due'] <= now + 1 for p in self.pending):
             return
         players = self._players()
-        for p in due:
+        for p in list(self.pending):
+            if p['slot'] != ABILITY and p['held']:
+                if players[p['owner']][2] >= p['cost'] * 10000:
+                    p['held'], p['due'] = False, now + p['delay']  # issued now
+                elif now >= p['hold_until']:
+                    self.pending.remove(p)
+                    self.expired += 1
+                else:
+                    p['due'] = now + 1 + p['delay']  # not issued yet: lands no earlier than this
+                continue
+            if p['due'] > now + 1:
+                continue
+            self.pending.remove(p)
             if p['slot'] == ABILITY:
-                self.pending.remove(p)
                 self._activate(p['owner'])
                 continue
             hand, _, elixir = players[p['owner']]
-            in_hand = hand.get(p['slot'], (None, None))[1] == p['card']
-            if in_hand and elixir >= p['cost'] * 10000:
+            if hand.get(p['slot'], (None, None))[1] == p['card'] and elixir >= p['cost'] * 10000:
                 self.env.queue_hand_action_at(SimpleNamespace(owner=p['owner'], hand_index=p['slot'], x=p['x'],
                                                               y=p['y']), execute_tick=now + 1)
-            elif in_hand and now + 1 < p['until']:
-                continue  # wait for elixir
-            self.pending.remove(p)
+            else:
+                self.expired += 1
 
     def _activate(self, owner):
         """Activate the first ready hero / champion ability of `owner`, if any (a press on a button no longer ready

@@ -169,6 +169,24 @@ class PPODistribution(unittest.TestCase):
         self.assertGreater(p_ability, 0.01)
         self.assertAlmostEqual((actions == D.ABILITY).float().mean().item(), p_ability, delta=0.01)
 
+    def test_ability_exploration(self):
+        """explore mixes "press the ability" into the whole distribution where it is ready, and only there."""
+        from .rl import distribution, entropy, log_prob, sample
+        logits = self.logits.clone()
+        logits[2, D.ABILITY] = -30.0  # ready, but the model would almost never press it
+        dist = distribution(logits, explore=0.05)
+        every = torch.arange(D.ACTIONS).expand(3, -1)
+        p = log_prob(tuple(t.unsqueeze(1).expand(-1, D.ACTIONS, *t.shape[1:]) if t.dim() > 1 else
+                           t.unsqueeze(1).expand(-1, D.ACTIONS) for t in dist), every).exp()
+        self.assertTrue(torch.allclose(p.sum(-1), torch.ones(3), atol=1e-4))
+        self.assertGreaterEqual(p[2, D.ABILITY].item(), 0.05 - 1e-6)
+        plain = distribution(logits)
+        for a, b in zip(dist, plain):  # rows 0 and 1: the ability is masked, nothing changes
+            self.assertTrue(torch.allclose(a[:2], b[:2]))
+        actions = sample(distribution(logits[2:].expand(20000, -1), explore=0.05))
+        self.assertAlmostEqual((actions == D.ABILITY).float().mean().item(), p[2, D.ABILITY].item(), delta=0.01)
+        self.assertTrue(torch.isfinite(entropy(dist)).all())
+
     def test_sampling_matches_probabilities(self):
         from .rl import distribution, log_prob, sample
         dist = distribution(self.logits[2:].expand(20000, -1))
@@ -241,7 +259,7 @@ def _reference_rows(states, owner, vocab):
     """The rows imitation learning trains on: data.features on the whole game through build_cache.encode."""
     from native_engine.build_cache import encode
     raw = encode({'states': list(states), 'commands': [], 'receipts': [], 'winner_matches': 0, 'crowns_matches': 0})
-    feats = D.features(raw, owner, vocab)
+    feats = D.features(raw, owner, vocab, online=True)
     return [{k: feats[k][t] for k in INPUT_KEYS} for t in range(len(states))]
 
 
@@ -369,7 +387,7 @@ class EngineFeatures(unittest.TestCase):
         raw = encode(result)
         vocab = D.build_vocab([CACHE]) if CACHE.exists() else {}
         for owner in (0, 1):
-            cached = D.features(raw, owner, vocab)
+            cached = D.features(raw, owner, vocab, online=True)
             agent = Agent(None, vocab, owner)
             for t, state in enumerate(result['states'][:400]):
                 online = agent.observe(state)

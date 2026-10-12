@@ -47,7 +47,10 @@ OVERFLOW_PENALTY = 0.002
 
 
 # ---- the policy distribution -----------------------------------------------------------------------------------------
-def distribution(logits, temperature=TEMPERATURE):
+ABILITY_EXPLORE = 0.01  # training: P(ability) >= this whenever it is ready (PPO stopped pressing it at all, unexplored)
+
+
+def distribution(logits, temperature=TEMPERATURE, explore=0.0):
     """[..., ACTIONS] logits -> (log p(wait), log p(play), conditional log-probs over the play options [..., 1 + 4*CELLS]:
     the ability, then cards x cells). The model masks what cannot be played (-inf), the ability when it is not ready.
     A step with nothing playable waits with probability 1."""
@@ -58,6 +61,16 @@ def distribution(logits, temperature=TEMPERATURE):
     log_play = torch.where(playable, torch.log1p(-log_wait.exp().clamp(max=1 - 1e-6)), torch.full_like(log_wait, -1e9))
     log_wait = torch.where(playable, log_wait, torch.zeros_like(log_wait))
     cond = torch.where(playable.unsqueeze(-1), options / temperature, torch.zeros_like(options)).log_softmax(-1)
+    if explore:  # mix explore x "press the ability" into the whole distribution where the ability is ready
+        ready = torch.isfinite(options[..., 0])
+        keep = torch.log1p(torch.tensor(-explore, device=logits.device))
+        new_wait = keep + log_wait
+        new_play = torch.log1p(-new_wait.exp().clamp(max=1 - 1e-6))
+        ability = torch.logaddexp(keep + log_play + cond[..., 0], torch.full_like(log_wait, explore).log()) - new_play
+        rest = keep + log_play.unsqueeze(-1) + cond[..., 1:] - new_play.unsqueeze(-1)
+        cond = torch.where(ready.unsqueeze(-1), torch.cat([ability.unsqueeze(-1), rest], -1), cond)
+        log_wait = torch.where(ready, new_wait, log_wait)
+        log_play = torch.where(ready, new_play, log_play)
     return log_wait, log_play, cond
 
 
@@ -136,6 +149,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
         observer = Observer(vocab)  # both seats' rows, built once per state
         steps = [defaultdict(list) for _ in (0, 1)]
         state = engine.reset(match=match)
+        expired = engine.expired
         crowns = (0, 0)
         timing = defaultdict(float)  # seconds per part of a decision, for the learner's log
         while True:
@@ -178,6 +192,7 @@ def play_games(index, delay, engine, vocab, learner, servers):
                 gained = (state.crowns[o] - crowns[o]) - (state.crowns[1 - o] - crowns[1 - o])
                 steps[o]['reward'][-1] += CROWN_REWARD * gained
             crowns = state.crowns
+        timing['expired'] = engine.expired - expired
         for o in (0, 1):
             outcome = 0.0 if state.result not in (0, 1) else (1.0 if state.result == o else -1.0)
             steps[o]['reward'][-1] += outcome
@@ -265,7 +280,7 @@ class Server:
             logits, value, (h, c) = model(unpack(rows), (h, c))
         self.h.index_copy_(1, index, h.float())
         self.c.index_copy_(1, index, c.float())
-        dist = distribution(logits[:, 0])
+        dist = distribution(logits[:, 0], explore=ABILITY_EXPLORE)
         action = sample(dist)
         return torch.stack([action.float(), log_prob(dist, action), value[:, 0].float()], 1), logits, value
 
@@ -407,7 +422,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
         return seen
 
     seen = refresh()
-    pool = {'il': args.init, **{q.stem: str(q) for q in sorted((Path(args.out) / 'pool').glob('*.pt'))}}
+    pool = {'il': args.init, **{q.stem: str(q) for q in sorted(opponent_dir(args).glob('*.pt'))}}
     server = Server({'current': model.eval(), **{k: load_policy(v, device)[0].eval() for k, v in pool.items()}},
                     device, model.config['core'])
     owners, first, window = [], None, args.batch_ms / 1000  # [(collector pipe, its requests)]
@@ -506,7 +521,7 @@ def update(model, reference, optimizer, trajectories, args, device):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
                 ref_logits, _, _ = reference({k: batch[k] for k in INPUT_KEYS}, valid=batch['time_mask'])
-            ref = distribution(ref_logits)
+            ref = distribution(ref_logits, explore=ABILITY_EXPLORE)
             for b, t in enumerate(chunk):
                 t['ref'] = tuple(r[b, :len(t['action'])] for r in ref)
     for _ in range(args.epochs):
@@ -518,7 +533,7 @@ def update(model, reference, optimizer, trajectories, args, device):
             x = {k: batch[k] for k in INPUT_KEYS}
             with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
                 logits, value, _ = model(x, valid=m)
-            dist = distribution(logits)
+            dist = distribution(logits, explore=ABILITY_EXPLORE)
             ref = padded_ref(trajectories[i:i + args.minibatch], m.shape[1])
             new_logp = log_prob(dist, batch['action'])
             ratio = (new_logp - batch['logp']).exp()
@@ -559,6 +574,11 @@ def padded_ref(chunk, T):
             full[b, :len(part)] = part
         out.append(full)
     return tuple(out)
+
+
+def opponent_dir(args):
+    """Where the frozen opponents come from: this run's own snapshots, or --opponent-pool."""
+    return Path(args.opponent_pool).expanduser() if args.opponent_pool else Path(args.out) / 'pool'
 
 
 def save(path, model, saved, optimizer=None, extra=None):
@@ -662,6 +682,8 @@ def main():
     parser.add_argument('--device', default='auto', help="'auto': cuda if available, decided in each process after forking")
     parser.add_argument('--learner-deck', help="specialist: the learning seat always plays this deck (8 cards, id or "
                         "id:el, as il.arena --deck), against real ladder decks; only that seat's games train")
+    parser.add_argument('--opponent-pool', help="frozen opponents from this directory of snapshots instead of the run's own "
+                        "(specialist: the general run's pool, models that play every ladder deck)")
     parser.add_argument('--pool-size', type=int, default=6, help='frozen opponents: the starting model + this many latest '
                         'snapshots')
     parser.add_argument('--server-device', help="the decision servers' device (default: --device), e.g. cuda:1 "
@@ -750,7 +772,7 @@ def main():
         for group in optimizer.param_groups:  # the saved state would restore the old learning rate
             group['lr'] = args.lr
     start_update = saved.get('update', 0)
-    frozen = ['il'] + [q.stem for q in sorted((out / 'pool').glob('*.pt'))]
+    frozen = ['il'] + [q.stem for q in sorted(opponent_dir(args).glob('*.pt'))]
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> recent learner outcomes
 
     def pick_opponent():
@@ -871,8 +893,9 @@ def main():
         if step % args.snapshot_every == 0:
             path = out / 'pool' / f'update-{step:05d}.pt'
             save(path, model, saved)
-            frozen.append(path.stem)
-            for q in snapshot_queues:
+            if opponent_dir(args) == out / 'pool':  # with --opponent-pool, our own snapshots are not opponents
+                frozen.append(path.stem)
+            for q in snapshot_queues if opponent_dir(args) == out / 'pool' else ():
                 q.put(str(path))
         served = {name: sum(stats[s * len(STATS) + j] for s in range(args.servers)) for j, name in enumerate(STATS)}
         for j in range(len(stats)):
@@ -889,6 +912,7 @@ def main():
                    server_ms_per_call=round(1000 * served['decide'] / max(served['batches'], 1), 2),
                    collector_ms={k: round(1000 * sum(t[k] for t in timed) / decisions, 2) for k in ('features', 'wait', 'engine')},
                    dropped_per_game=round(sum(t.get('dropped', 0) for t in timed) / max(len(timed), 1), 2),
+                   expired_per_game=round(sum(t.get('expired', 0) for t in timed) / max(len(timed), 1), 2),
                    server_s={k: round(served[k] / args.servers, 1) for k in ('receive', 'decide', 'reply')},
                    mean_batch=round(served['requests'] / max(served['batches'], 1), 1),
                    hours=(time.time() - started) / 3600, cycle_s=collect_time, wait_s=waited, update_s=time.time() - update_start,
