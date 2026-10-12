@@ -150,8 +150,9 @@ def play_battle(engine, agent, taps, state, args, log):
         in_flight = [InFlight(agent.owner, pending[0], pending[2], pending[1] + D.DEPLOY_DELAY)] if pending else []
         choice = agent.act(dataclasses.replace(state, plays=tuple(plays)), in_flight)
         plays = []
-        log({'event': 'decision', 'tick': state.tick, 'elixir': state.players[agent.owner].elixir,
-             'crowns': state.crowns, 'choice': choice[0]})
+        ready = any(a.ready for a in me.abilities)
+        log({'event': 'decision', 'tick': state.tick, 'elixir': me.elixir, 'crowns': state.crowns, 'choice': choice[0],
+             **({'ability_ready': True, 'p_ability': choice_odds(agent, me)['p_ability']} if ready else {})})
         if pending and state.tick - pending[1] > 30:
             log({'event': 'unconfirmed', 'tick': state.tick, 'card': pending[0]})
             pending = None
