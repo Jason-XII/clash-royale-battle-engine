@@ -399,5 +399,47 @@ class EngineFeatures(unittest.TestCase):
                                            err_msg=f'extras t={t}')
 
 
+class Shaping(unittest.TestCase):
+    """FirstLight's tower potential: 0 at the start, damage counts for the dealer and against the owner, a destroyed
+    tower counts its whole hp plus the crown, the king x3; and il.defense finds an unanswered push and its cost."""
+
+    @staticmethod
+    def state(hp, crowns=(0, 0)):
+        from native_engine.engine import Entity, State
+        towers = [(1, 0, 9000, 3000, 7728), (2, 0, 3500, 6500, 4858), (3, 1, 9000, 29000, 7728), (4, 1, 3500, 25500, 4858)]
+        entities = tuple(Entity(i, o, -1, x, y, hp.get(i, full), full, None, None, 'building', None)
+                         for i, o, x, y, full in towers if hp.get(i, full) is not None)
+        return State(0, 0, False, None, crowns, (), entities, (), 0)
+
+    def test_potential(self):
+        from .rl import potential, tower_hp
+        start = tower_hp(self.state({}))
+        self.assertEqual(potential(self.state({}), start, 0), 0.0)
+        half = self.state({4: 4858 // 2})  # owner 1's princess at half hp
+        self.assertAlmostEqual(potential(half, start, 0), 0.5, 3)
+        self.assertAlmostEqual(potential(half, start, 1), -0.5, 3)
+        gone = self.state({4: None}, crowns=(1, 0))  # destroyed: its hp and the crown
+        self.assertAlmostEqual(potential(gone, start, 0), 2.0)
+        king = self.state({3: 7728 // 2})
+        self.assertAlmostEqual(potential(king, start, 0), 1.5, 3)
+
+    def test_unanswered_push(self):
+        from . import defense
+        tower = lambda hp: [0, -1, 3500, 6500, hp, 4858, 1]
+        troop = lambda y: [1, 26000000, 3500, y, 1500, 1500, 0]  # an enemy troop in the left lane, our half below 15000
+        frames = [(t, np.array([tower(4858 - max(0, t - 20) * 10)] + ([troop(10000)] if 10 <= t <= 50 else []), np.int64))
+                  for t in range(0, 100, 5)]
+        ours = defense.game(frames, [])[0]
+        self.assertEqual(len(ours['pushes']), 1)
+        push = ours['pushes'][0]
+        self.assertFalse(push['answered'])
+        self.assertEqual(push['damage'], 10 * (90 - 20))  # damage until the push ended + GAP
+        answered = defense.game(frames, [(30, 0, 4000, 8000)])[0]['pushes'][0]  # a play landing in the left lane
+        self.assertTrue(answered['answered'])
+        self.assertEqual(answered['latency'], 20)
+        wrong_lane = defense.game(frames, [(30, 0, 14000, 8000)])[0]['pushes'][0]
+        self.assertFalse(wrong_lane['answered'])
+
+
 if __name__ == '__main__':
     unittest.main()

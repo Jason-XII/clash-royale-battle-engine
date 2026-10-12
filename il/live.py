@@ -27,6 +27,7 @@ from . import data as D
 from .data import InFlight
 from native_engine.engine import HOLD_TICKS, hold_slack, regen
 from .model import Agent, load
+from .rl import board_rows
 
 # Pixel_9_2 emulator screen (1080x2424), measured in clash-simulator-refactored/minimal_visualizer.py:
 # the 30 inner arena rows span y 295..1714, so 32 rows span one row more at each end.
@@ -153,6 +154,7 @@ def play_battle(engine, agent, taps, state, args, log):
         plays = []
         ready = any(a.ready for a in me.abilities)
         log({'event': 'decision', 'tick': state.tick, 'elixir': me.elixir, 'crowns': state.crowns, 'choice': choice[0],
+             'board': board_rows(state).tolist(),  # for il.defense --live
              **({'ability_ready': True, 'p_ability': choice_odds(agent, me)['p_ability']} if ready else {})})
         if pending and state.tick - pending[1] > HOLD_TICKS + D.DEPLOY_DELAY + 10:  # a held tap lands up to ~45 later
             log({'event': 'unconfirmed', 'tick': state.tick, 'card': pending[0]})

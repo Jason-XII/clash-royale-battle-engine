@@ -90,17 +90,30 @@ update and the servers stop sharing a GPU (one A100 was 96% busy). With `--remot
 `python -m il.rl join <run>`); they find the learner through `<run>/endpoint.json`, reconnect when it restarts
 and give up on a peer silent for 180 s. Not needed now: the decision servers, not the collectors, limit us.
 
-**E-Barbs specialist** (from the general model; the learning seat always plays our deck, the other seat a real
-ladder deck played by the general model or its snapshots (a specialist plays other decks ever worse, so it is no
-sparring partner); only our seat's games train):
+**E-Barbs specialist** (the learning seat always plays our deck, the other seat a real ladder deck played by the IL
+model (40%) or the general model's snapshots (PFSP); a specialist plays other decks ever worse, so it is no sparring
+partner; only our seat's games train). Opponent decks as FirstLight: 30% the 20 most played ladder decks, 40% any pool
+deck, 30% hard decks (those we score under 55% against lately). The run `ppo-ebarbs2` continues the first specialist
+(its latest.pt copied in) with tower shaping; the KL reference stays the General:
 
 ```bash
-nohup nice -n 10 env PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/ppo-general/latest.pt ~/cr-engine/runs/ppo-ebarbs \
+mkdir -p ~/cr-engine/runs/ppo-ebarbs2 && cp ~/cr-engine/runs/ppo-ebarbs/latest.pt ~/cr-engine/runs/ppo-ebarbs2/latest.pt
+cp ~/cr-engine/runs/ppo-ebarbs/latest.pt ~/cr-engine/runs/ebarbs-start.pt            # the autopilot's first best
+nohup nice -n 10 env PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/ppo-general/latest.pt ~/cr-engine/runs/ppo-ebarbs2 \
+  --il ~/cr-engine/runs/il-002/best.pt --il-share 0.4 --deck-mix 0.3,0.4,0.3 --shaping 0.1 \
   --learner-deck 26000043:1,26000020,26000036:1,26000052,26000017:2,26000083,28000015,28000026 \
   --self-play 0 --opponent-pool ~/cr-engine/runs/ppo-general/pool \
   --collectors 40 --servers 4 --server-device cuda:1 --pool ~/cr-engine/data/deck_pool.json \
-  --lr 2e-4 --games-per-update 256 --lam 0.98 --kl-coef 0.01 > ~/cr-engine/runs/ppo-ebarbs.out 2>&1 &
+  --lr 2e-4 --games-per-update 256 --lam 0.98 --kl-coef 0.01 > ~/cr-engine/runs/ppo-ebarbs2.out 2>&1 &
+cd ~/cr-engine && sbatch tools/autopilot.sbatch                                     
 ```
+
+**Autopilot** (`il/autopilot.py`, a CPU-only Slurm job next to training): every new snapshot plays the panel (General
+and IL, 200 games each, our deck vs the same real decks every time, live delay); one line per snapshot in
+`<run>/autopilot.jsonl`. A snapshot that beats `best.pt` on the panel without defending or playing less than the start
+is copied to `<run>/best.pt`, the checkpoint to play live. Two snapshots in a row 0.06 below the best (or entropy
+under 0.05) write `<run>/rollback.json`: the learner restarts from best.pt at half its learning rate (kept across
+restarts via `rollback-done-*.json`).
 
 **Inputs added after IL** (zero-initialised, so older checkpoints play exactly as before; the cache lacks them, so
 PPO learns them): our play or ability press in flight (masks everything else, as the engine allows one action in
@@ -129,8 +142,11 @@ changes; projectiles are objects whose data class is 10; costs are embedded (`CO
 
 **Algorithm.** Half the games are self-play (both seats learn), half against a frozen pool (IL + snapshots)
 picked by PFSP, weight (1 − win rate)² + 0.05. Policy: wait with the model's p(wait), else card × cell sampled
-at temperature 0.5 (ability masked: clapha cannot play abilities yet). Reward: ±1 result, ±0.1 per crown,
-−0.002 per decision at full elixir. PPO (clip 0.2, γ 0.999, whole games as LSTM sequences) with a KL penalty
+at temperature 0.5 (ability masked: clapha cannot play abilities yet). Reward: ±1 result, −0.002 per decision at full elixir,
+and (`--shaping`, from ppo-ebarbs2 on) FirstLight's tower shaping: β (γΦ′ − Φ) with Φ = crowns taken − lost + each
+tower's lost hp fraction (king ×3), + for theirs and − for ours, Φ = 0 once the game ends. Damage dealt and prevented
+is credited when it happens, and there is no bonus for a crown margin (the first runs' ±0.1 per crown was one: it
+paid for racing to three crowns). PPO (clip 0.2, γ 0.999, whole games as LSTM sequences) with a KL penalty
 towards the IL policy. Decks: real ladder deck pairs with evolutions and the game's levels (mostly 16).
 
 **Log** (`runs/<run>/metrics.jsonl`, one line per update): `pool` (score vs each frozen opponent, −1..1),
@@ -157,7 +173,23 @@ nohup nice -n 10 env PYTHONPATH=. python -m il.eval ~/clapha-engine ~/cr-engine/
 ```
 
 The summary reports both sides' plays per minute: a high score against an opponent that stopped playing proves
-nothing (FirstLight's lesson).
+nothing (FirstLight's lesson). `il.arena --a-deck` gives A one deck against the pool's decks (a specialist).
+
+**Defense** (`il/defense.py`): a push is enemy troops on our side of the river; it is answered when a play of ours
+lands in its lane (or the middle) before it ends. Per push: answered or not, the latency from the crossing to our
+landing, the tower hp it cost. The same numbers come from the cache (humans), arena games (`defense_a/b` in each game
+record), training (`defense` in metrics.jsonl) and live games (`python -m il.defense --live runs/live/*.jsonl`).
+
+| mid pushes (3–6k hp) | answered | latency | tower hp lost / push |
+|---|---|---|---|
+| humans (cache) | 91% | 0.4 s | 4.9% |
+| humans with our E-Barbs deck | 88% | 0.4 s | 7.1% |
+| il-002 with E-Barbs vs General | 90% | 1.6 s | 12.9% |
+| specialist update 2709 vs General | 82% | 2.1 s | 13.0% |
+
+Every play lands 21 ticks after it is issued, humans' too, so humans tap ~0.6 s before a push crosses; our models
+decide 0.75 s (IL) to 1.1–1.5 s (specialist) after it (`--delay 0` shifts the latency by exactly the delay). They
+answer as often as humans but late, and lose twice the hp per push.
 
 ## 5. Live Null's Royale games (Mac)
 
@@ -221,7 +253,13 @@ Hall of Fame).
    holding PPO in place. At 0.01 learning resumed (latest beats update-450 54.8%). `value_ev_*` show the value head
    explains ~35–50% of the returns.
 
-Next: General PPO until it plateaus, then an E-Barbs specialist from it, then climb the Nulls ladder.
+10. **The specialist that raced.** The General plateaued (~1,400 updates flat); the first E-Barbs specialist beat it
+   84% by racing (78% three-crowns), 16–5 live, every loss 0–1. Measured on the same scale as humans (`il.defense`,
+   section 4) it answered pushes as often as humans but ~1.5 s later. Its opponents never punished that and the
+   crown bonus paid for racing; ppo-ebarbs2 adds FirstLight's tower shaping, IL opponents, hard decks and the
+   autopilot.
+
+Next: ppo-ebarbs2 under the autopilot; then alternate General and specialist runs with the same reward.
 
 ## Pitfalls we hit (read before changing things)
 

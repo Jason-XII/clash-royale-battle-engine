@@ -19,6 +19,7 @@ import time
 import numpy as np
 
 from . import data as D
+from . import defense
 
 
 def decks(cache, count, seed):
@@ -75,27 +76,38 @@ def worker(index, args, jobs, out):
     time.sleep(index // 4 * 8)  # boot 4 engines at a time
     import torch
     from native_engine import Play
+    from native_engine.build_cache import ENTITY_TYPES
     from native_engine.clapha import ClaphaEngine
     from .model import Agent, load
     torch.set_num_threads(1)
     engine = ClaphaEngine(args.clapha)
     models = [load(args.a), load(args.b)]
     for game, pair in jobs:
-        match = make_match(pair, game + 1)
         a_owner = game % 2
+        if args.a_deck:  # A always plays this deck, B the pair's deck on its side
+            pair = dict(pair, decks=[mirror(args.a_deck)['decks'][0] if o == a_owner else pair['decks'][o] for o in (0, 1)])
+        match = make_match(pair, game + 1)
         agents = [Agent(*models[0 if owner == a_owner else 1], owner, decode=args.decode) for owner in (0, 1)]
         state = engine.reset(match=match)
         started, plays = time.perf_counter(), [0, 0]
+        frames, landed = [], []
         while not state.finalized and state.tick < 7200:
+            frames.append((state.tick, np.array([(e.owner, e.card, e.x, e.y, -1 if e.hp is None else e.hp,
+                                                  -1 if e.max_hp is None else e.max_hp, ENTITY_TYPES.index(e.entity_type))
+                                                 for e in state.entities], np.int64).reshape(-1, 7)))
             chosen = [Play(a.owner, *c[1:]) for a in agents for c in [a.act(state)] if c[0] == 'card']
             transition = engine.step(chosen, 5, delay=args.delay)
             for p, ok in zip(chosen, transition.executed):
                 plays[p.owner] += ok
+                if ok:
+                    landed.append((state.tick + args.delay, p.owner, p.x, p.y))
             state = transition.state
+        guard = defense.game(frames, landed)
         winner = None if state.result not in (0, 1) else 'A' if state.result == a_owner else 'B'
         out.put(('game', index, dict(game=game, winner=winner, a_owner=a_owner,
                                      crowns_a=state.crowns[a_owner], crowns_b=state.crowns[1 - a_owner],
                                      plays_a=plays[a_owner], plays_b=plays[1 - a_owner], tick=state.tick,
+                                     defense_a=guard[a_owner], defense_b=guard[1 - a_owner],
                                      seconds=time.perf_counter() - started)))
     out.put(('done', index, None))
     out.close()
@@ -110,12 +122,13 @@ def mirror(deck_text):
     return {'decks': [deck, deck], 'lvlcap': LEVEL, 'cardlvlmin': LEVEL, 'kt': [LEVEL] * 2, 'exp': [LEVEL] * 2}
 
 
-def run(clapha, a, b, pairs, procs=16, delay=D.DEPLOY_DELAY, decode='gate', out=None, report_every=20, logs='runs/arena-logs'):
+def run(clapha, a, b, pairs, procs=16, delay=D.DEPLOY_DELAY, decode='gate', out=None, report_every=20, logs='runs/arena-logs',
+        a_deck=None):
     """Plays A against B on `pairs` [(game index, deck pair)] across `procs` engines; returns the game records."""
     from native_engine.clapha import raise_thread_limit
     raise_thread_limit()  # before any engine process starts, so every process gets it
     os.makedirs(logs, exist_ok=True)
-    args = argparse.Namespace(clapha=clapha, a=a, b=b, delay=delay, decode=decode, logs=logs)
+    args = argparse.Namespace(clapha=clapha, a=a, b=b, delay=delay, decode=decode, logs=logs, a_deck=a_deck)
     ctx = mp.get_context('fork')
     q = ctx.Queue()
     workers = [ctx.Process(target=worker, args=(i, args, pairs[i::procs], q)) for i in range(procs)]
@@ -157,6 +170,7 @@ def main():
                         help="policy: il.rl's training policy (wait with p(wait), else card x cell at its temperature)")
     parser.add_argument('--deck', help='8 comma-separated cards, id or id:el (el = evolution flag as in replays): '
                         'both players use this deck at level 16 (mirror match)')
+    parser.add_argument('--a-deck', help='A always plays this deck (as --deck), B the deck pool\'s deck on its side')
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
     parser.add_argument('--cache', default='data/cache', help='deck pairs when there is no pool file')
     parser.add_argument('--seed', type=int, default=0)
@@ -166,7 +180,10 @@ def main():
         pairs = [(g, mirror(args.deck)) for g in range(args.games)]
     else:
         pairs = list(enumerate(deck_pairs(args.pool, args.cache, args.games, args.seed)))
-    report(run(args.clapha, args.a, args.b, pairs, args.procs, args.delay, args.decode, args.out))
+    report(run(args.clapha, args.a, args.b, pairs, args.procs, args.delay, args.decode, args.out, a_deck=args.a_deck))
+    results = [json.loads(l) for l in open(args.out)][-len(pairs):]
+    for side in 'ab':
+        print(f'defense {side.upper()}:', defense.summary([r[f'defense_{side}'] for r in results if f'defense_{side}' in r]))
 
 
 def summary(results):

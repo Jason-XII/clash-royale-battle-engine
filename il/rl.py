@@ -13,11 +13,13 @@ memory (one Python thread answering every decision was the bottleneck: GPU 17% b
 Policy: wait with the model's p(wait); otherwise a card x cell sampled from the non-wait logits at
 temperature TEMPERATURE (near the IL agent's "best card and cell", but stochastic so PPO can learn it).
 The ability action is masked (clapha cannot play it). A KL penalty keeps the policy near the IL model.
-Reward: +1 win / -1 loss at the end, +-CROWN_REWARD per crown taken / lost, -OVERFLOW_PENALTY per
-decision at full elixir.
+Reward: +1 win / -1 loss at the end, -OVERFLOW_PENALTY per decision at full elixir, and FirstLight's tower shaping:
+--shaping * (gamma * potential' - potential), the potential being crowns taken minus lost plus each tower's lost hp
+fraction (king x3), + for theirs and - for ours, and 0 once the game ends (so it adds no bonus for a fast three-crown
+or a crown margin, only credit for damage dealt and prevented when it happens).
 """
 import argparse
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 import json
 import math
 import multiprocessing as mp
@@ -36,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from . import data as D
+from . import defense
 from .model import INPUT_KEYS, Policy, load_weights
 from .train import collate
 
@@ -43,7 +46,9 @@ TEMPERATURE = 0.5
 HOLD_LIMIT = 60  # s a collector's next game may be held back for a full backlog (well under REPLY_TIMEOUT)
 REPLY_TIMEOUT = 180  # s; the learner can be busy with an update (~20 s). A node that dies sends nothing, so a
                      # collector that waits longer treats the connection as gone and reconnects (il.rl join).
-CROWN_REWARD = 0.1
+KING_WEIGHT = 3.0  # the king tower's share of the shaping potential (FirstLight)
+FOCUS_DECKS = 20  # --deck-mix 'focus': the most played ladder decks of the pool
+HARD_WIN_RATE, HARD_DECAY, HARD_TOP = 0.55, 0.8, 128  # FirstLight's hard-deck tracking
 OVERFLOW_PENALTY = 0.002
 
 
@@ -103,6 +108,38 @@ def sample(dist):
     return torch.where(play, option + 1, torch.zeros_like(option))
 
 
+def tower_hp(state):
+    """{tower id: (owner, hp, king)}; a destroyed tower is absent."""
+    return {e.id: (e.owner, max(e.hp or 0, 0), e.x == 9000) for e in state.entities
+            if e.card == -1 and e.entity_type == 'building'}
+
+
+def potential(state, start, owner):
+    """FirstLight's shaping potential for `owner` (see the module docstring); `start` is tower_hp at the start."""
+    towers = tower_hp(state)
+    value = float(state.crowns[owner] - state.crowns[1 - owner])
+    for tid, (o, full, king) in start.items():
+        lost = 1.0 - (towers[tid][1] / max(full, 1) if tid in towers else 0.0)
+        value += (KING_WEIGHT if king else 1.0) * lost * (1.0 if o != owner else -1.0)
+    return value
+
+
+def rollback_scale(out):
+    """The learning rate's factor from il.autopilot's rollbacks so far (kept across restarts)."""
+    return float(np.prod([json.loads(f.read_text())['lr_scale'] for f in Path(out).glob('rollback-done-*.json')]))
+
+
+def deck_key(deck):
+    return tuple(sorted((int(c['d']), int(c.get('el', 0))) for c in deck))  # an evolved card plays differently
+
+
+def board_rows(state):
+    """il.defense's frame rows: owner, card, x, y, hp, max hp, entity type."""
+    from native_engine.build_cache import ENTITY_TYPES
+    return np.array([(e.owner, e.card, e.x, e.y, -1 if e.hp is None else e.hp, -1 if e.max_hp is None else e.max_hp,
+                      ENTITY_TYPES.index(e.entity_type)) for e in state.entities], np.int64).reshape(-1, 7)
+
+
 # ---- collectors ---------------------------------------------------------------------------------------------------------
 def collector_engine(name, out, clapha, stagger):
     """A collector process's log, CPU priority and booted engine (+ the run's vocab)."""
@@ -151,13 +188,17 @@ def play_games(index, delay, engine, vocab, learner, servers):
         steps = [defaultdict(list) for _ in (0, 1)]
         state = engine.reset(match=match)
         expired = engine.expired
-        crowns = (0, 0)
+        shaping, gamma = spec.get('shaping', (0.0, 1.0))
+        start = tower_hp(state)
+        phi = [potential(state, start, o) for o in (0, 1)]
+        frames, landed = [], []  # for il.defense: the board every decision, our plays where they land
         timing = defaultdict(float)  # seconds per part of a decision, for the learner's log
         while True:
             t0 = time.perf_counter()
             # A player with a play or ability press in flight can do nothing else (ClaphaEngine drops it): the
             # Observer masks everything for that seat, so what is stored is what happened (wait, log-prob 0).
             rows = observer.observe(state, [InFlight(p['owner'], p['card'], p['cost'], p['due']) for p in engine.pending])
+            frames.append((state.tick, board_rows(state)))
             t1 = time.perf_counter()
             conn.send(('act', index, [((index, o), models[o], pack(rows[o])) for o in (0, 1)]))
             replies = receive(conn)
@@ -187,20 +228,25 @@ def play_games(index, delay, engine, vocab, learner, servers):
             t3 = time.perf_counter()
             transition = engine.step(plays, 5, delay=delay)
             timing['dropped'] += transition.executed.count(False)  # plays the engine refused
+            landed += [(state.tick + delay, p.owner, p.x, p.y) for p, ok in zip(plays, transition.executed)
+                       if ok and p.slot != ABILITY]
             state = transition.state
             timing['engine'] += time.perf_counter() - t3
-            for o in (0, 1):  # crowns taken minus crowns lost since the last decision
-                gained = (state.crowns[o] - crowns[o]) - (state.crowns[1 - o] - crowns[1 - o])
-                steps[o]['reward'][-1] += CROWN_REWARD * gained
-            crowns = state.crowns
+            ended = state.finalized or state.tick >= 7200
+            for o in (0, 1):
+                new = 0.0 if ended else potential(state, start, o)
+                steps[o]['reward'][-1] += shaping * (gamma * new - phi[o])
+                phi[o] = new
         timing['expired'] = engine.expired - expired
+        guard = defense.game(frames, landed)
         for o in (0, 1):
             outcome = 0.0 if state.result not in (0, 1) else (1.0 if state.result == o else -1.0)
             steps[o]['reward'][-1] += outcome
             if o in spec.get('train', [s for s in (0, 1) if models[s] == 'current']):
                 trajectory = {k: np.array(v) for k, v in steps[o].items()}
                 trajectory = {k: v.astype(np.float32) if v.dtype == np.float64 else v for k, v in trajectory.items()}
-                learner.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o], timing=timing)))
+                learner.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o], timing=timing,
+                                                         defense=guard[o], tag=spec.get('tag'))))
                 timing = {}  # counted once per game
         conn.send(('reset', index, [(index, 0), (index, 1)]))
 
@@ -423,7 +469,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
         return seen
 
     seen = refresh()
-    pool = {'il': args.init, **{q.stem: str(q) for q in sorted(opponent_dir(args).glob('*.pt'))}}
+    pool = {'il': args.il or args.init, **{q.stem: str(q) for q in sorted(opponent_dir(args).glob('*.pt'))}}
     server = Server({'current': model.eval(), **{k: load_policy(v, device)[0].eval() for k, v in pool.items()}},
                     device, model.config['core'])
     owners, first, window = [], None, args.batch_ms / 1000  # [(collector pipe, its requests)]
@@ -685,6 +731,13 @@ def main():
                         "id:el, as il.arena --deck), against real ladder decks; only that seat's games train")
     parser.add_argument('--opponent-pool', help="frozen opponents from this directory of snapshots instead of the run's own "
                         "(specialist: the general run's pool, models that play every ladder deck)")
+    parser.add_argument('--il', help="the frozen opponent called 'il' (default: init); e.g. the real IL model when init is "
+                        "the General, the specialist's KL reference")
+    parser.add_argument('--shaping', type=float, default=0.1, help="tower shaping's weight (FirstLight: 0.05-0.15; 0: off)")
+    parser.add_argument('--il-share', type=float, help='games against the IL model among frozen-opponent games (FirstLight '
+                        'specialist: 0.4); the rest PFSP over the snapshots. Default: IL is one PFSP entry')
+    parser.add_argument('--deck-mix', default='0,1,0', help='specialist opponent decks: shares of the most played decks, '
+                        'any pool deck, and hard decks (FirstLight: 0.3,0.4,0.3)')
     parser.add_argument('--pool-size', type=int, default=6, help='frozen opponents: the starting model + this many latest '
                         'snapshots')
     parser.add_argument('--server-device', help="the decision servers' device (default: --device), e.g. cuda:1 "
@@ -764,14 +817,14 @@ def main():
     if device.type == 'cuda':  # convs in channels-last layout: no layout conversion before each conv (~7% of an update)
         model.to(memory_format=torch.channels_last)
         reference.to(memory_format=torch.channels_last)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr * rollback_scale(out))
     if 'optimizer' in saved:
         try:
             optimizer.load_state_dict(saved['optimizer'])
         except ValueError:  # saved before the model gained layers: a fresh Adam
             print('the saved optimizer state does not fit the model; starting Adam afresh', flush=True)
         for group in optimizer.param_groups:  # the saved state would restore the old learning rate
-            group['lr'] = args.lr
+            group['lr'] = args.lr * rollback_scale(out)
     start_update = saved.get('update', 0)
     frozen = ['il'] + [q.stem for q in sorted(opponent_dir(args).glob('*.pt'))]
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> recent learner outcomes
@@ -779,7 +832,12 @@ def main():
     def pick_opponent():
         # the starting model and the --pool-size latest snapshots: older ones are beaten easily and each extra model
         # in a server's round costs a graph launch and a copy back (14 frozen models cut throughput by a quarter)
-        active = frozen[:1] + frozen[1:][-args.pool_size:]
+        if args.il_share is not None:  # FirstLight's specialist mix: IL this often, PFSP over the snapshots otherwise
+            if random.random() < args.il_share or len(frozen) == 1:
+                return 'il'
+            active = frozen[1:][-args.pool_size:]
+        else:
+            active = frozen[:1] + frozen[1:][-args.pool_size:]
         weights = [(1 - (np.mean(results[k]) + 1) / 2 if results[k] else 0.5) ** 2 + 0.05 for k in active]
         return random.choices(active, weights)[0]
 
@@ -796,6 +854,28 @@ def main():
     held, held_time = [], [0.0]  # collectors waiting for their next game (conn, since); seconds held this cycle
     max_backlog = args.games_per_update if args.max_backlog is None else args.max_backlog
 
+    # Specialist opponent decks (FirstLight): --deck-mix shares of the most played ladder decks, any pool deck, and
+    # hard decks: those our seat scores worst against lately (results decay by HARD_DECAY every update).
+    deck_mix = [float(x) for x in args.deck_mix.split(',')]
+    ladder = [d for pair in deck_pairs for d in pair['decks']] if learner_deck is not None else []
+    by_key = {deck_key(d): d for d in ladder}
+    played_keys = [deck_key(d) for d in ladder]
+    focus = [k for k, _ in Counter(played_keys).most_common(FOCUS_DECKS)]
+    deck_results = {}  # deck key -> [decayed sum of outcomes, decayed games]
+
+    def hard_decks():
+        rated = [(total / games, key) for key, (total, games) in deck_results.items()
+                 if games >= 1 and (total / games + 1) / 2 < HARD_WIN_RATE]
+        return [key for _, key in sorted(rated)[:HARD_TOP]]
+
+    def opponent_deck():
+        kind = random.choices(('focus', 'pool', 'hard'), deck_mix)[0]
+        hard = hard_decks() if kind == 'hard' else []
+        key = random.choice(focus if kind == 'focus' else hard) if kind == 'focus' or hard else None
+        if key is None:
+            key = random.choice(played_keys)
+        return by_key[key], key
+
     def new_game(conn):
         """The next game's spec for a collector. A frozen opponent's games all go to its home server (pool position %
         servers): a server then runs the current model and its own opponents, not every model of the pool, each round."""
@@ -808,14 +888,14 @@ def main():
         else:
             server = self_play_games % args.servers
             self_play_games += 1
-        decks, train = random.choice(deck_pairs), None
+        decks, train, tag = random.choice(deck_pairs), None, None
         if learner_deck is not None:  # specialist: our deck vs a real ladder deck; only our seat learns
             decks = dict(decks, decks=[None, None])
             decks['decks'][learner_seat] = learner_deck
-            decks['decks'][1 - learner_seat] = random.choice(random.choice(deck_pairs)['decks'])
+            decks['decks'][1 - learner_seat], tag = opponent_deck()
             train = [learner_seat]
         conn.send(dict(decks=decks, seed=random.randrange(1 << 30), models=models, server=server,
-                       **({'train': train} if train else {})))
+                       shaping=(args.shaping, args.gamma), tag=tag, **({'train': train} if train else {})))
 
     def serve_collectors():
         """A thread that keeps the collectors busy (new games, trajectories) while the main thread trains."""
@@ -860,6 +940,10 @@ def main():
                     elif kind == 'trajectory':
                         if payload['opponent'] != 'current':
                             results[payload['opponent']].append(payload['outcome'])
+                        if payload.get('tag') is not None:
+                            entry = deck_results.setdefault(payload['tag'], [0.0, 0.0])
+                            entry[0] += payload['outcome']
+                            entry[1] += 1
                         played += 1
                         ready.put(payload)
         except BaseException as error:  # noqa: BLE001 - reported by the main thread
@@ -880,6 +964,18 @@ def main():
                 trajectories.append(ready.get(timeout=1))
             except queue.Empty:
                 pass
+        rollback = out / 'rollback.json'  # written by il.autopilot: restart from its best checkpoint at a lower rate
+        if rollback.exists():
+            order = json.loads(rollback.read_text())
+            load_weights(model, load_policy(order['checkpoint'], 'cpu')[1]['model'])
+            optimizer = torch.optim.Adam(model.parameters(), lr=optimizer.param_groups[0]['lr'] * order['lr_scale'])
+            rollback.rename(out / f'rollback-done-{update_index}.json')
+            publish()  # this batch was played by the weights we left: dropped
+            print(f"rolled back to {order['checkpoint']}, lr {optimizer.param_groups[0]['lr']:.2e}", flush=True)
+            continue
+        for entry in list(deck_results.values()):
+            entry[0] *= HARD_DECAY
+            entry[1] *= HARD_DECAY
         waited = time.time() - update_end  # the learner's wait for this batch after the last update
         backlog = ready.qsize()  # trajectories still waiting once this batch is taken
         collect_time, last = time.time() - last, time.time()  # wall clock per update: collection overlaps updates
@@ -922,7 +1018,9 @@ def main():
                    abilities_per_game=float(np.mean([(t['action'] == D.ABILITY).sum() for t in trajectories])),
                    full_elixir=float(np.mean(np.concatenate([t['full'] for t in trajectories]))),
                    score_vs_pool=float(np.mean(outcomes)) if outcomes else None,
-                   pool={k: round(float(np.mean(v)), 3) for k, v in list(results.items()) if v}, **stats_row)
+                   pool={k: round(float(np.mean(v)), 3) for k, v in list(results.items()) if v}, hard_decks=len(hard_decks()),
+                   lr=optimizer.param_groups[0]['lr'],
+                   defense=defense.summary([t['defense'] for t in trajectories if t.get('defense')]), **stats_row)
         metrics.write(json.dumps(row) + '\n')
         metrics.flush()
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()}), flush=True)
