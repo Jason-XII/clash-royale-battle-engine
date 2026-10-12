@@ -24,7 +24,7 @@ SDK = Path.home() / 'Library/Android/sdk'
 ADB = str(SDK / 'platform-tools/adb')
 NDK = SDK / 'ndk/30.0.16248370/toolchains/llvm/prebuilt/darwin-x86_64/bin'
 REPO = Path(__file__).resolve().parent
-PROBE_SHA256 = '2c6e10de7e80c0414e8c295224f9a1d9e0110debc2897b724ee48810ab57accf'  # prebuilt/libcrprobe.so
+PROBE_SHA256 = 'd526ed884bd449fbd360a32f22cfd3f524efe35ee06755dc7d0cee3e10e97190'  # prebuilt/libcrprobe.so
 
 
 def adb(serial, *arguments, check=True):
