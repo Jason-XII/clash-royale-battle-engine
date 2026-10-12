@@ -14,6 +14,7 @@ lasting findings are recorded.
 | How the live client takes a play (deal, refill, elixir, timing) | [docs/GAME_INTEGRATION.md](GAME_INTEGRATION.md) | yes |
 | The engine: loader, per-build addresses, porting a new game build, engine reads per card | github.com/arronwang01/clapha-engine | **no** (Jason has access) |
 | Training metrics for Arron | this repo, branch `reports` (below) | yes |
+| Arron's console: Mac app that plays on the MuMu emulator with a model (FirstLight's or this repo's), HUD, Wi-Fi phone | github.com/arronwang01/clapha-console (its README says what it is and what it needs) | **no** (Jason has access) |
 
 Rule of thumb: anything about the engine's insides (addresses, memory layouts, how a new game build is ported) goes to
 clapha-engine; everything else goes here.
