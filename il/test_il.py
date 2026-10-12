@@ -5,6 +5,7 @@
 """
 from pathlib import Path
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -379,6 +380,46 @@ class EngineFeatures(unittest.TestCase):
                 known = [0, 1, 2, 3, D.EXTRAS - 1]
                 np.testing.assert_allclose(online['extras'][0, 0, known].numpy(), cached['extras'][t, known],
                                            err_msg=f'extras t={t}')
+
+
+class LiveTaps(unittest.TestCase):
+    """il.live picks fast_tap when the emulator lets it write the touchscreen, else adb input tap (adb stood in)."""
+
+    def fake_adb(self, ready):
+        import types
+        from . import live
+        sent, calls = [], []
+
+        class Shell:
+            def __init__(self, args, **kw):
+                calls.append(args)
+                self.stdin = types.SimpleNamespace(write=lambda text: sent.append(text.strip()), flush=lambda: None)
+                answers = iter([ready] + ['{"ok":1}'] * 10)
+                self.stdout = types.SimpleNamespace(readline=lambda: next(answers) + '\n')
+
+            def kill(self):
+                pass
+
+        def run(args, **kw):
+            calls.append(args)
+            return types.SimpleNamespace(stdout='Physical size: 1080x2424\n' if args[-2:] == ['wm', 'size'] else '')
+        return live, sent, calls, mock.patch.object(live.subprocess, 'Popen', Shell), mock.patch.object(live.subprocess, 'run', run)
+
+    def test_fast_tap_commands(self):
+        live, sent, calls, popen, run = self.fake_adb('{"ready":"/dev/input/event1","max_x":32767,"max_y":32767,"max_pressure":0}')
+        with popen, run:
+            taps = live.make_taps('emulator-5554')
+            screen = taps.play(2, 9000, 5000, 1)
+        self.assertEqual(taps.name, 'fast_tap')
+        sx, sy = live.slot_screen(2)
+        self.assertEqual(sent, ['size 1080 2424', 'pressure', f'placeh {sx} {sy} {screen[0]} {screen[1]} 8 16'])
+        self.assertTrue(any('push' in c for c in calls))
+
+    def test_falls_back_to_adb(self):
+        live, sent, calls, popen, run = self.fake_adb('/dev/input/event1: Permission denied')
+        with popen, run:
+            taps = live.make_taps('emulator-5554')
+        self.assertEqual(taps.name, 'adb')
 
 
 if __name__ == '__main__':

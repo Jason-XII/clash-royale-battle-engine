@@ -12,6 +12,7 @@ runs/live/<time>.jsonl. --watch: self-play with the decks of human replays, draw
 import argparse
 import dataclasses
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -70,7 +71,9 @@ def world_screen(x, y, owner):
 
 
 class Taps:
-    """One persistent adb shell; each play is `tap card && tap tile`, acknowledged."""
+    """One persistent adb shell; each play is `tap card && tap tile`, acknowledged. Every `input tap` starts a Java
+    process on the device (9-20 ms each on MuMu, 150-400 ms on slower emulators: measured in clapha)."""
+    name = 'adb'
 
     def __init__(self, serial):
         self.shell = subprocess.Popen(['adb', '-s', serial, 'shell'], stdin=subprocess.PIPE,
@@ -89,6 +92,66 @@ class Taps:
         if line != 'done:0':
             raise RuntimeError(f'adb tap failed: {line!r}')
         return tx, ty
+
+
+class FastTaps:
+    """Touches written straight to the emulator's touchscreen by one resident process (tools/fast_tap.c, built as
+    prebuilt/fast_tap: `aarch64-linux-android31-clang -O2 -o prebuilt/fast_tap tools/fast_tap.c`), the input path
+    `input tap` ends in, without starting a process per tap: ~2 ms of overhead per play (clapha, MuMu). Same interface as
+    Taps. Screen pixels are scaled to the touchscreen's own range (`size`), with pressure where the device has it."""
+    name = 'fast_tap'
+    BINARY = Path(__file__).resolve().parent.parent / 'prebuilt' / 'fast_tap'
+    REMOTE = '/data/local/tmp/fast_tap'
+    GAP_MS, HOLD_MS = 8, 16  # card touch, gap, tile touch: the client takes any of 0-33 ms gaps, 2-48 ms holds
+
+    def __init__(self, serial):
+        adb = ['adb', '-s', serial]
+        subprocess.run(adb + ['push', str(self.BINARY), self.REMOTE], check=True, capture_output=True)
+        subprocess.run(adb + ['shell', 'chmod', '755', self.REMOTE], check=True, capture_output=True)
+        sizes = re.findall(r'(\d+)x(\d+)', subprocess.run(adb + ['shell', 'wm', 'size'], capture_output=True,
+                                                         text=True).stdout)
+        if not sizes:
+            raise RuntimeError('wm size gave no screen size')
+        width, height = map(int, sizes[-1])  # an override size, when set, is listed last
+        self.shell = subprocess.Popen(adb + ['shell', f'{self.REMOTE} auto 2>&1'], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, text=True, bufsize=1)
+        ready = self.shell.stdout.readline().strip()
+        if not ready.startswith('{"ready"'):  # e.g. no permission to write the touchscreen
+            self.shell.kill()
+            raise RuntimeError(f'fast_tap did not start: {ready or "no output"}')
+        self.ready = json.loads(ready)
+        self.send(f'size {width} {height}')
+        self.send('pressure')
+
+    def send(self, command):
+        self.shell.stdin.write(command + '\n')
+        self.shell.stdin.flush()
+        line = self.shell.stdout.readline().strip()
+        if not line.startswith('{') or '"error"' in line:
+            raise RuntimeError(f'fast_tap {command!r}: {line or "process ended"}')
+        return json.loads(line)
+
+    def tap(self, x, y):
+        self.send(f'taph {x} {y} 34')
+
+    def play(self, slot, x, y, owner):
+        (sx, sy), (tx, ty) = slot_screen(slot), world_screen(x, y, owner)
+        self.send(f'placeh {sx} {sy} {tx} {ty} {self.GAP_MS} {self.HOLD_MS}')
+        return tx, ty
+
+
+def make_taps(serial, mode='auto'):
+    """FastTaps when the emulator lets fast_tap write its touchscreen (mode 'auto' or 'fast'), else adb `input tap`."""
+    if mode != 'adb':
+        try:
+            taps = FastTaps(serial)
+            print(f'tapping with fast_tap ({taps.ready})', flush=True)
+            return taps
+        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
+            if mode == 'fast':
+                raise
+            print(f'fast_tap unavailable ({error}); tapping through adb input tap', flush=True)
+    return Taps(serial)
 
 
 def capture(engine, cursor=0):
@@ -171,7 +234,8 @@ def play_battle(engine, agent, taps, state, args, log):
         screen = taps.play(slot, x, y, agent.owner)
         pending = (card.card, state.tick, card.cost)
         log({'event': 'tap', 'tick': state.tick, 'card': card.card, 'slot': slot, 'world': [x, y],
-             'screen': screen, 'input_ms': round((time.perf_counter() - started) * 1000), **choice_odds(agent, me)})
+             'screen': screen, 'input_ms': round((time.perf_counter() - started) * 1000), 'tap_method': taps.name,
+             **choice_odds(agent, me)})
     return state
 
 
@@ -241,6 +305,8 @@ def main():
     parser.add_argument('--decode', choices=('gate', 'sample', 'argmax', 'policy'), default='gate')
     parser.add_argument('--port', type=int, default=26789)
     parser.add_argument('--serial', default='emulator-5554')
+    parser.add_argument('--tap', choices=('auto', 'fast', 'adb'), default='auto',
+                        help='auto: fast_tap (prebuilt/fast_tap) when the emulator allows it, else adb input tap')
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each game')
     parser.add_argument('--shots', help='a directory: screenshot 2 s after each of our Wizard plays lands')
     parser.add_argument('--watch', type=Path, help='a replay parquet part: self-play with its decks instead')
@@ -254,7 +320,7 @@ def main():
     deck = {int(c) for c in args.deck.split(',')} if args.deck else None
     model, vocab = load(args.checkpoint)
     engine = connect(args)
-    taps = Taps(args.serial)
+    taps = make_taps(args.serial, args.tap)
     Path('runs/live').mkdir(parents=True, exist_ok=True)
     if args.shots:
         Path(args.shots).mkdir(parents=True, exist_ok=True)
