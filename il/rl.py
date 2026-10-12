@@ -19,6 +19,7 @@ decision at full elixir.
 import argparse
 from collections import defaultdict, deque
 import json
+import math
 import multiprocessing as mp
 from multiprocessing.connection import Client, Listener, wait
 import queue
@@ -63,10 +64,10 @@ def distribution(logits, temperature=TEMPERATURE, explore=0.0):
     cond = torch.where(playable.unsqueeze(-1), options / temperature, torch.zeros_like(options)).log_softmax(-1)
     if explore:  # mix explore x "press the ability" into the whole distribution where the ability is ready
         ready = torch.isfinite(options[..., 0])
-        keep = torch.log1p(torch.tensor(-explore, device=logits.device))
+        keep = math.log1p(-explore)  # Python floats: a tensor made here is a CPU -> GPU copy, which breaks CUDA graphs
         new_wait = keep + log_wait
         new_play = torch.log1p(-new_wait.exp().clamp(max=1 - 1e-6))
-        ability = torch.logaddexp(keep + log_play + cond[..., 0], torch.full_like(log_wait, explore).log()) - new_play
+        ability = torch.logaddexp(keep + log_play + cond[..., 0], torch.full_like(log_wait, math.log(explore))) - new_play
         rest = keep + log_play.unsqueeze(-1) + cond[..., 1:] - new_play.unsqueeze(-1)
         cond = torch.where(ready.unsqueeze(-1), torch.cat([ability.unsqueeze(-1), rest], -1), cond)
         log_wait = torch.where(ready, new_wait, log_wait)
