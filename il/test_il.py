@@ -393,7 +393,8 @@ class UnitStates(unittest.TestCase):
                                               'speedPercent': -100, 'hitSpeedPercent': -100}],
                                    'attack': {'cycleMs': 600, 'hitSpeedMs': 1200, 'loadMs': 300, 'dashCooldownMs': 750},
                                    'charge': 5000, 'pushed': True, 'pushRemainingMs': 400, 'spawnTimerMs': 2000,
-                                   'ability': {'phase': 'active', 'used': True}})
+                                   'ability': {'phase': 'active', 'used': True, 'sinceUseMs': 1500, 'uses': 1, 'maxCharges': 2},
+                                   'shield': 75, 'shieldMax': 150, 'state': 3})
         names = dict(zip(D.UNIT_STATE_NAMES, frozen))
         self.assertEqual((names['immune'], names['airborne'], names['stops_movement'], names['stops_attacks']), (1, 1, 1, 1))
         self.assertAlmostEqual(names['stopped_s'], 2.5)
@@ -402,6 +403,10 @@ class UnitStates(unittest.TestCase):
         self.assertAlmostEqual(names['run_up_charge'], 0.5)
         self.assertAlmostEqual(names['pushed_s'], 0.4)
         self.assertEqual((names['ability_on'], names['ability_used']), (1, 1))
+        self.assertEqual((names['shield'], names['dashing'], names['river_jump']), (0.5, 1, 0))
+        self.assertEqual((names['ability_since_s'], names['ability_uses']), (1.5, 0.5))
+        ramp = unit_state_tuple({'kind': 'unit', 'attack': {'stage': 2, 'hitSpeedMs': 400}, 'state': 5})
+        self.assertEqual((ramp[D.UNIT_STATE_NAMES.index('ramp_stage')], ramp[D.UNIT_STATE_NAMES.index('river_jump')]), (1, 1))
         shot = unit_state_tuple({'kind': 'projectile', 'aimX': 9000 + 1800, 'aimY': 16000 - 3200})
         self.assertEqual(shot[D.UNIT_STATES:], (10800, 12800))
         ents = (Entity(7, 0, 26000000, 9000, 16000, 600, 600, None, None, 'troop', None, frozen),

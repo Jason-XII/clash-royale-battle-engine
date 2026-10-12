@@ -11,7 +11,6 @@ Differences from the probe, each filled to match it:
   - projectile vs area (objects without hitpoints): by the class of the object's data global id
 """
 import ctypes
-import dataclasses
 from pathlib import Path
 import resource
 import sys
@@ -70,6 +69,9 @@ def _report_cpus(loader):
     loader.shim('get_nprocs_conf', ctypes.c_int)(lambda: ENGINE_CPUS)
 
 
+_EMPTY = {}
+
+
 def _ms_s(value, cap):
     """Milliseconds -> seconds, clipped to [0, cap]; None -> 0."""
     return 0.0 if value is None else min(max(float(value), 0.0), cap * 1000.0) / 1000.0
@@ -79,19 +81,29 @@ def unit_state_tuple(u):
     """One object's Reader.unit_states() dict -> il.data.UNIT_STATE_NAMES values, then the aim's world x, y (None, None
     when it has no aim). Kinds: 'unit' (troops, buildings, towers), 'area' (spell areas), 'projectile', 'timed' (fuses)."""
     kind = u.get('kind')
-    buffs = u.get('buffs') or ()
-    stopping = [b for b in buffs if b.get('stopsMovement') or b.get('stopsAttacks')]
-    attack = u.get('attack') or {}
-    ability = u.get('ability') or {}
+    buffs = u.get('buffs')
+    stops_move = stops_attack = False
+    stopped = speed = hit = 0
+    if buffs:  # most units have none
+        for b in buffs:
+            m, a = b.get('stopsMovement'), b.get('stopsAttacks')
+            stops_move = stops_move or bool(m)
+            stops_attack = stops_attack or bool(a)
+            if m or a:
+                stopped = max(stopped, b.get('remainingMs') or 0)
+            speed += b.get('speedPercent') or 0
+            hit += b.get('hitSpeedPercent') or 0
+    attack = u.get('attack') or _EMPTY
+    ability = u.get('ability') or _EMPTY
     hit_speed = attack.get('hitSpeedMs') or 0
     timer = (u.get('remainingMs') if kind == 'area' else u.get('fuseMs') if kind == 'timed' else u.get('spawnTimerMs'))
     values = (
         float(bool(u.get('hidden'))), float(bool(u.get('immune'))), float(bool(u.get('invisible'))),
         float(bool(u.get('airborne'))),
-        float(any(b.get('stopsMovement') for b in buffs)), float(any(b.get('stopsAttacks') for b in buffs)),
-        _ms_s(max((b.get('remainingMs') or 0 for b in stopping), default=0), 5),
-        min(max(sum(b.get('speedPercent') or 0 for b in buffs) / 100.0, -1.0), 2.0),
-        min(max(sum(b.get('hitSpeedPercent') or 0 for b in buffs) / 100.0, -1.0), 2.0),
+        float(stops_move), float(stops_attack),
+        _ms_s(stopped, 5),
+        min(max(speed / 100.0, -1.0), 2.0),
+        min(max(hit / 100.0, -1.0), 2.0),
         _ms_s(u.get('pushRemainingMs'), 5) if u.get('pushed') else 0.0,
         min(max((attack.get('cycleMs') or 0) / hit_speed, 0.0), 1.0) if hit_speed > 0 else 0.0,
         _ms_s(attack.get('loadMs'), 5),
@@ -101,6 +113,12 @@ def unit_state_tuple(u):
         _ms_s(timer, 10),
         0.0, 0.0,  # aim, filled per seat by il.data.Observer
         float(bool(ability.get('used'))),
+        min(max((u.get('shield') or 0) / u['shieldMax'], 0.0), 1.0) if u.get('shieldMax') else 0.0,
+        min(max(attack.get('stage') or 0, 0), 2) / 2.0,  # damage ramp (Inferno Tower / Dragon, Mighty Miner): 0, 0.5, 1
+        float(u.get('state') == 3),  # dashing: Bandit / Boss Bandit dash, Mega Knight jump, Golden Knight's chain
+        float(u.get('state') == 5),  # jumping the river (Hog Rider, Royal Hogs)
+        _ms_s(ability.get('sinceUseMs'), 10),  # time since this unit's last ability use (0 before any: see ability_used)
+        min(max((ability.get('uses') or 0) / ability['maxCharges'], 0.0), 1.0) if ability.get('maxCharges') else 0.0,
     )
     aim = (u['aimX'], u['aimY']) if kind == 'projectile' and u.get('aimX') is not None else (None, None)
     return values + aim
@@ -117,7 +135,8 @@ class ClaphaEngine:
         self.env = CrxEnv(clapha / 'engine', Path(workdir or tempfile.mkdtemp(prefix='clapha-')),
                           str(clapha / 'data' / 'assets'))
         self.state, self.generation, self.sequence, self.pending = None, 0, 0, []
-        self.unit_states = unit_states  # read clapha-engine's unit states into Entity.states (~+0.4 ms a step)
+        self.unit_states = unit_states  # read clapha-engine's unit states into Entity.states (~+0.2 ms a step)
+        self.ability_clock = None
 
     def reset(self, seed=1, match=None):
         if match is None:
@@ -125,6 +144,10 @@ class ClaphaEngine:
         self.env.create_match(match)
         self.generation += 1
         self.hands, self.pending = None, []
+        # time since each hero / champion unit used its ability (the engine keeps no such timer); placed at the first
+        # snapshot that shows the use (up to one decision late) unless the ability has a cooldown (then exact)
+        observe = sys.modules.get(type(self.env.reader).__module__)
+        self.ability_clock = observe.AbilityClock() if hasattr(observe, 'AbilityClock') else None
         r = self.env.reader
         logic = r.logic(self.env.battle)  # a deck never changes within a battle: read its card ids once
         self.deck = [[r.card_id(r.card_data(slot)) for slot in r.deck_slots(logic, owner)] for owner in (0, 1)]
@@ -246,10 +269,14 @@ class ClaphaEngine:
         if hasattr(env.reader, 'entities'):  # clapha's lean reader: the same fields as objects(), as tuples
             rows = env.reader.entities(env.battle)
             crowns, ended, winner = env._result([{'nativeObjectId': r[0], 'hp': r[5]} for r in rows])
-            entities = tuple(self._entity_row(r) for r in rows)
             if self.unit_states and hasattr(env.reader, 'unit_states'):  # clapha-engine >= a9dceac: each unit's states
-                states = {u['nativeObjectId']: unit_state_tuple(u) for u in env.reader.unit_states(env.battle)}
-                entities = tuple(dataclasses.replace(e, states=states.get(e.id)) for e in entities)
+                units = env.reader.unit_states(env.battle)
+                if self.ability_clock is not None:
+                    self.ability_clock.update(env.tick(), units)
+                states = {u['nativeObjectId']: unit_state_tuple(u) for u in units}
+                entities = tuple(self._entity_row(r, states.get(r[0])) for r in rows)
+            else:
+                entities = tuple(self._entity_row(r) for r in rows)
         else:
             objects = env.reader.objects(env.battle)
             crowns, ended, winner = env._result(objects)
@@ -282,15 +309,15 @@ class ClaphaEngine:
         return cost
 
     @staticmethod
-    def _entity_row(r):
-        """_entity for a row of clapha's Reader.entities (the same values)."""
+    def _entity_row(r, states=None):
+        """_entity for a row of clapha's Reader.entities (the same values); states: its unit_state_tuple, if read."""
         oid, owner, card, x, y, hp, max_hp, target, load, deploy, global_id = r
         if hp is None:
             kind = 'projectile' if global_id // 1000000 == PROJECTILE_CLASS else 'area'
-            return Entity(oid, owner, card, x, y, None, None, None, None, kind, None)
+            return Entity(oid, owner, card, x, y, None, None, None, None, kind, None, states)
         attack = load is not None  # load and deploy are read exactly when there is an attack component
         return Entity(oid, owner, card, x, y, hp, max_hp, target if attack else None, _ms(load) if attack else None,
-                      'building' if card == -1 else 'troop', _ms(deploy))
+                      'building' if card == -1 else 'troop', _ms(deploy), states)
 
     @staticmethod
     def _entity(o):

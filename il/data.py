@@ -31,7 +31,8 @@ EXTRAS = 18
 # seat like positions. Times in seconds, clipped.
 UNIT_STATE_NAMES = ('hidden', 'immune', 'invisible', 'airborne', 'stops_movement', 'stops_attacks', 'stopped_s',
                     'speed_effect', 'hit_speed_effect', 'pushed_s', 'attack_cycle', 'load_s', 'run_up_charge',
-                    'dash_cooldown_s', 'ability_on', 'timer_s', 'aim_dx', 'aim_dy', 'ability_used')
+                    'dash_cooldown_s', 'ability_on', 'timer_s', 'aim_dx', 'aim_dy', 'ability_used', 'shield',
+                    'ramp_stage', 'dashing', 'river_jump', 'ability_since_s', 'ability_uses')
 UNIT_STATES = len(UNIT_STATE_NAMES)
 REGEN = 10000 / 56  # raw elixir per tick (1 per 2.8 s); x2 after tick 2400, x3 after 4800 (measured on the cache)
 
