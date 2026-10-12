@@ -147,7 +147,7 @@ class PPODistribution(unittest.TestCase):
         self.logits[1, 2:] = float('-inf')            # nothing playable: must wait
 
     def test_normalized_legal_and_consistent(self):
-        from .rl import distribution, entropy, kl, log_prob
+        from .model import distribution, entropy, kl, log_prob
         dist = distribution(self.logits)
         every = torch.arange(D.ACTIONS).expand(3, -1)
         p = log_prob(tuple(t.unsqueeze(1).expand(-1, D.ACTIONS, *t.shape[1:]) if t.dim() > 1 else
@@ -160,7 +160,7 @@ class PPODistribution(unittest.TestCase):
         self.assertTrue(torch.allclose(kl(dist, dist), torch.zeros(3), atol=1e-5))
 
     def test_ready_ability_is_one_of_the_play_options(self):
-        from .rl import distribution, log_prob, sample
+        from .model import distribution, log_prob, sample
         logits = self.logits[2:].clone()
         logits[0, D.ABILITY] = logits[0, 2:].max() + 1  # temperature 0.5: about e^2 times the best card
         dist = distribution(logits.expand(40000, -1))
@@ -171,7 +171,7 @@ class PPODistribution(unittest.TestCase):
 
     def test_ability_exploration(self):
         """explore mixes "press the ability" into the whole distribution where it is ready, and only there."""
-        from .rl import distribution, entropy, log_prob, sample
+        from .model import distribution, entropy, log_prob, sample
         logits = self.logits.clone()
         logits[2, D.ABILITY] = -30.0  # ready, but the model would almost never press it
         dist = distribution(logits, explore=0.05)
@@ -188,7 +188,7 @@ class PPODistribution(unittest.TestCase):
         self.assertTrue(torch.isfinite(entropy(dist)).all())
 
     def test_sampling_matches_probabilities(self):
-        from .rl import distribution, log_prob, sample
+        from .model import distribution, log_prob, sample
         dist = distribution(self.logits[2:].expand(20000, -1))
         actions = sample(dist)
         p_wait = log_prob(dist, torch.zeros_like(actions))[0].exp().item()
@@ -198,10 +198,10 @@ class PPODistribution(unittest.TestCase):
 
 @unittest.skipUnless(CACHE.exists(), 'build data/cache-smoke first')
 class PPOServer(unittest.TestCase):
-    """il.rl.Server keeps every seat's LSTM state apart: interleaved seats see what one full-sequence pass sees."""
+    """il.actors.Server keeps every seat's LSTM state apart: interleaved seats see what one full-sequence pass sees."""
 
     def test_interleaved_seats_match_full_sequences(self):
-        from .rl import Server, pack
+        from .actors import Server, pack
         torch.manual_seed(0)
         shard = D.Shard(CACHE)
         vocab = D.build_vocab([CACHE])
@@ -226,7 +226,7 @@ class PPOServer(unittest.TestCase):
 
     def test_mixed_models_in_one_round(self):
         """Requests for two models in one round: each model gets exactly its own rows."""
-        from .rl import Server, pack
+        from .actors import Server, pack
         torch.manual_seed(1)
         shard = D.Shard(CACHE)
         vocab = D.build_vocab([CACHE])
@@ -246,7 +246,7 @@ class PPOServer(unittest.TestCase):
             self.assertTrue(torch.allclose(torch.tensor(got[g]), full[g], atol=1e-4))
 
     def test_silent_peer_times_out(self):
-        from . import rl
+        from . import actors as rl
         old, rl.REPLY_TIMEOUT = rl.REPLY_TIMEOUT, 0.2
         try:
             a, b = __import__('multiprocessing').Pipe()
@@ -318,7 +318,7 @@ class ObserverExtras(unittest.TestCase):
     def test_play_in_flight_masks_everything(self):
         from native_engine.engine import Ability
         from .data import InFlight, Observer
-        from .rl import distribution, log_prob, sample
+        from .model import distribution, log_prob, sample
         ready = (Ability(2, 0, 10000, 1, 1, (77,)),)
         row, other = Observer({}).observe(self.state(ready), [InFlight(0, 26000001, 4, 222)])
         self.assertFalse(row['slot_ok'].any() or row['ability_ok'])
@@ -412,7 +412,7 @@ class Shaping(unittest.TestCase):
         return State(0, 0, False, None, crowns, (), entities, (), 0)
 
     def test_potential(self):
-        from .rl import potential, tower_hp
+        from .actors import potential, tower_hp
         start = tower_hp(self.state({}))
         self.assertEqual(potential(self.state({}), start, 0), 0.0)
         half = self.state({4: 4858 // 2})  # owner 1's princess at half hp
@@ -439,6 +439,38 @@ class Shaping(unittest.TestCase):
         self.assertEqual(answered['latency'], 20)
         wrong_lane = defense.game(frames, [(30, 0, 14000, 8000)])[0]['pushes'][0]
         self.assertFalse(wrong_lane['answered'])
+
+
+class Matchmaking(unittest.TestCase):
+    """The specialist's game specs: our deck in the learning seat, a frozen opponent on its home server, and a deck we
+    keep losing to becomes a hard deck (until its results decay away)."""
+
+    def test_specialist_specs(self):
+        import argparse
+        from .rl import Matchmaker, deck_key
+        ours = [{'d': 26000043, 'el': 1}] + [{'d': 26000000 + i} for i in range(7)]
+        ladder = [[{'d': 27000000 + 10 * j + i} for i in range(8)] for j in range(30)]
+        pairs = [{'decks': [ladder[j], ladder[(j + 1) % 30]]} for j in range(30)]
+        args = argparse.Namespace(self_play=0.0, il_share=0.4, pool_size=6, servers=4, deck_mix='0,0,1',
+                                  shaping=0.1, gamma=0.999)
+        m = Matchmaker(args, pairs, ours, ['il', 'update-00150', 'update-00300'])
+        for _ in range(20):
+            spec = m.spec()
+            seat = spec['train'][0]
+            self.assertEqual(spec['decks']['decks'][seat], ours)
+            opponent = spec['models'][1 - seat]
+            self.assertIn(opponent, m.frozen)
+            self.assertEqual(spec['server'], m.frozen.index(opponent) % 4)
+            self.assertEqual(spec['tag'], deck_key(spec['decks']['decks'][1 - seat]))
+        lost_to = deck_key(ladder[3])
+        self.assertEqual(m.hard_decks(), [])
+        for _ in range(3):
+            m.record({'opponent': 'il', 'outcome': -1.0, 'tag': lost_to})
+        self.assertEqual(m.hard_decks(), [lost_to])
+        self.assertTrue(all(m.spec()['tag'] == lost_to for _ in range(10)))  # deck mix: hard decks only
+        for _ in range(5):
+            m.decay()
+        self.assertEqual(m.hard_decks(), [])  # 3 * 0.8^5 < 1 game
 
 
 if __name__ == '__main__':

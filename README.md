@@ -10,7 +10,7 @@
 |---|---|---|---|
 | 1. Rebuild 252k human replays, cache raw states | Mac | ARM64 `libg.so` in an Android emulator + our probe | `build_cache.py` |
 | 2. Imitation learning | GPU node | none (cache only) | `il/data.py`, `il/model.py`, `il/train.py` |
-| 3. PPO self-play | GPU node (x86_64 Linux) | clapha-engine, in-process | `clapha.py`, `il/rl.py` |
+| 3. PPO self-play | GPU node (x86_64 Linux) | clapha-engine, in-process | `clapha.py`, `il/rl.py`, `il/actors.py` |
 | 4. Evaluation (model vs model) | GPU node | clapha-engine | `il/arena.py`, `il/eval.py` |
 | 5. Live Null's Royale games | Mac | the game itself + our probe's live mode | `il/live.py` |
 
@@ -24,9 +24,10 @@ emulator.py              build / install the probe, start the headless emulator,
 build_cache.py           rebuild IL_Replay games (FirstLight's converter), cache raw states, build the deck pool
 prebuilt/libcrprobe.so   the probe, built from vendor/firstlight/probe (FirstLight's source + our live mode)
 il/data.py               features and labels from raw states (cache), and `Observer` (engine states, both seats)
-il/model.py              the policy and Agent (plays a checkpoint in any engine)
+il/model.py              the policy, its PPO distribution, and Agent (plays a checkpoint in any engine)
 il/train.py              imitation learning
-il/rl.py                 PPO: collectors, decision servers, learner; `il.rl join` for collectors in another job
+il/rl.py                 PPO learner: matchmaking (opponents, decks), the update, `il.rl join` (another job)
+il/actors.py             collectors (games, reward shaping), decision servers (GPU, MPS), the joining job's side
 il/arena.py, il/eval.py  model vs model; PPO snapshots vs a reference
 il/live.py               live Nulls games by adb taps; --watch: self-play in the emulator engine
 il/test_il.py            features/labels, PPO distribution, decision server, online = cached features

@@ -75,6 +75,13 @@ def game(frames, plays):
     return out
 
 
+def board_rows(state):
+    """il.defense's frame rows: owner, card, x, y, hp, max hp, entity type."""
+    from native_engine.build_cache import ENTITY_TYPES
+    return np.array([(e.owner, e.card, e.x, e.y, -1 if e.hp is None else e.hp, -1 if e.max_hp is None else e.max_hp,
+                      ENTITY_TYPES.index(e.entity_type)) for e in state.entities], np.int64).reshape(-1, 7)
+
+
 def summary(games):
     """Per-player-game stats -> one line of aggregates: pushes per game, the share answered, damage per answered /
     unanswered push (as a share of the starting tower hp), tower hp lost per game, own-half play share."""

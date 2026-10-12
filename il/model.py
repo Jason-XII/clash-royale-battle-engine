@@ -1,5 +1,7 @@
 """Small recurrent policy: entities scattered onto the 32x18 tile grid, a conv tower, one LSTM,
 and a joint (wait | ability | hand slot x cell) action head (~0.9M parameters); `Agent` plays a checkpoint in any engine."""
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -151,6 +153,63 @@ def load(checkpoint, device='cpu'):
     return model, saved['vocab']
 
 
+# ---- the PPO policy distribution (il.rl) -----------------------------------------------------------------------------
+TEMPERATURE = 0.5
+ABILITY_EXPLORE = 0.01  # training: P(ability) >= this whenever it is ready (PPO stopped pressing it at all, unexplored)
+
+
+def distribution(logits, temperature=TEMPERATURE, explore=0.0):
+    """[..., ACTIONS] logits -> (log p(wait), log p(play), conditional log-probs over the play options [..., 1 + 4*CELLS]:
+    the ability, then cards x cells). The model masks what cannot be played (-inf), the ability when it is not ready.
+    A step with nothing playable waits with probability 1."""
+    logits = logits.float()
+    options = logits[..., 1:]
+    log_wait = logits.log_softmax(-1)[..., 0]
+    playable = torch.isfinite(options).any(-1)
+    log_play = torch.where(playable, torch.log1p(-log_wait.exp().clamp(max=1 - 1e-6)), torch.full_like(log_wait, -1e9))
+    log_wait = torch.where(playable, log_wait, torch.zeros_like(log_wait))
+    cond = torch.where(playable.unsqueeze(-1), options / temperature, torch.zeros_like(options)).log_softmax(-1)
+    if explore:  # mix explore x "press the ability" into the whole distribution where the ability is ready
+        ready = torch.isfinite(options[..., 0])
+        keep = math.log1p(-explore)  # Python floats: a tensor made here is a CPU -> GPU copy, which breaks CUDA graphs
+        new_wait = keep + log_wait
+        new_play = torch.log1p(-new_wait.exp().clamp(max=1 - 1e-6))
+        ability = torch.logaddexp(keep + log_play + cond[..., 0], torch.full_like(log_wait, math.log(explore))) - new_play
+        rest = keep + log_play.unsqueeze(-1) + cond[..., 1:] - new_play.unsqueeze(-1)
+        cond = torch.where(ready.unsqueeze(-1), torch.cat([ability.unsqueeze(-1), rest], -1), cond)
+        log_wait = torch.where(ready, new_wait, log_wait)
+        log_play = torch.where(ready, new_play, log_play)
+    return log_wait, log_play, cond
+
+
+def log_prob(dist, action):
+    log_wait, log_play, cond = dist
+    option = (action - 1).clamp(min=0)
+    return torch.where(action == D.WAIT, log_wait, log_play + cond.gather(-1, option.unsqueeze(-1)).squeeze(-1))
+
+
+def entropy(dist):
+    log_wait, log_play, cond = dist
+    p_wait, p_play = log_wait.exp(), log_play.exp()
+    cond_entropy = -(cond.exp() * torch.nan_to_num(cond, neginf=0.0)).sum(-1)
+    return -(p_wait * log_wait + p_play * torch.where(p_play > 0, log_play, torch.zeros_like(log_play))) + p_play * cond_entropy
+
+
+def kl(dist, ref):
+    """KL(policy || reference), both in this factorised form."""
+    (lw, lp, c), (rw, rp, rc) = dist, ref
+    pw, pp = lw.exp(), lp.exp()
+    cond_kl = (c.exp() * (torch.nan_to_num(c, neginf=0.0) - torch.nan_to_num(rc, neginf=0.0))).sum(-1)
+    return pw * (lw - rw) + pp * torch.where(pp > 0, lp - rp + cond_kl, torch.zeros_like(lp))
+
+
+def sample(dist):
+    log_wait, log_play, cond = dist
+    play = torch.rand_like(log_wait) < log_play.exp()
+    option = (cond - torch.empty_like(cond).exponential_().log()).argmax(-1)  # Gumbel-max: a draw from softmax(cond)
+    return torch.where(play, option + 1, torch.zeros_like(option))
+
+
 class Agent:
     """One player. `act(state)` returns ('wait',), ('ability',) or ('card', slot, x, y) in world units.
 
@@ -181,7 +240,6 @@ class Agent:
         logits = logits[0, 0].float()
         self.last_logits = logits  # for logging (il.live)
         if self.decode == 'policy':  # il.rl's training policy
-            from .rl import distribution, sample
             action = int(sample(distribution(logits[None]))[0])
         elif self.decode == 'sample':
             action = int(torch.distributions.Categorical(logits=logits).sample())

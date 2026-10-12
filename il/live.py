@@ -27,7 +27,7 @@ from . import data as D
 from .data import InFlight
 from native_engine.engine import HOLD_TICKS, hold_slack, regen
 from .model import Agent, load
-from .rl import board_rows
+from .defense import board_rows
 
 # Pixel_9_2 emulator screen (1080x2424), measured in clash-simulator-refactored/minimal_visualizer.py:
 # the 30 inner arena rows span y 295..1714, so 32 rows span one row more at each end.
@@ -182,7 +182,7 @@ def play_battle(engine, agent, taps, state, args, log):
 
 def choice_odds(agent, me):
     """Our hand at a tap and how likely the training policy was to play each slot (summed over cells) or wait."""
-    from .rl import distribution
+    from .model import distribution
     log_wait, log_play, cond = distribution(agent.last_logits[None])
     options = cond[0].exp() * log_play.exp()  # the ability, then cards x cells
     slots = options[1:].view(4, D.CELLS).sum(-1).tolist()
