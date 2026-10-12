@@ -497,6 +497,18 @@ def update(model, reference, optimizer, trajectories, args, device):
         'value_ev_gae': explained(np.concatenate([t['ret'] for t in trajectories]), value)}
     keys = INPUT_KEYS + ('action', 'logp', 'adv', 'ret')
     stats = defaultdict(list)
+    # The reference (IL) policy's distribution, once per trajectory: it does not change during the update, so the
+    # epochs need not run its forward pass again (it was a quarter of the update's GPU time).
+    with torch.no_grad():
+        for i in range(0, len(trajectories), args.minibatch):
+            chunk = trajectories[i:i + args.minibatch]
+            batch = collate([{k: t[k] for k in INPUT_KEYS + ('action',)} for t in chunk])
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
+                ref_logits, _, _ = reference({k: batch[k] for k in INPUT_KEYS}, valid=batch['time_mask'])
+            ref = distribution(ref_logits)
+            for b, t in enumerate(chunk):
+                t['ref'] = tuple(r[b, :len(t['action'])] for r in ref)
     for _ in range(args.epochs):
         random.shuffle(trajectories)
         for i in range(0, len(trajectories), args.minibatch):
@@ -505,10 +517,9 @@ def update(model, reference, optimizer, trajectories, args, device):
             m = batch['time_mask']
             x = {k: batch[k] for k in INPUT_KEYS}
             with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
-                logits, value, _ = model(x)
-                with torch.no_grad():
-                    ref_logits, _, _ = reference(x)
-            dist, ref = distribution(logits), distribution(ref_logits)
+                logits, value, _ = model(x, valid=m)
+            dist = distribution(logits)
+            ref = padded_ref(trajectories[i:i + args.minibatch], m.shape[1])
             new_logp = log_prob(dist, batch['action'])
             ratio = (new_logp - batch['logp']).exp()
             adv = (batch['adv'] - mean) / std
@@ -528,7 +539,26 @@ def update(model, reference, optimizer, trajectories, args, device):
                 stats['kl_ref'].append(kl_ref.item())
                 stats['approx_kl'].append(((ratio - 1) - ratio.log())[m].mean().item())
                 stats['clip_frac'].append(((ratio - 1).abs() > args.clip)[m].float().mean().item())
+    for t in trajectories:
+        del t['ref']
     return {**{k: float(np.mean(v)) for k, v in stats.items()}, **diagnostics}
+
+
+def padded_ref(chunk, T):
+    """The minibatch's reference distribution [B, T, ...] from its trajectories' stored ones: padded steps as a padded
+    step's own (no playable card: wait with probability 1)."""
+    first = chunk[0]['ref'][0]
+    padded = torch.full((1, D.ACTIONS), float('-inf'), device=first.device)
+    padded[:, 0] = 0  # a padded step's logits: wait finite; the ability (ability_ok False) and every card cell masked
+    fills = [f[0] for f in distribution(padded)]
+    out = []
+    for j, fill in enumerate(fills):
+        parts = [t['ref'][j] for t in chunk]
+        full = fill.expand(len(parts), T, *fill.shape).clone()
+        for b, part in enumerate(parts):
+            full[b, :len(part)] = part
+        out.append(full)
+    return tuple(out)
 
 
 def save(path, model, saved, optimizer=None, extra=None):
@@ -708,6 +738,9 @@ def main():
     model = cpu_model.to(device)
     reference, _ = load_policy(args.init, device)
     reference.eval().requires_grad_(False)
+    if device.type == 'cuda':  # convs in channels-last layout: no layout conversion before each conv (~7% of an update)
+        model.to(memory_format=torch.channels_last)
+        reference.to(memory_format=torch.channels_last)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     if 'optimizer' in saved:
         try:

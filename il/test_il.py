@@ -108,6 +108,34 @@ class AddedLayers(unittest.TestCase):
         self.assertTrue(torch.isinf(masked[..., D.ABILITY]).all())
 
 
+@unittest.skipUnless(CACHE.exists(), 'build data/cache-smoke first')
+class ValidStepsOnly(unittest.TestCase):
+    """Policy.forward(valid=mask), as the PPO update runs it, gives the valid steps' outputs and gradients unchanged."""
+
+    def test_same_outputs_and_gradients(self):
+        from .train import collate
+        torch.manual_seed(0)
+        shard = D.Shard(CACHE)
+        vocab = D.build_vocab([CACHE])
+        model = Policy(max(vocab.values()) + 1)
+        for layer in (model.extras, model.matchup[-1]):  # not zero, so the added inputs are exercised too
+            torch.nn.init.normal_(layer.weight, std=0.1)
+        seqs = [D.sequence(shard[g], g % 2, vocab) for g in range(3)]
+        batch = collate([{k: s[k][:n] for k in INPUT_KEYS + ('action',)} for s, n in zip(seqs, (40, 25, 33))])
+        x, m = {k: batch[k] for k in INPUT_KEYS}, batch['time_mask']
+        outs, grads = [], []
+        for valid in (None, m):
+            model.zero_grad()
+            logits, value, _ = model(x, valid=valid)
+            finite = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
+            (finite[m].sum() + value[m].sum()).backward()
+            outs.append((logits[m], value[m]))
+            grads.append(torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]))
+        self.assertTrue(torch.allclose(outs[0][0], outs[1][0], atol=1e-5, equal_nan=True))
+        self.assertTrue(torch.allclose(outs[0][1], outs[1][1], atol=1e-5))
+        self.assertTrue(torch.allclose(grads[0], grads[1], rtol=1e-4, atol=1e-5))
+
+
 class PPODistribution(unittest.TestCase):
     """il.rl's factorised policy: wait with p(wait), else a card x cell at a temperature."""
 
@@ -345,8 +373,12 @@ class EngineFeatures(unittest.TestCase):
             agent = Agent(None, vocab, owner)
             for t, state in enumerate(result['states'][:400]):
                 online = agent.observe(state)
-                for key in set(INPUT_KEYS) - {'ability_ok'}:  # unknown in the cache, so unmasked there
+                for key in set(INPUT_KEYS) - {'ability_ok', 'extras'}:  # ability_ok: unknown in the cache, unmasked
                     np.testing.assert_allclose(online[key][0, 0].numpy(), cached[key][t], err_msg=f'{key} t={t}')
+                # extras: the cache has no ability or evolution state (the probe reports them now); compare the rest
+                known = [0, 1, 2, 3, D.EXTRAS - 1]
+                np.testing.assert_allclose(online['extras'][0, 0, known].numpy(), cached['extras'][t, known],
+                                           err_msg=f'extras t={t}')
 
 
 if __name__ == '__main__':
