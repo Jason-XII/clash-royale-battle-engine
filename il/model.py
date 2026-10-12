@@ -5,11 +5,11 @@ from torch import nn
 import torch.nn.functional as F
 
 from . import data as D
-from .data import ACTIONS, CELLS, ENTITY_FLOATS, EXTRAS, H, MAX_ENTITIES, REVEALED, SCALARS, W
+from .data import ACTIONS, CELLS, ENTITY_FLOATS, EXTRAS, H, MAX_ENTITIES, REVEALED, SCALARS, UNIT_STATES, W
 
 INPUT_KEYS = ('ent_obj', 'ent_side', 'ent_type', 'ent_cell', 'ent_float', 'rev_card', 'rev_age',
               'scalars', 'hand_card', 'hand_cost', 'next_card', 'slot_ok',
-              'extras', 'cycle_card', 'pending_card', 'ability_ok', 'opp_deck')
+              'extras', 'cycle_card', 'pending_card', 'ability_ok', 'opp_deck', 'ent_state')
 
 
 def mlp(*widths):
@@ -51,7 +51,9 @@ class Policy(nn.Module):
         # and never reaches a decision).
         self.extras = nn.Linear(EXTRAS + 4 * card_dim, core)
         self.matchup = mlp(core + card_dim, 64, 1)
-        for layer in (self.extras, self.matchup[-1]):
+        # each unit's states from clapha-engine (data.UNIT_STATE_NAMES), added to its embedding before the grid
+        self.unit_state = nn.Linear(UNIT_STATES, entity_dim)
+        for layer in (self.extras, self.matchup[-1], self.unit_state):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
 
@@ -94,7 +96,7 @@ class Policy(nn.Module):
         N = B * T
         # Entities -> per-cell sums on the grid.
         ent = self.card(x['ent_obj']) + self.side(x['ent_side']) + self.kind(x['ent_type'])
-        ent = self.entity(torch.cat([ent, x['ent_float']], -1))  # [B, T, E, D]
+        ent = self.entity(torch.cat([ent, x['ent_float']], -1)) + self.unit_state(x['ent_state'])  # [B, T, E, D]
         ent = ent * (x['ent_side'] > 0).unsqueeze(-1)
         D = ent.shape[-1]
         grid = ent.new_zeros(N, CELLS, D)
@@ -137,9 +139,9 @@ assert ACTIONS == 2 + 4 * CELLS
 
 
 def load_weights(model, weights):
-    """A checkpoint from before the extras / matchup layers loads with them at their zero initialisation."""
+    """A checkpoint from before the extras / matchup / unit_state layers loads with them at their zero initialisation."""
     missing, unexpected = model.load_state_dict(weights, strict=False)
-    added = ('extras.', 'matchup.')
+    added = ('extras.', 'matchup.', 'unit_state.')
     if unexpected or any(not k.startswith(added) for k in missing):
         raise RuntimeError(f'checkpoint does not fit the model: missing {missing}, unexpected {unexpected}')
 

@@ -26,6 +26,13 @@ AFFORD_SLACK = 8000
 # Inputs the IL cache lacks (zeros there; PPO learns them): our play in flight (4), the hero / champion ability (5),
 # per hand slot "its next play is evolved" (4) and evolution progress (4), the opponent elixir estimate (1).
 EXTRAS = 18
+# Per-unit states from clapha-engine's Reader.unit_states() (clapha-engine docs/engine/UNIT_STATES.md), added after IL:
+# zeros where they are not read (IL replays, the emulator probe). Owner-independent except the aim, which is rotated per
+# seat like positions. Times in seconds, clipped.
+UNIT_STATE_NAMES = ('hidden', 'immune', 'invisible', 'airborne', 'stops_movement', 'stops_attacks', 'stopped_s',
+                    'speed_effect', 'hit_speed_effect', 'pushed_s', 'attack_cycle', 'load_s', 'run_up_charge',
+                    'dash_cooldown_s', 'ability_on', 'timer_s', 'aim_dx', 'aim_dy', 'ability_used')
+UNIT_STATES = len(UNIT_STATE_NAMES)
 REGEN = 10000 / 56  # raw elixir per tick (1 per 2.8 s); x2 after tick 2400, x3 after 4800 (measured on the cache)
 
 
@@ -140,6 +147,7 @@ def entity_features(replay, owner, vocab, T):
         'ent_type': np.zeros((T, MAX_ENTITIES), np.int64),  # 0 pad, 1 + build_cache.ENTITY_TYPES index
         'ent_cell': np.zeros((T, MAX_ENTITIES), np.int64),
         'ent_float': np.zeros((T, MAX_ENTITIES, ENTITY_FLOATS), np.float32),
+        'ent_state': np.zeros((T, MAX_ENTITIES, UNIT_STATES), np.float32),  # not in replays: zeros
     }
     out['ent_obj'][st, slot] = lookup(vocab, obj[keep])
     out['ent_side'][st, slot] = np.where(own[keep] == owner, 1, 2)
@@ -328,6 +336,15 @@ class Observer:
         dep_f = (_clip(dep, 0, 5000) / 1000)[:keep]
         cd_f = (_clip(cd, 0, 5000) / 1000)[:keep]
         tgt_on = (tgt >= 0)[:keep]
+        # Unit states (Entity.states, clapha-engine); the aim's world x, y is rotated per seat below.
+        states = np.zeros((keep, UNIT_STATES), np.float32)
+        aims = []
+        for i, ent in enumerate(ents[:keep]):
+            if ent.states is not None:
+                states[i] = ent.states[:UNIT_STATES]
+                if ent.states[UNIT_STATES] is not None:
+                    aims.append((i, ent.states[UNIT_STATES], ent.states[UNIT_STATES + 1]))
+        dx_col, dy_col = UNIT_STATE_NAMES.index('aim_dx'), UNIT_STATE_NAMES.index('aim_dy')
 
         p = state.players
         tick = _F32(state.tick)
@@ -345,7 +362,13 @@ class Observer:
             row = {
                 'ent_obj': np.zeros(MAX_ENTITIES, np.int64), 'ent_side': np.zeros(MAX_ENTITIES, np.int64),
                 'ent_type': np.zeros(MAX_ENTITIES, np.int64), 'ent_cell': np.zeros(MAX_ENTITIES, np.int64),
-                'ent_float': np.zeros((MAX_ENTITIES, ENTITY_FLOATS), np.float32)}
+                'ent_float': np.zeros((MAX_ENTITIES, ENTITY_FLOATS), np.float32),
+                'ent_state': np.zeros((MAX_ENTITIES, UNIT_STATES), np.float32)}
+            row['ent_state'][:keep] = states
+            for i, ax, ay in aims:  # where a projectile flies, relative to it, in this seat's frame
+                sx, sy = (-1, -1) if owner == 1 else (1, 1)
+                row['ent_state'][i, dx_col] = np.float32(np.clip(sx * (ax - x[i]) / 18000, -1, 1))
+                row['ent_state'][i, dy_col] = np.float32(np.clip(sy * (ay - y[i]) / 32000, -1, 1))
             row['ent_obj'][:keep] = obj_ids
             row['ent_side'][:keep] = np.where(own[:keep] == owner, 1, 2)
             row['ent_type'][:keep] = typ[:keep] + 1

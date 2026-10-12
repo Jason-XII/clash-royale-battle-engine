@@ -90,7 +90,7 @@ def sample(dist):
 
 
 # ---- collectors ---------------------------------------------------------------------------------------------------------
-def collector_engine(name, out, clapha, stagger):
+def collector_engine(name, out, clapha, stagger, unit_states=False):
     """A collector process's log, CPU priority and booted engine (+ the run's vocab)."""
     log = os.open(f'{out}/logs/collector-{name}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     os.dup2(log, 1)
@@ -99,12 +99,12 @@ def collector_engine(name, out, clapha, stagger):
     os.nice(5)  # the decision servers are the bottleneck on a busy node: let them run first
     torch.set_num_threads(1)
     from native_engine.clapha import ClaphaEngine
-    return ClaphaEngine(clapha), D.load_vocab(Path(out) / 'vocab.json')
+    return ClaphaEngine(clapha, unit_states=unit_states), D.load_vocab(Path(out) / 'vocab.json')
 
 
 def collector(index, args, learner, servers):
     """A collector on the learner's node, connected by pipes (one to every decision server)."""
-    engine, vocab = collector_engine(index, args.out, args.clapha, index // 4 * 8)
+    engine, vocab = collector_engine(index, args.out, args.clapha, index // 4 * 8, args.unit_states)
     play_games(index, args.delay, engine, vocab, learner, servers)
     for conn in servers:
         conn.close()
@@ -205,6 +205,7 @@ LAYOUT = [(k, np.int64, (D.MAX_ENTITIES,)) for k in ('ent_obj', 'ent_side', 'ent
     ('rev_card', np.int64, (D.REVEALED,)), ('hand_card', np.int64, (4,)), ('next_card', np.int64, ()),
     ('cycle_card', np.int64, (3,)), ('pending_card', np.int64, ()), ('opp_deck', np.int64, (8,)),
     ('ent_float', np.float32, (D.MAX_ENTITIES, D.ENTITY_FLOATS)), ('rev_age', np.float32, (D.REVEALED,)),
+    ('ent_state', np.float32, (D.MAX_ENTITIES, D.UNIT_STATES)),
     ('scalars', np.float32, (D.SCALARS,)), ('hand_cost', np.float32, (4,)), ('extras', np.float32, (D.EXTRAS,)),
     ('slot_ok', np.bool_, (4,)), ('ability_ok', np.bool_, ())]
 assert sorted(k for k, _, _ in LAYOUT) == sorted(INPUT_KEYS)
@@ -586,7 +587,7 @@ def remote(slot, run):
     raise_thread_limit()
     first = endpoint(run)
     name = f'{socket.gethostname()}-{os.getppid()}-{slot}'
-    engine, vocab = collector_engine(name, first['out'], first['clapha'], slot // 4 * 8)
+    engine, vocab = collector_engine(name, first['out'], first['clapha'], slot // 4 * 8, first.get('unit_states', False))
     while True:
         learner, servers = None, []
         try:
@@ -648,6 +649,9 @@ def main():
     parser.add_argument('--self-play', type=float, default=0.5)
     parser.add_argument('--snapshot-every', type=int, default=150, help='updates between frozen snapshots')
     parser.add_argument('--delay', type=int, default=D.DEPLOY_DELAY)
+    parser.add_argument('--unit-states', action='store_true', help="collectors read clapha-engine's unit states "
+                        '(effects, invisible / underground, charge, projectiles ...) into the ent_state input: '
+                        'about +0.4 ms of engine time per decision (needs clapha-engine >= a9dceac)')
     parser.add_argument('--lr', type=float, default=2e-5)
     parser.add_argument('--epochs', type=int, default=2)
     parser.add_argument('--minibatch', type=int, default=8, help='games per gradient step')
@@ -724,7 +728,7 @@ def main():
         endpoint = {'learner': [ip, learner_listener.address[1]],
                     'servers': [[ip, listener.address[1]] for listener in server_listeners],
                     'authkey': authkey.hex(), 'host': socket.gethostname(), 'clapha': args.clapha,
-                    'out': str(out.resolve()), 'delay': args.delay, 'started': time.time()}
+                    'out': str(out.resolve()), 'delay': args.delay, 'unit_states': args.unit_states, 'started': time.time()}
         path = out / 'endpoint.json'
         path.write_text(json.dumps(endpoint))
         path.chmod(0o600)  # the key admits collectors

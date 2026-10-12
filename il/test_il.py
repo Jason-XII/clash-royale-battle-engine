@@ -86,7 +86,7 @@ class AddedLayers(unittest.TestCase):
         from .model import load_weights
         torch.manual_seed(0)
         model = Policy(40).eval()
-        old = {k: v for k, v in model.state_dict().items() if not k.startswith(('extras.', 'matchup.'))}
+        old = {k: v for k, v in model.state_dict().items() if not k.startswith(('extras.', 'matchup.', 'unit_state.'))}
         fresh = Policy(40).eval()
         load_weights(fresh, old)
         x = {'ent_obj': torch.randint(0, 40, (2, 3, D.MAX_ENTITIES)), 'ent_side': torch.randint(0, 3, (2, 3, D.MAX_ENTITIES)),
@@ -97,9 +97,10 @@ class AddedLayers(unittest.TestCase):
              'next_card': torch.randint(0, 40, (2, 3)), 'slot_ok': torch.ones(2, 3, 4, dtype=torch.bool),
              'extras': torch.rand(2, 3, D.EXTRAS), 'cycle_card': torch.randint(0, 40, (2, 3, 3)),
              'pending_card': torch.randint(0, 40, (2, 3)), 'ability_ok': torch.ones(2, 3, dtype=torch.bool),
-             'opp_deck': torch.randint(0, 40, (2, 3, 8))}
+             'opp_deck': torch.randint(0, 40, (2, 3, 8)), 'ent_state': torch.randn(2, 3, D.MAX_ENTITIES, D.UNIT_STATES)}
         blank = dict(x, extras=torch.zeros(2, 3, D.EXTRAS), cycle_card=torch.zeros(2, 3, 3, dtype=torch.long),
-                     pending_card=torch.zeros(2, 3, dtype=torch.long), opp_deck=torch.zeros(2, 3, 8, dtype=torch.long))
+                     pending_card=torch.zeros(2, 3, dtype=torch.long), opp_deck=torch.zeros(2, 3, 8, dtype=torch.long),
+                     ent_state=torch.zeros(2, 3, D.MAX_ENTITIES, D.UNIT_STATES))
         with torch.no_grad():
             got, want = fresh(x), fresh(blank)
         self.assertTrue(torch.equal(got[0], want[0]) and torch.equal(got[1], want[1]))
@@ -379,6 +380,44 @@ class EngineFeatures(unittest.TestCase):
                 known = [0, 1, 2, 3, D.EXTRAS - 1]
                 np.testing.assert_allclose(online['extras'][0, 0, known].numpy(), cached['extras'][t, known],
                                            err_msg=f'extras t={t}')
+
+
+class UnitStates(unittest.TestCase):
+    """clapha-engine's unit states: carried by Entity.states, rows built by Observer, a zero-initialised layer."""
+
+    def test_tuple_and_rows(self):
+        from native_engine.clapha import unit_state_tuple
+        from native_engine.engine import Entity, Player, State
+        frozen = unit_state_tuple({'kind': 'unit', 'hidden': False, 'immune': True, 'invisible': False, 'airborne': True,
+                                   'buffs': [{'stopsMovement': True, 'stopsAttacks': True, 'remainingMs': 2500,
+                                              'speedPercent': -100, 'hitSpeedPercent': -100}],
+                                   'attack': {'cycleMs': 600, 'hitSpeedMs': 1200, 'loadMs': 300, 'dashCooldownMs': 750},
+                                   'charge': 5000, 'pushed': True, 'pushRemainingMs': 400, 'spawnTimerMs': 2000,
+                                   'ability': {'phase': 'active', 'used': True}})
+        names = dict(zip(D.UNIT_STATE_NAMES, frozen))
+        self.assertEqual((names['immune'], names['airborne'], names['stops_movement'], names['stops_attacks']), (1, 1, 1, 1))
+        self.assertAlmostEqual(names['stopped_s'], 2.5)
+        self.assertAlmostEqual(names['speed_effect'], -1.0)
+        self.assertAlmostEqual(names['attack_cycle'], 0.5)
+        self.assertAlmostEqual(names['run_up_charge'], 0.5)
+        self.assertAlmostEqual(names['pushed_s'], 0.4)
+        self.assertEqual((names['ability_on'], names['ability_used']), (1, 1))
+        shot = unit_state_tuple({'kind': 'projectile', 'aimX': 9000 + 1800, 'aimY': 16000 - 3200})
+        self.assertEqual(shot[D.UNIT_STATES:], (10800, 12800))
+        ents = (Entity(7, 0, 26000000, 9000, 16000, 600, 600, None, None, 'troop', None, frozen),
+                Entity(8, 1, -1, 9000, 16000, None, None, None, None, 'projectile', None, shot),
+                Entity(9, 1, 26000001, 3000, 3000, 300, 300, None, None, 'troop', None))
+        players = tuple(Player(o, 50000, (), (), (), ()) for o in (0, 1))
+        state = State(1, 100, False, None, (0, 0), players, ents, (), 1)
+        rows = D.Observer({26000000: 2, 26000001: 3}).observe(state)
+        for owner, row in enumerate(rows):
+            self.assertEqual(row['ent_state'].dtype, np.float32)
+            np.testing.assert_allclose(row['ent_state'][0, :16], np.float32(frozen[:16]), rtol=1e-6)
+            self.assertFalse(row['ent_state'][2].any())  # no states read: zeros
+            sign = -1 if owner == 1 else 1   # the aim turns with the seat, like positions
+            col = D.UNIT_STATE_NAMES.index('aim_dx')
+            np.testing.assert_allclose(row['ent_state'][1, col:col + 2], [sign * 0.1, sign * -0.1], rtol=1e-6)
+
 
 
 if __name__ == '__main__':

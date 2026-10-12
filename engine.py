@@ -73,6 +73,9 @@ class Entity:
     attack_cooldown_ms: int | None  # Zero means ready; rounded up to a 50 ms tick.
     entity_type: str  # troop, building, projectile or area
     deployment_remaining_ms: int | None
+    # clapha-engine's unit states (il.data.UNIT_STATE_NAMES order; aim as world x, y): None where the engine does not
+    # give them (the emulator probe, IL replays) -- the features are then zeros.
+    states: tuple | None = None
 
 
 @dataclass(frozen=True)

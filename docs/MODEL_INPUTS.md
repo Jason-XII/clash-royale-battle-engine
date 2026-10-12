@@ -18,6 +18,12 @@ action, evolution per hand slot (next play evolved, progress), the next three cy
 (regeneration measured on the cache: 1 per 2.8 s, x2 from tick 2400, x3 from 4800). The opponent's whole deck feeds the
 value head only (training-time information, never a decision). Rows below say "has (2026-10-12)" where this applies.
 
+**Update 2026-10-12** (Arron's PR): clapha-engine reads the (B) states below on both builds (`Reader.unit_states()`, checked
+card by card in its docs/engine/UNIT_STATES.md). `--unit-states` puts 19 of them per unit into the `ent_state` input
+(names in il/data.py `UNIT_STATE_NAMES`; a zero-initialised layer, so older checkpoints play as before). It costs about
+0.4 ms of engine time per decision (measured in x86 emulation: 0.41 -> 0.80 ms per `ClaphaEngine.step`), so it is off
+by default. Rows below say "has with --unit-states" where this applies.
+
 Status words: **missing** (not in the features), **partial**, **has**. "Checked" means verified on the engine; anything
 not marked checked is from reading the code.
 
@@ -25,22 +31,22 @@ not marked checked is from reading the code.
 
 | What | Why | Now | Source |
 |---|---|---|---|
-| Attack phase (windup / hit / cooldown) and time into it | when the next hit lands; whether a stun resets it | partial (reload timer only) | (A) the reader gives attack stage, timeline and load time per unit; their meaning per card to be checked |
+| Attack phase (windup / hit / cooldown) and time into it | when the next hit lands; whether a stun resets it | **has with `--unit-states` (`ent_state`)**: fraction of the attack cycle, load time | clapha-engine `Reader.unit_states()` `attack` (checked per card) |
 | Which unit it targets (and where) | pulls, kiting, who dies next | partial (has a target: yes/no) | (A) exact target id and target position |
-| Run-up charge (Prince, Dark Prince, Battle Ram, Ram Rider) | double damage; stun resets it | missing | (A) movement charge progress; to be checked per card |
-| Damage ramp on one target (Inferno Tower / Dragon, Mighty Miner) | when to reset it | missing | (B) |
-| Charge-up before one big shot (Sparky, …) | the stun / Zap window | missing | (A?) probably the attack timeline; to be checked |
-| Dashes, jumps, hooks (Bandit, Boss Bandit, Mega Knight, Fisherman, Golden Knight, …) | invulnerable during a dash, landing damage | missing | (B) |
-| Frozen / slowed / raged / stunned / poisoned, time left | value of every trade | missing | (B) |
-| **Can't act**: frozen, held by vines, netted, knocked into the air (by an ability), and for how long | whether it can attack / move now | missing | (B) all of these should be one list of effects per unit in the engine (the buff component FirstLight's probe documents); read the list, not each effect separately |
-| **Invisible** (Royal Ghost, Archer Queen ability): can't be targeted, **can** take area damage | spells still hit it | missing | (B) |
-| **Underground** (Miner / Drill / Mighty Miner travelling, Tesla hidden): can't be targeted, **can't** be hurt | nothing hits it | missing | (B) |
+| Run-up charge (Prince, Dark Prince, Battle Ram, Ram Rider) | double damage; stun resets it | **has with `--unit-states` (`ent_state`)** | clapha-engine `Reader.unit_states()` `charge` |
+| Damage ramp on one target (Inferno Tower / Dragon, Mighty Miner) | when to reset it | missing | (A) clapha-engine `Reader.unit_states()` `attack.hitCount` / stage: available, not yet an input |
+| Charge-up before one big shot (Sparky, …) | the stun / Zap window | **has with `--unit-states` (`ent_state`)** (load time) | clapha-engine `Reader.unit_states()` `attack.loadMs` (Sparky's charge-up) |
+| Dashes, jumps, hooks (Bandit, Boss Bandit, Mega Knight, Fisherman, Golden Knight, …) | invulnerable during a dash, landing damage | **has with `--unit-states` (`ent_state`)**: immune, dash cooldown | clapha-engine `Reader.unit_states()` `immune`, `attack.dashCooldownMs`; dash state names not an input yet; Golden Knight hop index open |
+| Frozen / slowed / raged / stunned / poisoned, time left | value of every trade | **has with `--unit-states` (`ent_state`)**: speed and hit-speed effects (summed) | clapha-engine `Reader.unit_states()` `buffs` (every effect with time left) |
+| **Can't act**: frozen, held by vines, netted, knocked into the air (by an ability), and for how long | whether it can attack / move now | **has with `--unit-states` (`ent_state`)**: can't move / can't attack and the longest such time left, airborne, push time left | clapha-engine `Reader.unit_states()` `buffs[].stopsMovement / stopsAttacks`, `airborne`, `pushed`; E-Wiz / Lightning / E-Spirit stuns, Log / Snowball pushes: open in clapha-engine |
+| **Invisible** (Royal Ghost, Archer Queen ability): can't be targeted, **can** take area damage | spells still hit it | **has with `--unit-states` (`ent_state`)** | clapha-engine `Reader.unit_states()` `invisible` (Poison still hurts an invisible Royal Ghost: checked) |
+| **Underground** (Miner / Drill / Mighty Miner travelling, Tesla hidden): can't be targeted, **can't** be hurt | nothing hits it | **has with `--unit-states` (`ent_state`)** (hidden) | clapha-engine `Reader.unit_states()` `hidden` (the engine's own check; Miner / Drill / Tesla: checked) |
 | Evolved or not, hero or not (per unit) | they behave differently | missing | (A) the unit's form id |
 | Hero / champion ability (英雄技能资讯): **whether it is in its ability now, how long the ability has lasted so far, whether the ability has been used already, Boss Bandit's number of uses**; plus cooldown and charges | ability timing; what is left of a hero | partial (2026-10-12): own controller's ready / casting / charges / cooldown | (A) has; (B) per unit: in ability, time into it, used yet, use count |
-| Spell areas with a duration (Graveyard, Poison, Freeze, Tornado, Earthquake, …): time elapsed / left | how many more Skeletons, how long the freeze lasts | missing (position only) | (B) |
+| Spell areas with a duration (Graveyard, Poison, Freeze, Tornado, Earthquake, …): time elapsed / left | how many more Skeletons, how long the freeze lasts | **has with `--unit-states` (`ent_state`)** (time left) | clapha-engine `Reader.unit_states()` areas `remainingMs` |
 | "Just happened": died, spawned, got hit, spell landed | events are part of the moment's state | missing | (A) derivable from the change between two decisions |
-| **Projectiles in flight**, including after their owner died (e.g. the Executioner's axe): direction, speed, where they will go | not placing a card into their path | partial (position + "projectile" only) | (B) |
-| **What units leave behind** (e.g. Giant Skeleton's bomb): time until it goes off | placement and retreat | partial (a unit, no timer) | (B) |
+| **Projectiles in flight**, including after their owner died (e.g. the Executioner's axe): direction, speed, where they will go | not placing a card into their path | **has with `--unit-states` (`ent_state`)**: where it flies, relative to it, per seat | clapha-engine `Reader.unit_states()` projectiles: aim point, homing target, shooter |
+| **What units leave behind** (e.g. Giant Skeleton's bomb): time until it goes off | placement and retreat | **has with `--unit-states` (`ent_state`)**: spawn timer / bomb fuse | clapha-engine `Reader.unit_states()` `spawnTimerMs`, kind `timed` `fuseMs`, `leavesOnDeath` |
 
 Card by card: charging and the other special states differ per card (Bandit and Boss Bandit dash, Sparky, Inferno,
 Mother Witch, Monk, …). The list per card, with how each is read and whether it is checked, is kept with the engine
