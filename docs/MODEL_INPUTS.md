@@ -25,12 +25,15 @@ not marked checked is from reading the code.
 | Charge-up before one big shot (Sparky, …) | the stun / Zap window | missing | (A?) probably the attack timeline; to be checked |
 | Dashes, jumps, hooks (Bandit, Boss Bandit, Mega Knight, Fisherman, Golden Knight, …) | invulnerable during a dash, landing damage | missing | (B) |
 | Frozen / slowed / raged / stunned / poisoned, time left | value of every trade | missing | (B) |
+| **Can't act**: frozen, held by vines, netted, knocked into the air (by an ability), and for how long | whether it can attack / move now | missing | (B) all of these should be one list of effects per unit in the engine (the buff component FirstLight's probe documents); read the list, not each effect separately |
 | **Invisible** (Royal Ghost, Archer Queen ability): can't be targeted, **can** take area damage | spells still hit it | missing | (B) |
 | **Underground** (Miner / Drill / Mighty Miner travelling, Tesla hidden): can't be targeted, **can't** be hurt | nothing hits it | missing | (B) |
 | Evolved or not, hero or not (per unit) | they behave differently | missing | (A) the unit's form id |
 | Hero / champion ability (英雄技能资讯): **whether it is in its ability now, how long the ability has lasted so far, whether the ability has been used already, Boss Bandit's number of uses**; plus cooldown and charges | ability timing; what is left of a hero | missing (abilities masked) | (A) own: cooldown, charges, button state; (B) per unit: in ability, time into it, used yet, use count |
 | Spell areas with a duration (Graveyard, Poison, Freeze, Tornado, Earthquake, …): time elapsed / left | how many more Skeletons, how long the freeze lasts | missing (position only) | (B) |
 | "Just happened": died, spawned, got hit, spell landed | events are part of the moment's state | missing | (A) derivable from the change between two decisions |
+| **Projectiles in flight**, including after their owner died (e.g. the Executioner's axe): direction, speed, where they will go | not placing a card into their path | partial (position + "projectile" only) | (B) |
+| **What units leave behind** (e.g. Giant Skeleton's bomb): time until it goes off | placement and retreat | partial (a unit, no timer) | (B) |
 
 Card by card: charging and the other special states differ per card (Bandit and Boss Bandit dash, Sparky, Inferno,
 Mother Witch, Monk, …). The list per card, with how each is read and whether it is checked, is kept with the engine
