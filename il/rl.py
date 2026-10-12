@@ -39,6 +39,7 @@ from .model import INPUT_KEYS, Policy, load_weights
 from .train import collate
 
 TEMPERATURE = 0.5
+HOLD_LIMIT = 60  # s a collector's next game may be held back for a full backlog (well under REPLY_TIMEOUT)
 REPLY_TIMEOUT = 180  # s; the learner can be busy with an update (~20 s). A node that dies sends nothing, so a
                      # collector that waits longer treats the connection as gone and reconnects (il.rl join).
 CROWN_REWARD = 0.1
@@ -611,6 +612,8 @@ def main():
     parser.add_argument('--servers', type=int, default=3, help='decision server processes (each one Python thread)')
     parser.add_argument('--batch-ms', type=float, default=2.0, help='how long a server gathers decisions per GPU call')
     parser.add_argument('--games-per-update', type=int, default=128)
+    parser.add_argument('--max-backlog', type=int, help='finished trajectories waiting for the learner before collectors '
+                        "are held back (default: --games-per-update; 0: no limit)")
     parser.add_argument('--updates', type=int, default=100000)
     parser.add_argument('--self-play', type=float, default=0.5)
     parser.add_argument('--snapshot-every', type=int, default=150, help='updates between frozen snapshots')
@@ -734,10 +737,33 @@ def main():
 
     ready, failed = queue.Queue(), []  # finished trajectories; why collecting stopped
     played = 0
+    held, held_time = [], [0.0]  # collectors waiting for their next game (conn, since); seconds held this cycle
+    max_backlog = args.games_per_update if args.max_backlog is None else args.max_backlog
+
+    def new_game(conn):
+        """The next game's spec for a collector. A frozen opponent's games all go to its home server (pool position %
+        servers): a server then runs the current model and its own opponents, not every model of the pool, each round."""
+        nonlocal self_play_games
+        learner_seat = random.randrange(2)
+        models = ['current', 'current']
+        if random.random() >= args.self_play:
+            models[1 - learner_seat] = pick_opponent()
+            server = frozen.index(models[1 - learner_seat]) % args.servers
+        else:
+            server = self_play_games % args.servers
+            self_play_games += 1
+        decks, train = random.choice(deck_pairs), None
+        if learner_deck is not None:  # specialist: our deck vs a real ladder deck; only our seat learns
+            decks = dict(decks, decks=[None, None])
+            decks['decks'][learner_seat] = learner_deck
+            decks['decks'][1 - learner_seat] = random.choice(random.choice(deck_pairs)['decks'])
+            train = [learner_seat]
+        conn.send(dict(decks=decks, seed=random.randrange(1 << 30), models=models, server=server,
+                       **({'train': train} if train else {})))
 
     def serve_collectors():
         """A thread that keeps the collectors busy (new games, trajectories) while the main thread trains."""
-        nonlocal next_remote, self_play_games, played
+        nonlocal next_remote, played
         try:
             while True:
                 while not arrivals.empty():
@@ -747,35 +773,34 @@ def main():
                         raise RuntimeError('every collector died')
                     time.sleep(0.5)
                     continue
-                for conn in wait(conns, timeout=1):
+                # With a full update's worth of trajectories already waiting (--max-backlog), collectors' next games
+                # are held back until the learner takes them (at most HOLD_LIMIT s): otherwise, when collectors
+                # outrun the update, the queue grows without end (memory, and data from ever older weights).
+                now = time.time()
+                while held and (not max_backlog or ready.qsize() < max_backlog or now - held[0][1] > HOLD_LIMIT):
+                    conn, since = held.pop(0)
+                    held_time[0] += now - since
+                    if conn in conns:
+                        try:
+                            new_game(conn)
+                        except (EOFError, OSError):
+                            pass  # gone meanwhile; the read below notices
+                for conn in wait(conns, timeout=0.2 if held else 1):
                     try:
                         kind, index, payload = conn.recv()
                     except (EOFError, OSError):  # a collector died, or a remote one's job ended; its log says why
                         conns.remove(conn)
+                        held[:] = [h for h in held if h[0] is not conn]
                         print(f'a collector left ({len(conns)} connected); see {out}/logs/', flush=True)
                         continue
                     if kind == 'hello':  # a remote collector: its number
                         conn.send({'index': next_remote})
                         next_remote += 1
                     elif kind == 'new_game':
-                        # A frozen opponent's games all go to its home server (pool position % servers): a server
-                        # then runs the current model and its own opponents, not every model of the pool, each round.
-                        learner_seat = random.randrange(2)
-                        models = ['current', 'current']
-                        if random.random() >= args.self_play:
-                            models[1 - learner_seat] = pick_opponent()
-                            server = frozen.index(models[1 - learner_seat]) % args.servers
+                        if max_backlog and ready.qsize() >= max_backlog:
+                            held.append((conn, time.time()))
                         else:
-                            server = self_play_games % args.servers
-                            self_play_games += 1
-                        decks, train = random.choice(deck_pairs), None
-                        if learner_deck is not None:  # specialist: our deck vs a real ladder deck; only our seat learns
-                            decks = dict(decks, decks=[None, None])
-                            decks['decks'][learner_seat] = learner_deck
-                            decks['decks'][1 - learner_seat] = random.choice(random.choice(deck_pairs)['decks'])
-                            train = [learner_seat]
-                        conn.send(dict(decks=decks, seed=random.randrange(1 << 30), models=models, server=server,
-                                       **({'train': train} if train else {})))
+                            new_game(conn)
                     elif kind == 'trajectory':
                         if payload['opponent'] != 'current':
                             results[payload['opponent']].append(payload['outcome'])
@@ -786,6 +811,7 @@ def main():
 
     threading.Thread(target=serve_collectors, daemon=True).start()
     started = last = update_end = time.time()
+    played_before = 0
     metrics = open(out / 'metrics.jsonl', 'a')
     for update_index in range(start_update, args.updates):
         # Games keep being played (with the previous weights) while an update runs; PPO's ratio uses the log-probs
@@ -799,6 +825,7 @@ def main():
             except queue.Empty:
                 pass
         waited = time.time() - update_end  # the learner's wait for this batch after the last update
+        backlog = ready.qsize()  # trajectories still waiting once this batch is taken
         collect_time, last = time.time() - last, time.time()  # wall clock per update: collection overlaps updates
         update_start = time.time()
         model.train()
@@ -820,7 +847,13 @@ def main():
         timed = [t['timing'] for t in trajectories if t['timing']]
         decisions = sum(t['decisions'] for t in timed) or 1
         outcomes = [t['outcome'] for t in trajectories if t['opponent'] != 'current']
+        collected, played_before = played - played_before, played
+        held_s, held_time[0] = held_time[0], 0.0
         row = dict(update=step, collectors=len(conns), trajectories=played, games_per_hour=round(3600 * len(timed) / max(collect_time, 1e-9)),
+                   # games_per_hour: trajectories trained on per hour; collected_per_hour: finished by collectors
+                   # (higher when collectors outrun the update; then backlog / held_s show the learner is the limit)
+                   collected_per_hour=round(3600 * collected / max(collect_time, 1e-9)), backlog=backlog, held_s=round(held_s, 1),
+                   server_ms_per_call=round(1000 * served['decide'] / max(served['batches'], 1), 2),
                    collector_ms={k: round(1000 * sum(t[k] for t in timed) / decisions, 2) for k in ('features', 'wait', 'engine')},
                    dropped_per_game=round(sum(t.get('dropped', 0) for t in timed) / max(len(timed), 1), 2),
                    server_s={k: round(served[k] / args.servers, 1) for k in ('receive', 'decide', 'reply')},
