@@ -19,10 +19,14 @@ action, evolution per hand slot (next play evolved, progress), the next three cy
 value head only (training-time information, never a decision). Rows below say "has (2026-10-12)" where this applies.
 
 **Update 2026-10-12** (Arron's PR): clapha-engine reads the (B) states below on both builds (`Reader.unit_states()`, checked
-card by card in its docs/engine/UNIT_STATES.md). `--unit-states` puts 25 of them per unit into the `ent_state` input
+card by card in its docs/engine/UNIT_STATES.md). `--unit-states` puts 31 of them per unit into the `ent_state` input
 (names in il/data.py `UNIT_STATE_NAMES`; a zero-initialised layer, so older checkpoints play as before). It costs about
 0.2-0.3 ms of engine time per decision (measured in x86 emulation, same harness: 0.41 ms per `ClaphaEngine.step` without,
-0.62-0.72 with; 0.83-0.90 before clapha-engine's faster reader of 2026-10-12), so it is off by default. Rows below say "has with --unit-states" where this applies.
+0.62-0.72 with; 0.83-0.90 before clapha-engine's faster reader of 2026-10-12), so it is off by default. **Live play:** Arron's
+console reads the same states from the running game and builds the same vector (checked offline: identical on 413,722
+object-ticks); its offsets on the phone build are still to be confirmed on one recorded battle, so keep live-play
+checkpoints without `--unit-states` until then. Every standard card, evolution and hero form was played for this
+(clapha-engine docs/engine/CARD_SWEEP.md). Rows below say "has with --unit-states" where this applies.
 
 Status words: **missing** (not in the features), **partial**, **has**. "Checked" means verified on the engine; anything
 not marked checked is from reading the code.
@@ -37,7 +41,9 @@ not marked checked is from reading the code.
 | Damage ramp on one target (Inferno Tower / Dragon, Mighty Miner) | when to reset it | **has with `--unit-states` (`ent_state`)**: ramp stage 0 / 0.5 / 1 | clapha-engine `Reader.unit_states()` `attack.stage` (checked: damage per hit by stage, reset by a stun or a new target) |
 | Charge-up before one big shot (Sparky, …) | the stun / Zap window | **has with `--unit-states` (`ent_state`)** (load time) | clapha-engine `Reader.unit_states()` `attack.loadMs` (Sparky's charge-up) |
 | Dashes, jumps, hooks (Bandit, Boss Bandit, Mega Knight, Fisherman, Golden Knight, Hog Rider's river jump, …) | invulnerable during a dash, landing damage | **has with `--unit-states` (`ent_state`)**: dashing, river jump, immune, dash cooldown | clapha-engine `Reader.unit_states()` `stateName` (`dashing`, `river_jump`, `hooking`, `reeling_to_building`), `immune`, `attack.dashCooldownMs`; Golden Knight hop index open |
-| Shield (Dark Prince, Guards, Royal Recruits): shield left | a Zap / Log breaks it; the hit that breaks it does not reach the hit points | **has with `--unit-states` (`ent_state`)**: shield left / full | clapha-engine `Reader.unit_states()` `shield`, `shieldMax` (checked on both builds) |
+| Height, jumps, things on their way back: Mega Knight's jump (height, time left), a unit knocked up, the Executioner's axe / Fisherman's hook out and back, the Fisherman's countdown before the hook, where a Miner / Goblin Drill comes up, the Royal Ghost's time until invisible again, Golden Knight's hop | landing damage, dodging the axe, where the Miner pops | **has with `--unit-states` (`ent_state`)** | clapha-engine `Reader.unit_states()` `z`, `jumpRemainingMs`, `attack.returnShot`, `attack.specialCooldownMs`, `surfaceAt`, `invisibleAgainMs`, `attack.dashHop` (all checked on both builds) |
+| What an effect does beyond speed: damage reduction (evolved Knight), heals, curses | the value of a trade | missing: effects enter only by speed / hit speed / can't act | clapha-engine `buffs[].name` / `globalId` (every effect, by id): an effect-id embedding would add it |
+| Shield (Dark Prince, Guards, Royal Recruits; also Hero Knight, evolved Wizard / Skeleton Army, Royal Delivery's recruit): shield left | a Zap / Log breaks it; the hit that breaks it does not reach the hit points | **has with `--unit-states` (`ent_state`)**: shield left / full | clapha-engine `Reader.unit_states()` `shield`, `shieldMax` (checked on both builds) |
 | Frozen / slowed / raged / stunned / poisoned, time left | value of every trade | **has with `--unit-states` (`ent_state`)**: speed and hit-speed effects (summed) | clapha-engine `Reader.unit_states()` `buffs` (every effect with time left) |
 | **Can't act**: frozen, held by vines, netted, knocked into the air (by an ability), and for how long | whether it can attack / move now | **has with `--unit-states` (`ent_state`)**: can't move / can't attack and the longest such time left, airborne, push time left | clapha-engine `Reader.unit_states()` `buffs[].stopsMovement / stopsAttacks`, `airborne`, `pushed` (Electro Wizard / Lightning / Electro Spirit stuns, Log / Snowball pushes: checked) |
 | **Invisible** (Royal Ghost, Archer Queen ability): can't be targeted, **can** take area damage | spells still hit it | **has with `--unit-states` (`ent_state`)** | clapha-engine `Reader.unit_states()` `invisible` (Poison still hurts an invisible Royal Ghost: checked) |
