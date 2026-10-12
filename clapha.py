@@ -95,6 +95,7 @@ def unit_state_tuple(u):
             hit += b.get('hitSpeedPercent') or 0
     attack = u.get('attack') or _EMPTY
     ability = u.get('ability') or _EMPTY
+    shot = attack.get('returnShot')
     hit_speed = attack.get('hitSpeedMs') or 0
     timer = (u.get('remainingMs') if kind == 'area' else u.get('fuseMs') if kind == 'timed' else u.get('spawnTimerMs'))
     values = (
@@ -119,8 +120,20 @@ def unit_state_tuple(u):
         float(u.get('state') == 5),  # jumping the river (Hog Rider, Royal Hogs)
         _ms_s(ability.get('sinceUseMs'), 10),  # time since this unit's last ability use (0 before any: see ability_used)
         min(max((ability.get('uses') or 0) / ability['maxCharges'], 0.0), 1.0) if ability.get('maxCharges') else 0.0,
+        min(max(float(u.get('z') or 0) / 3000.0, 0.0), 2.0),  # height: Mega Knight's jump (3000), a unit knocked up
+        _ms_s(u.get('jumpRemainingMs'), 2),
+        min(max(shot['elapsedMs'] / shot['totalMs'], 0.0), 1.0) if shot else 0.0,  # Executioner's axe / Fisherman's hook out
+        _ms_s(attack.get('specialCooldownMs'), 5),  # the Fisherman's countdown before the hook
+        _ms_s(u.get('invisibleAgainMs'), 5),  # Royal Ghost: time until invisible again
+        min(float(attack.get('dashHop') or 0) / 3.0, 1.0),  # Golden Knight's hop in its dash chain
     )
-    aim = (u['aimX'], u['aimY']) if kind == 'projectile' and u.get('aimX') is not None else (None, None)
+    # where it is heading: a projectile's aim, or the point an underground Miner / Goblin Drill / Mighty Miner comes up
+    if kind == 'projectile' and u.get('aimX') is not None:
+        aim = (u['aimX'], u['aimY'])
+    elif u.get('surfaceAt'):
+        aim = tuple(u['surfaceAt'])
+    else:
+        aim = (None, None)
     return values + aim
 
 

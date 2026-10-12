@@ -405,6 +405,13 @@ class UnitStates(unittest.TestCase):
         self.assertEqual((names['ability_on'], names['ability_used']), (1, 1))
         self.assertEqual((names['shield'], names['dashing'], names['river_jump']), (0.5, 1, 0))
         self.assertEqual((names['ability_since_s'], names['ability_uses']), (1.5, 0.5))
+        miner = unit_state_tuple({'kind': 'unit', 'z': 1500, 'jumpRemainingMs': 500, 'invisibleAgainMs': 1000,
+                                  'attack': {'returnShot': {'elapsedMs': 750, 'totalMs': 1500}, 'specialCooldownMs': 250,
+                                             'dashHop': 3}, 'surfaceAt': (3500, 12500)})
+        got = dict(zip(D.UNIT_STATE_NAMES, miner))
+        self.assertEqual((got['height'], got['jump_s'], got['return_shot'], got['special_s'], got['invisible_again_s'],
+                          got['dash_hop']), (0.5, 0.5, 0.5, 0.25, 1.0, 1.0))
+        self.assertEqual(miner[D.UNIT_STATES:], (3500, 12500))   # heading for: where it comes up
         ramp = unit_state_tuple({'kind': 'unit', 'attack': {'stage': 2, 'hitSpeedMs': 400}, 'state': 5})
         self.assertEqual((ramp[D.UNIT_STATE_NAMES.index('ramp_stage')], ramp[D.UNIT_STATE_NAMES.index('river_jump')]), (1, 1))
         shot = unit_state_tuple({'kind': 'projectile', 'aimX': 9000 + 1800, 'aimY': 16000 - 3200})
