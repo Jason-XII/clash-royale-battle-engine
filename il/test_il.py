@@ -97,10 +97,12 @@ class AddedLayers(unittest.TestCase):
              'next_card': torch.randint(0, 40, (2, 3)), 'slot_ok': torch.ones(2, 3, 4, dtype=torch.bool),
              'extras': torch.rand(2, 3, D.EXTRAS), 'cycle_card': torch.randint(0, 40, (2, 3, 3)),
              'pending_card': torch.randint(0, 40, (2, 3)), 'ability_ok': torch.ones(2, 3, dtype=torch.bool),
-             'opp_deck': torch.randint(0, 40, (2, 3, 8)), 'ent_state': torch.randn(2, 3, D.MAX_ENTITIES, D.UNIT_STATES)}
+             'opp_deck': torch.randint(0, 40, (2, 3, 8)), 'ent_state': torch.randn(2, 3, D.MAX_ENTITIES, D.UNIT_STATES),
+             'ent_effect': torch.randint(0, D.EFFECT_VOCAB, (2, 3, D.MAX_ENTITIES, D.UNIT_EFFECTS))}
         blank = dict(x, extras=torch.zeros(2, 3, D.EXTRAS), cycle_card=torch.zeros(2, 3, 3, dtype=torch.long),
                      pending_card=torch.zeros(2, 3, dtype=torch.long), opp_deck=torch.zeros(2, 3, 8, dtype=torch.long),
-                     ent_state=torch.zeros(2, 3, D.MAX_ENTITIES, D.UNIT_STATES))
+                     ent_state=torch.zeros(2, 3, D.MAX_ENTITIES, D.UNIT_STATES),
+                     ent_effect=torch.zeros(2, 3, D.MAX_ENTITIES, D.UNIT_EFFECTS, dtype=torch.long))
         with torch.no_grad():
             got, want = fresh(x), fresh(blank)
         self.assertTrue(torch.equal(got[0], want[0]) and torch.equal(got[1], want[1]))
@@ -405,17 +407,23 @@ class UnitStates(unittest.TestCase):
         self.assertEqual((names['ability_on'], names['ability_used']), (1, 1))
         self.assertEqual((names['shield'], names['dashing'], names['river_jump']), (0.5, 1, 0))
         self.assertEqual((names['ability_since_s'], names['ability_uses']), (1.5, 0.5))
+        fortify = next(i for i, n in __import__('json').loads((__import__('pathlib').Path(D.__file__).parent / 'effects.json').read_text())['effects'] if n == 'Knight_Fortify_EV1')
+        knight = unit_state_tuple({'kind': 'unit', 'buffs': [{'globalId': 9999, 'remainingMs': 100}, {'globalId': fortify, 'remainingMs': 900}]})
+        self.assertEqual(knight[D.UNIT_STATES + 2:], (fortify, 9999, 0))      # longest time left first
+        rows = D.Observer({26000000: 2}).observe(State(1, 100, False, None, (0, 0), tuple(Player(o, 0, (), (), (), ()) for o in (0, 1)),
+                                                       (Entity(7, 0, 26000000, 9000, 16000, 600, 600, None, None, 'troop', None, knight),), (), 1))
+        self.assertEqual(rows[0]['ent_effect'][0].tolist(), [D.EFFECTS[fortify], 1, 0])   # unlisted id -> 1, none -> 0
         miner = unit_state_tuple({'kind': 'unit', 'z': 1500, 'jumpRemainingMs': 500, 'invisibleAgainMs': 1000,
                                   'attack': {'returnShot': {'elapsedMs': 750, 'totalMs': 1500}, 'specialCooldownMs': 250,
                                              'dashHop': 3}, 'surfaceAt': (3500, 12500)})
         got = dict(zip(D.UNIT_STATE_NAMES, miner))
         self.assertEqual((got['height'], got['jump_s'], got['return_shot'], got['special_s'], got['invisible_again_s'],
                           got['dash_hop']), (0.5, 0.5, 0.5, 0.25, 1.0, 1.0))
-        self.assertEqual(miner[D.UNIT_STATES:], (3500, 12500))   # heading for: where it comes up
+        self.assertEqual(miner[D.UNIT_STATES:D.UNIT_STATES + 2], (3500, 12500))   # heading for: where it comes up
         ramp = unit_state_tuple({'kind': 'unit', 'attack': {'stage': 2, 'hitSpeedMs': 400}, 'state': 5})
         self.assertEqual((ramp[D.UNIT_STATE_NAMES.index('ramp_stage')], ramp[D.UNIT_STATE_NAMES.index('river_jump')]), (1, 1))
         shot = unit_state_tuple({'kind': 'projectile', 'aimX': 9000 + 1800, 'aimY': 16000 - 3200})
-        self.assertEqual(shot[D.UNIT_STATES:], (10800, 12800))
+        self.assertEqual(shot[D.UNIT_STATES:D.UNIT_STATES + 2], (10800, 12800))
         ents = (Entity(7, 0, 26000000, 9000, 16000, 600, 600, None, None, 'troop', None, frozen),
                 Entity(8, 1, -1, 9000, 16000, None, None, None, None, 'projectile', None, shot),
                 Entity(9, 1, 26000001, 3000, 3000, 300, 300, None, None, 'troop', None))

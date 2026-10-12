@@ -35,6 +35,12 @@ UNIT_STATE_NAMES = ('hidden', 'immune', 'invisible', 'airborne', 'stops_movement
                     'ramp_stage', 'dashing', 'river_jump', 'ability_since_s', 'ability_uses',
                     'height', 'jump_s', 'return_shot', 'special_s', 'invisible_again_s', 'dash_hop')
 UNIT_STATES = len(UNIT_STATE_NAMES)
+# Which effects are on a unit (not only their speed / can't-act parts: the evolved Knight's damage reduction, heals, curses):
+# up to UNIT_EFFECTS effect data ids per unit, after the aim in Entity.states, embedded by the model. Ids from the game data
+# of both supported builds (il/effects.json): index 0 = none, 1 = an id not listed, 2 + position.
+UNIT_EFFECTS = 3
+EFFECTS = {int(i): 2 + k for k, (i, _name) in enumerate(json.loads((Path(__file__).parent / 'effects.json').read_text())['effects'])}
+EFFECT_VOCAB = 2 + len(EFFECTS)
 REGEN = 10000 / 56  # raw elixir per tick (1 per 2.8 s); x2 after tick 2400, x3 after 4800 (measured on the cache)
 
 
@@ -150,6 +156,7 @@ def entity_features(replay, owner, vocab, T):
         'ent_cell': np.zeros((T, MAX_ENTITIES), np.int64),
         'ent_float': np.zeros((T, MAX_ENTITIES, ENTITY_FLOATS), np.float32),
         'ent_state': np.zeros((T, MAX_ENTITIES, UNIT_STATES), np.float32),  # not in replays: zeros
+        'ent_effect': np.zeros((T, MAX_ENTITIES, UNIT_EFFECTS), np.int64),
     }
     out['ent_obj'][st, slot] = lookup(vocab, obj[keep])
     out['ent_side'][st, slot] = np.where(own[keep] == owner, 1, 2)
@@ -340,12 +347,15 @@ class Observer:
         tgt_on = (tgt >= 0)[:keep]
         # Unit states (Entity.states, clapha-engine); the aim's world x, y is rotated per seat below.
         states = np.zeros((keep, UNIT_STATES), np.float32)
+        effects = np.zeros((keep, UNIT_EFFECTS), np.int64)
         aims = []
         for i, ent in enumerate(ents[:keep]):
             if ent.states is not None:
                 states[i] = ent.states[:UNIT_STATES]
                 if ent.states[UNIT_STATES] is not None:
                     aims.append((i, ent.states[UNIT_STATES], ent.states[UNIT_STATES + 1]))
+                for k, effect in enumerate(ent.states[UNIT_STATES + 2:UNIT_STATES + 2 + UNIT_EFFECTS]):
+                    effects[i, k] = EFFECTS.get(int(effect), 1) if effect else 0
         dx_col, dy_col = UNIT_STATE_NAMES.index('aim_dx'), UNIT_STATE_NAMES.index('aim_dy')
 
         p = state.players
@@ -365,8 +375,10 @@ class Observer:
                 'ent_obj': np.zeros(MAX_ENTITIES, np.int64), 'ent_side': np.zeros(MAX_ENTITIES, np.int64),
                 'ent_type': np.zeros(MAX_ENTITIES, np.int64), 'ent_cell': np.zeros(MAX_ENTITIES, np.int64),
                 'ent_float': np.zeros((MAX_ENTITIES, ENTITY_FLOATS), np.float32),
-                'ent_state': np.zeros((MAX_ENTITIES, UNIT_STATES), np.float32)}
+                'ent_state': np.zeros((MAX_ENTITIES, UNIT_STATES), np.float32),
+                'ent_effect': np.zeros((MAX_ENTITIES, UNIT_EFFECTS), np.int64)}
             row['ent_state'][:keep] = states
+            row['ent_effect'][:keep] = effects
             for i, ax, ay in aims:  # where a projectile flies, relative to it, in this seat's frame
                 sx, sy = (-1, -1) if owner == 1 else (1, 1)
                 row['ent_state'][i, dx_col] = np.float32(np.clip(sx * (ax - x[i]) / 18000, -1, 1))

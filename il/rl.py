@@ -206,6 +206,7 @@ LAYOUT = [(k, np.int64, (D.MAX_ENTITIES,)) for k in ('ent_obj', 'ent_side', 'ent
     ('cycle_card', np.int64, (3,)), ('pending_card', np.int64, ()), ('opp_deck', np.int64, (8,)),
     ('ent_float', np.float32, (D.MAX_ENTITIES, D.ENTITY_FLOATS)), ('rev_age', np.float32, (D.REVEALED,)),
     ('ent_state', np.float32, (D.MAX_ENTITIES, D.UNIT_STATES)),
+    ('ent_effect', np.int64, (D.MAX_ENTITIES, D.UNIT_EFFECTS)),
     ('scalars', np.float32, (D.SCALARS,)), ('hand_cost', np.float32, (4,)), ('extras', np.float32, (D.EXTRAS,)),
     ('slot_ok', np.bool_, (4,)), ('ability_ok', np.bool_, ())]
 assert sorted(k for k, _, _ in LAYOUT) == sorted(INPUT_KEYS)

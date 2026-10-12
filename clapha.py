@@ -134,7 +134,9 @@ def unit_state_tuple(u):
         aim = tuple(u['surfaceAt'])
     else:
         aim = (None, None)
-    return values + aim
+    # which effects are on it (data ids, longest time left first; il.data.UNIT_EFFECTS of them, 0 = none)
+    ids = [b.get('globalId') or 0 for b in sorted(u.get('buffs') or (), key=lambda b: -(b.get('remainingMs') or 0))][:3]
+    return values + aim + tuple(ids + [0] * (3 - len(ids)))
 
 
 class ClaphaEngine:
