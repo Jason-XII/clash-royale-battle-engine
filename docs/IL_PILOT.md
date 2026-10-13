@@ -6,7 +6,9 @@ step. The full checks, and what a wrong number means: clapha-il `docs/MONITOR.md
 Arron; do not work around it.
 
 Before converting: `git pull` in ~/clapha-engine (795e83a or later: the Dagger Duchess read failed in every battle after
-an engine's first, so earlier conversions have no daggers) and in ~/clapha-il (5c7aa25 or later). Game files: Arron's Drive
+an engine's first, so earlier conversions have no daggers) and in ~/clapha-il (99ebee7 or later: the training input is built ~4x faster per core and batches carry only the
+object slots they use; every value byte-for-byte the same as before, checked on 168 player-games with
+`tools/compare_features.py`). Game files: Arron's Drive
 folder (`shasum -a 256 -c SHA256SUMS`); the collected battles are the **-v2** tar.
 
 | step | job | what must be true |
@@ -24,7 +26,8 @@ folder (`shasum -a 256 -c SHA256SUMS`); the collected battles are the **-v2** ta
 **One clapha-il.** `il/clapha_agent.py` uses `clapha_il.features.PlayerView`, which is not in ClashAlpha/clapha-il yet: push it
 there, merged with clapha-il's 2026-10-12 changes to `features.py` (time since an ability was used, the Royal Chef
 cooking clock, channel names) and `train.py` (the card loss only where the whole hand is known; --resume, --patience,
-best.pt, --val-games; several --games). The pilot, the full run and the arena must all run the same clapha-il commit,
+best.pt, --val-games; several --games; `cycle.own_views`, the fast hand reconstruction). The pilot, the full run and the
+arena must all run the same clapha-il commit,
 or the arena plays a model with inputs it was not trained on. Re-run `check_clapha_inputs.py` after the merge.
 
 Arron's mac checks of the same code (2026-10-12): 60 IL_Replay + 24 collected games converted, all kept, PASS, audit
