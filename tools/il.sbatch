@@ -20,6 +20,8 @@
 #SBATCH --output=runs/il-%j.out
 
 set -e
+# some RTX5090 nodes fail CUDA init with error 804 (a forward-compatibility libcuda on a GeForce card): name the node
+echo "$(hostname): $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)"
 PY=/public/app/miniconda3/py312_24.4.0-0/bin/python
 RUN=${RUN:?RUN=name of the run}
 GAMES=${GAMES:-$HOME/il-raw-pilot/games}
