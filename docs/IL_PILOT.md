@@ -7,7 +7,7 @@ Arron; do not work around it. Policies, what to do when something goes wrong, an
 clapha-il `docs/HANDOFF.md` (private repo) — read it first.
 
 Before converting: `git pull` in ~/clapha-engine (795e83a or later: the Dagger Duchess read failed in every battle after
-an engine's first, so earlier conversions have no daggers) and in ~/clapha-il (0155582 or later: conversion 2.7x faster with identical records; idle games left out; and from 99ebee7: the training input is built ~4x faster per core and batches carry only the
+an engine's first, so earlier conversions have no daggers) and in ~/clapha-il (b607bd1 or later: Jason's branch merged into main, nothing changed in the inputs; 0155582: conversion 2.7x faster with identical records; idle games left out; and from 99ebee7: the training input is built ~4x faster per core and batches carry only the
 object slots they use; every value byte-for-byte the same as before, checked on 168 player-games with
 `tools/compare_features.py`). Game files: Arron's Drive
 folder (`shasum -a 256 -c SHA256SUMS`); the collected battles are the **-v2** tar.
@@ -24,8 +24,8 @@ folder (`shasum -a 256 -c SHA256SUMS`); the collected battles are the **-v2** ta
 | 8. The full run | `tools/il.sbatch` (below) | the rules in "Starting the full run" all hold |
 | (later) Arron's collected battles | `tools/oracle_collected.sbatch` | not needed for the full run; for the matchup specialists |
 
-**One clapha-il.** `il/clapha_agent.py` uses `clapha_il.features.PlayerView`, which is not in ClashAlpha/clapha-il yet: push it
-there, merged with clapha-il's 2026-10-12 changes to `features.py` (time since an ability was used, the Royal Chef
+**One clapha-il.** Done 2026-10-14: Jason's branch is merged into main (b607bd1). Work on main from now on; it holds
+`PlayerView` together with clapha-il's 2026-10-12 changes to `features.py` (time since an ability was used, the Royal Chef
 cooking clock, channel names) and `train.py` (the card loss only where the whole hand is known; --resume, --patience,
 best.pt, --val-games; several --games; `cycle.own_views`, the fast hand reconstruction). The pilot, the full run and the
 arena must all run the same clapha-il commit,
@@ -55,14 +55,19 @@ leave that run out of step 2 and say so in the report.
 - the last validation: `p_play_mean` within 25% of `play_rate` (the model plays about as often as people);
 - no NaN anywhere in the validation lines.
 
-**2. Choose the size and attention.** Among `pilot-base`, `pilot-no-attention`, `pilot-large`: the lowest `best_score`;
-but when a cheaper run is within 1% of it, the cheaper one (no-attention, then base, then large).
+**2. Choose the settings** (the pilot as run, 2026-10-13: base, no-attention, no-unit-states, next-play). Between
+`pilot-base` and `pilot-no-attention`: the lower `best_score`, but no-attention when it is within 1% (cheaper). Then
+`--next-play`: keep it when `pilot-next-play`'s `timing_gain` is higher than base's and its `best_score` is not more than
+1% worse.
 
-**3. Keep unit states and effect vectors on.** If `pilot-no-unit-states` or `pilot-effect-ids` has a `best_score` more
-than 1% *better* than the run with the same size, do not start: that points at a bug in those inputs; tell Arron.
+**3. Keep unit states on.** If `pilot-no-unit-states` has a `best_score` more than 1% *better* than `pilot-base`, do not
+start: that points at a bug in those inputs; tell Arron.
 
-**4. Start it** with the chosen run's flags (none for `pilot-base`; `--attention-layers 0`; or `--core 1024
---conv-channels 160 --object-dim 192`) after the full conversion:
+**bf16 and the cosine schedule** change the numbers (slightly) and were not part of the pilot: Arron decides. Without his
+answer, run the full run as the pilot ran (no `--bf16`, no `--cosine`).
+
+**4. Start it** with the chosen flags (none for `pilot-base`; `--attention-layers 0`; plus `--next-play 0.5` if kept)
+after the full conversion:
 
     RUN=il-full GAMES=~/il-raw/games VOCAB=~/il-runs/vocab-full.json LIMIT=0 EPOCHS=20 \
       FLAGS="<chosen flags> --patience 5 --val-every 5000 --val-games 1000 --resume" sbatch tools/il.sbatch
