@@ -8,9 +8,10 @@ lasting findings are recorded.
 
 | What | Where | Public? |
 |---|---|---|
-| Training code, model, features | this repo | yes |
+| Self-play (PPO), arena, defense stats, the engine wrapper | this repo | yes |
+| Model, inputs, replay conversion, imitation learning | github.com/ClashAlpha/clapha-il (Jason's work on branch `jason`) | yes |
 | Pull requests from Arron (fixes, speed-ups) | this repo, from arronwang01/clash-royale-battle-engine | yes |
-| What the model's input lacks | [docs/MODEL_INPUTS.md](MODEL_INPUTS.md) | yes |
+| What the model's input is and lacks | clapha-il's docs/INPUTS.md | yes |
 | How the live client takes a play (deal, refill, elixir, timing) | [docs/GAME_INTEGRATION.md](GAME_INTEGRATION.md) | yes |
 | The engine: loader, per-build addresses, porting a new game build, engine reads per card | github.com/arronwang01/clapha-engine | **no** (Jason has access) |
 | Training metrics for Arron | sent by Jason on request (below) | no |
@@ -33,7 +34,7 @@ measured timing, a card's special state, an engine read. Each one is written dow
 measured or checked, on which build and date**, and **how to check it again**:
 
 - game and client rules → docs/GAME_INTEGRATION.md (here);
-- model input requirements → docs/MODEL_INPUTS.md (here);
+- model input requirements → clapha-il's docs/INPUTS.md;
 - engine reads, per-card engine states, porting notes → clapha-engine (private).
 
 Nothing is written as fact before it is checked; open questions are marked as open.
