@@ -17,8 +17,9 @@
 
 set -e
 cd "$HOME/clapha-engine"
+PY=/public/app/miniconda3/py312_24.4.0-0/bin/python  # has pyarrow (the node's python3 does not)
 COMMON="--replays $HOME/cr-engine/data/IL_Replay/replays --out $HOME/oracle --workers 23 --seed-check 2
         --firstlight $HOME/firstlight-cr --converter $HOME/clapha-engine/training/cr"
-python3 crx/version_oracle.py run --engine d86 ~/engine-86/engine ~/engine-86/data/assets $COMMON
-python3 crx/version_oracle.py run --engine d29 ~/engine-29/engine ~/engine-29/data/assets --fallback $COMMON
-python3 crx/version_oracle.py report --out ~/oracle --prefer d86 d29
+$PY crx/version_oracle.py run --engine d86 ~/engine-86/engine ~/engine-86/data/assets $COMMON
+$PY crx/version_oracle.py run --engine d29 ~/engine-29/engine ~/engine-29/data/assets --fallback $COMMON
+$PY crx/version_oracle.py report --out ~/oracle --prefer d86 d29
