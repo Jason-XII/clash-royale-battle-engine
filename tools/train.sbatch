@@ -1,11 +1,15 @@
 #!/bin/bash
-# The PPO learner of the E-Barbs specialist run (ppo-ebarbs2, README): learner on GPU 0, decision servers (MPS) on
-# GPU 1, collectors on the job's CPUs; --remote lets tools/satellite.sbatch join it. Resumes from <run>/latest.pt.
+# The PPO learner (il.rl) from a clapha-il checkpoint: learner on GPU 0, decision servers (MPS) on GPU 1 (GPU 0 too with one
+# GPU), collectors on the job's CPUs; --remote lets tools/satellite.sbatch join it. Resumes from $RUN/latest.pt.
 #
-#   cd ~/cr-engine && sbatch tools/train.sbatch && sbatch tools/satellite.sbatch    # start
-#   scancel --name=cr-ppo                                                          # stop both
+#   cd ~/cr-engine && INIT=~/il-runs/<run>/latest.pt RUN=~/cr-engine/runs/ppo-general sbatch tools/train.sbatch
+#   RUN=~/cr-engine/runs/ppo-general sbatch tools/satellite.sbatch       # more collectors for it
+#   scancel --name=cr-ppo                                                # stop both
+#   # smoke: one GPU, 20 updates of 32 games
+#   INIT=... RUN=~/cr-engine/runs/ppo-smoke UPDATES=20 FLAGS="--games-per-update 32" sbatch --gres=gpu:1 tools/train.sbatch
 #
-# qos_p107-a100 allows 16 CPUs per user however many GPUs: collectors (CPU) are the limit, so more A100s add nothing.
+# FLAGS adds il.rl options (a specialist: --learner-deck ... --self-play 0 --il-share 0.4 --deck-mix 0.3,0.4,0.3).
+# qos_p107-a100 allows 16 CPUs per user however many GPUs: collectors (CPU) are the limit.
 #SBATCH --job-name=cr-ppo
 #SBATCH --account=competition
 #SBATCH --partition=P107-A100
@@ -14,15 +18,14 @@
 #SBATCH --gres=gpu:2
 #SBATCH --mem=100G
 #SBATCH --time=4-00:00:00
+#SBATCH --exclude=anode02
 #SBATCH --output=runs/train-%j.out
 
+echo "node $(hostname); $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)"
 ulimit -u 65536
 cd "$HOME/cr-engine"
-R=$HOME/cr-engine/runs
+SERVER_DEVICE=cuda:$(( $(nvidia-smi -L | wc -l) > 1 ? 1 : 0 ))
 exec nice -n 10 env PYTHONPATH=. /public/app/miniconda3/py312_24.4.0-0/bin/python -m il.rl "$HOME/clapha-engine" \
-  $R/ppo-general/latest.pt $R/ppo-ebarbs2 --remote \
-  --il $R/il-002/best.pt --il-share 0.4 --deck-mix 0.3,0.4,0.3 --shaping 0.1 \
-  --learner-deck 26000043:1,26000020,26000036:1,26000052,26000017:2,26000083,28000015,28000026 \
-  --self-play 0 --opponent-pool $R/ppo-general/pool \
-  --collectors 40 --servers 4 --server-device cuda:1 --pool $HOME/cr-engine/data/deck_pool.json \
-  --lr 2e-4 --games-per-update 256 --lam 0.98 --kl-coef 0.01
+  "${INIT:?INIT: the clapha-il checkpoint to start from}" "${RUN:?RUN: the run directory}" --remote \
+  --collectors "${COLLECTORS:-40}" --servers "${SERVERS:-4}" --server-device "$SERVER_DEVICE" \
+  --pool "$HOME/cr-engine/data/deck_pool.json" --updates "${UPDATES:-100000}" $FLAGS

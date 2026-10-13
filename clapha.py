@@ -215,8 +215,8 @@ class ClaphaEngine:
         replays are read by the same code."""
         r, battle = self.env.reader, self.env.battle
         lean = r.frame(battle)
-        return {'tick': self.env.tick(), 'lean': {k: v for k, v in lean.items() if k != 'objects'},
-                'objects': r.objects(battle), 'units': r.unit_states(battle)}
+        objects = lean.pop('objects')  # frame() has read them already
+        return {'tick': self.env.tick(), 'lean': lean, 'objects': objects, 'units': r.unit_states(battle)}
 
     def run(self, ticks, count):
         states = []

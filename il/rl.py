@@ -1,4 +1,4 @@
-"""PPO on clapha engines (x86_64 Linux), starting from an IL checkpoint: the learner.
+"""PPO on clapha engines (x86_64 Linux), starting from a clapha-il checkpoint: the learner.
 
     PYTHONPATH=. python -m il.rl ~/clapha-engine ~/cr-engine/runs/il-002/best.pt ~/cr-engine/runs/ppo-general --collectors 24 --servers 4
     PYTHONPATH=. python -m il.rl join ~/cr-engine/runs/ppo-general --collectors 36 --servers 3   # another (GPU) job's
@@ -9,9 +9,9 @@ runs PPO on the finished trajectories and publishes new weights to the servers t
 self-play (--self-play, both seats learn) or against a frozen pool (the IL model and snapshots) chosen by PFSP:
 weight (1 - win rate)^2 + 0.05.
 
-Policy (il.model.distribution): wait with the model's p(wait); otherwise a card x cell sampled from the non-wait
-logits at temperature TEMPERATURE (near the IL agent's "best card and cell", but stochastic so PPO can learn it).
-A KL penalty keeps the policy near the IL model. Reward: see il.actors.
+Policy (il.policy): what to do, which hand card, which tile, each sampled from the model's head (as the arena plays
+it). A KL penalty keeps the policy near the IL model: exact for the what and card heads, the k3 estimate for the tile
+taken. Reward: see il.actors.
 """
 import argparse
 from collections import Counter, defaultdict, deque
@@ -31,19 +31,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import data as D
 from . import defense
+from . import policy
 from .actors import (STATS, accept_into, collector, decision_server, join, load_policy, opponent_dir, pick_device,
                      reachable_ip, start_mps)
-from .model import ABILITY_EXPLORE, INPUT_KEYS, distribution, entropy, kl, load_weights, log_prob
-from .train import collate
 
 HOLD_LIMIT = 60  # s a collector's next game may be held back for a full backlog (well under REPLY_TIMEOUT)
 FOCUS_DECKS = 20  # --deck-mix 'focus': the most played ladder decks of the pool
 HARD_DECAY, HARD_TOP, HARD_GAMES = 0.8, 10, 8  # hard cards: the HARD_TOP worst of those in >= HARD_GAMES decayed games
 ADAM_WARMUP = 20  # updates of learning-rate ramp after a fresh Adam: its first steps are full-size on every weight
                   # (a fresh Adam at lr 2e-4 broke the specialist: approx_kl 0.06, 25x usual, and a collapse)
-AUX_HORIZONS = (40, 120)  # decisions (5 ticks each) ahead: the auxiliary head's tower-damage targets
 
 
 def rollback_scale(out):
@@ -172,58 +169,84 @@ def explained(target, value):
     return float(1 - np.var(target - value) / max(np.var(target), 1e-8))
 
 
-def aux_targets(towers):
-    """[T, 2] damage dealt / taken so far (il.actors.damage) -> [T, 4]: how much more of each AUX_HORIZONS decisions
-    later (or at the game's end)."""
-    T = len(towers)
-    return np.concatenate([towers[np.minimum(np.arange(T) + h, T - 1)] - towers for h in AUX_HORIZONS], 1)
+def batch(chunk, keys, device):
+    """Trajectories -> model inputs [B, T, ...], the per-decision arrays `keys` [B, T] and the mask of real decisions."""
+    x = policy.tensors({k: policy.pad_stack([t['inputs'][k] for t in chunk]) for k in chunk[0]['inputs']}, device)
+    y = {k: torch.from_numpy(policy.pad_stack([t[k] for t in chunk])).to(device, non_blocking=True) for k in keys}
+    T = x['scalars'].shape[1]
+    valid = torch.from_numpy(np.arange(T) < np.array([len(t['action']) for t in chunk])[:, None]).to(device)
+    return x, y, valid
+
+
+def _entropy(logp):
+    return -(logp.exp() * logp.masked_fill(torch.isinf(logp), 0)).sum(-1)
+
+
+def _kl(logp, ref):
+    return (logp.exp() * (logp.masked_fill(torch.isinf(logp), 0) - ref.masked_fill(torch.isinf(ref), 0))).sum(-1)
+
+
+def evaluate(model, x, action, valid):
+    """A forward pass on a padded batch -> per real decision ([n], in the mask's order): log p(action), the what and
+    card heads' log-probs [n, 4], the log-prob of the tile taken and its head's entropy (0 where no card was played),
+    whether a card was played, and the value."""
+    full = model(x)
+    out, x = policy.flat(full, x)
+    v = valid.reshape(-1)
+    xv = {k: x[k][v] for k in ('own_flight_card', 'legal')}
+    what, slot, cell, play = policy.split(action.reshape(-1)[v])
+    what_lp = policy.what_logp(out['what'][v], xv, policy.ABILITY_EXPLORE)
+    which_lp = policy.which_logp(out['which'][v], xv)
+    tiles = policy.tile_logp(model, out, x, slot[play], v.nonzero().squeeze(1)[play])
+    tile, tile_entropy = what_lp.new_zeros(len(what)), what_lp.new_zeros(len(what))
+    tile[play] = tiles.gather(1, cell[play].unsqueeze(1)).squeeze(1)
+    tile_entropy[play] = _entropy(tiles)
+    pick = lambda lp, i: lp.gather(1, i.unsqueeze(1)).squeeze(1)  # noqa: E731
+    logp = pick(what_lp, what) + torch.where(play, pick(which_lp, slot) + tile, torch.zeros_like(tile))
+    return dict(logp=logp, what=what_lp, which=which_lp, tile=tile, tile_entropy=tile_entropy, play=play,
+                value=full['value'].reshape(-1)[v])
 
 
 def update(model, reference, optimizer, trajectories, args, device):
     for t in trajectories:
         t['adv'], t['ret'] = advantages(t, args.gamma, args.lam)
-        t['aux'] = aux_targets(t['towers'])
     flat = np.concatenate([t['adv'] for t in trajectories])
     mean, std = flat.mean(), flat.std() + 1e-8
     value = np.concatenate([t['value'] for t in trajectories])
     diagnostics = {  # how much the value head (the advantages' baseline) knows, before this update
         'value_ev_mc': explained(np.concatenate([discounted(t['reward'], args.gamma) for t in trajectories]), value),
         'value_ev_gae': explained(np.concatenate([t['ret'] for t in trajectories]), value)}
-    keys = INPUT_KEYS + ('action', 'logp', 'adv', 'ret', 'aux')
+    autocast = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda')
     stats = defaultdict(list)
-    # The reference (IL) policy's distribution, once per trajectory: it does not change during the update, so the
-    # epochs need not run its forward pass again (it was a quarter of the update's GPU time).
+    # The reference (IL) policy once per trajectory: its what / card heads and the tile taken. It does not change during
+    # the update, so the epochs need not run its forward pass again.
     with torch.no_grad():
         for i in range(0, len(trajectories), args.minibatch):
             chunk = trajectories[i:i + args.minibatch]
-            batch = collate([{k: t[k] for k in INPUT_KEYS + ('action',)} for t in chunk])
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
-                ref_logits, _, _ = reference({k: batch[k] for k in INPUT_KEYS}, valid=batch['time_mask'])
-            ref = distribution(ref_logits, explore=ABILITY_EXPLORE)
-            for b, t in enumerate(chunk):
-                t['ref'] = tuple(r[b, :len(t['action'])] for r in ref)
+            x, y, valid = batch(chunk, ('action',), device)
+            with torch.autocast(**autocast):
+                ref = evaluate(reference, x, y['action'], valid)
+            lengths = [len(t['action']) for t in chunk]
+            for t, *parts in zip(chunk, *(ref[k].float().split(lengths) for k in ('what', 'which', 'tile'))):
+                t['ref'] = parts
     for _ in range(args.epochs):
         random.shuffle(trajectories)
         for i in range(0, len(trajectories), args.minibatch):
-            batch = collate([{k: t[k] for k in keys} for t in trajectories[i:i + args.minibatch]])
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            m = batch['time_mask']
-            x = {k: batch[k] for k in INPUT_KEYS}
-            with torch.autocast(device.type, torch.bfloat16, enabled=device.type == 'cuda'):
-                logits, value, _, aux = model(x, valid=m, aux=True)
-            dist = distribution(logits, explore=ABILITY_EXPLORE)
-            ref = padded_ref(trajectories[i:i + args.minibatch], m.shape[1])
-            new_logp = log_prob(dist, batch['action'])
-            ratio = (new_logp - batch['logp']).exp()
-            adv = (batch['adv'] - mean) / std
-            policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv)[m].mean()
-            value_loss = F.mse_loss(value.float()[m], batch['ret'][m])
-            aux_loss = F.mse_loss(aux.float()[m], batch['aux'][m])
-            ent = entropy(dist)[m].mean()
-            kl_ref = kl(dist, ref)[m].mean()
-            loss = (policy_loss + args.value_coef * value_loss + args.aux_coef * aux_loss - args.entropy * ent
-                    + args.kl_coef * kl_ref)
+            chunk = trajectories[i:i + args.minibatch]
+            x, y, valid = batch(chunk, ('action', 'logp', 'adv', 'ret'), device)
+            with torch.autocast(**autocast):
+                new = evaluate(model, x, y['action'], valid)
+            ref_what, ref_which, ref_tile = (torch.cat(parts) for parts in zip(*(t['ref'] for t in chunk)))
+            ratio = (new['logp'] - y['logp'][valid]).exp()
+            adv = (y['adv'][valid] - mean) / std
+            policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv).mean()
+            value_loss = F.mse_loss(new['value'].float(), y['ret'][valid])
+            p_play = new['what'][:, policy.PLAY].exp()
+            ent = (_entropy(new['what']) + p_play * _entropy(new['which']) + new['tile_entropy']).mean()
+            log_r = ref_tile - new['tile']  # the tile taken: KL's k3 estimate (r - 1 - log r), 0 where no card was played
+            kl_ref = (_kl(new['what'], ref_what) + p_play * _kl(new['which'], ref_which)
+                      + torch.where(new['play'], log_r.exp() - 1 - log_r, torch.zeros_like(log_r))).mean()
+            loss = policy_loss + args.value_coef * value_loss - args.entropy * ent + args.kl_coef * kl_ref
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -231,35 +254,17 @@ def update(model, reference, optimizer, trajectories, args, device):
             with torch.no_grad():
                 stats['policy_loss'].append(policy_loss.item())
                 stats['value_loss'].append(value_loss.item())
-                stats['aux_loss'].append(aux_loss.item())
                 stats['entropy'].append(ent.item())
                 stats['kl_ref'].append(kl_ref.item())
-                stats['approx_kl'].append(((ratio - 1) - ratio.log())[m].mean().item())
-                stats['clip_frac'].append(((ratio - 1).abs() > args.clip)[m].float().mean().item())
+                stats['approx_kl'].append(((ratio - 1) - ratio.log()).mean().item())
+                stats['clip_frac'].append(((ratio - 1).abs() > args.clip).float().mean().item())
     for t in trajectories:
         del t['ref']
     return {**{k: float(np.mean(v)) for k, v in stats.items()}, **diagnostics}
 
 
-def padded_ref(chunk, T):
-    """The minibatch's reference distribution [B, T, ...] from its trajectories' stored ones: padded steps as a padded
-    step's own (no playable card: wait with probability 1)."""
-    first = chunk[0]['ref'][0]
-    padded = torch.full((1, D.ACTIONS), float('-inf'), device=first.device)
-    padded[:, 0] = 0  # a padded step's logits: wait finite; the ability (ability_ok False) and every card cell masked
-    fills = [f[0] for f in distribution(padded)]
-    out = []
-    for j, fill in enumerate(fills):
-        parts = [t['ref'][j] for t in chunk]
-        full = fill.expand(len(parts), T, *fill.shape).clone()
-        for b, part in enumerate(parts):
-            full[b, :len(part)] = part
-        out.append(full)
-    return tuple(out)
-
-
 def save(path, model, saved, optimizer=None, extra=None):
-    """Same layout as IL checkpoints (il.model.load reads it); only latest.pt keeps the optimizer."""
+    """Same layout as IL checkpoints (il.policy.load reads it, vocabulary included); only latest.pt keeps the optimizer."""
     base = {k: v for k, v in saved.items() if k not in ('optimizer', 'update')}
     tmp = Path(f'{path}.tmp')  # written whole, then renamed: a kill mid-write (scancel, node failure) keeps the old file
     torch.save(dict(base, model=model.state_dict(), **({'optimizer': optimizer.state_dict()} if optimizer else {}),
@@ -283,7 +288,8 @@ def main():
     parser.add_argument('--updates', type=int, default=100000)
     parser.add_argument('--self-play', type=float, default=0.5)
     parser.add_argument('--snapshot-every', type=int, default=150, help='updates between frozen snapshots')
-    parser.add_argument('--delay', type=int, default=D.DEPLOY_DELAY)
+    parser.add_argument('--delay', default=policy.PLAY_DELAY, type=lambda s: tuple(map(int, s.split('-'))) if '-' in s else int(s),
+                        help="decision -> landing ticks, or a range drawn per play (default 23-27, as clapha-il's labels)")
     parser.add_argument('--lr', type=float, default=2e-5)
     parser.add_argument('--epochs', type=int, default=2)
     parser.add_argument('--minibatch', type=int, default=8, help='games per gradient step')
@@ -291,8 +297,6 @@ def main():
     parser.add_argument('--gamma', type=float, default=0.999)
     parser.add_argument('--lam', type=float, default=0.95)
     parser.add_argument('--value-coef', type=float, default=0.5)
-    parser.add_argument('--aux-coef', type=float, default=0.02, help="the auxiliary tower-damage head's loss "
-                        "weight (its loss is ~35x the value loss: 0.5 swamped the policy gradient)")
     parser.add_argument('--entropy', type=float, default=0.002)
     parser.add_argument('--kl-coef', type=float, default=0.05)
     parser.add_argument('--pool', default='data/deck_pool.json', help='deck pairs as played (build_cache --deck-pool)')
@@ -326,8 +330,9 @@ def main():
     (out / 'pool').mkdir(exist_ok=True)
     resume = out / 'latest.pt'
     start_from = resume if resume.exists() else args.init
-    cpu_model, saved = load_policy(start_from, 'cpu')
-    (out / 'vocab.json').write_text(json.dumps({str(k): v for k, v in saved['vocab'].items()}))
+    cpu_model, vocab, saved = policy.load(start_from, 'cpu')
+    saved['vocab'] = sorted(vocab.index)  # every checkpoint this run saves carries it
+    vocab.save(out / 'vocab.json')  # what the collectors build inputs with
     from .arena import deck_pairs as sample_decks, mirror
     learner_deck = mirror(args.learner_deck)['decks'][0] if args.learner_deck else None
     deck_pairs = sample_decks(args.pool, args.cache, 30000, seed=random.randrange(1 << 20))
@@ -388,7 +393,7 @@ def main():
     torch.set_num_threads(2)
     device = pick_device(args.device)
     model = cpu_model.to(device)
-    reference, _ = load_policy(args.init, device)
+    reference, _ = load_policy(args.init, device, vocab)
     reference.eval().requires_grad_(False)
     if device.type == 'cuda':  # convs in channels-last layout: no layout conversion before each conv (~7% of an update)
         model.to(memory_format=torch.channels_last)
@@ -490,7 +495,7 @@ def main():
         rollback = out / 'rollback.json'  # written by il.autopilot: restart from its best checkpoint at a lower rate
         if rollback.exists():
             order = json.loads(rollback.read_text())
-            load_weights(model, load_policy(order['checkpoint'], 'cpu')[1]['model'])
+            model.load_state_dict(load_policy(order['checkpoint'], 'cpu', vocab)[1]['model'])
             base_lr *= order['lr_scale']
             optimizer, fresh_at = torch.optim.Adam(model.parameters(), lr=base_lr), update_index + 1
             rollback.rename(out / f'rollback-done-{update_index}.json')
@@ -538,8 +543,9 @@ def main():
                    mean_batch=round(served['requests'] / max(served['batches'], 1), 1),
                    hours=(time.time() - started) / 3600, cycle_s=collect_time, wait_s=waited, update_s=time.time() - update_start,
                    steps=int(sum(len(t['action']) for t in trajectories)),
-                   plays_per_game=float(np.mean([(t['action'] >= 2).sum() for t in trajectories])),
-                   abilities_per_game=float(np.mean([(t['action'] == D.ABILITY).sum() for t in trajectories])),
+                   plays_per_game=float(np.mean([(t['action'] >= policy.CARD).sum() for t in trajectories])),
+                   abilities_per_game=float(np.mean([np.isin(t['action'], (policy.ABILITY1, policy.ABILITY2)).sum()
+                                                     for t in trajectories])),
                    full_elixir=float(np.mean(np.concatenate([t['full'] for t in trajectories]))),
                    score_vs_pool=float(np.mean(outcomes)) if outcomes else None,
                    pool={k: round(float(np.mean(v)), 3) for k, v in list(matchmaker.results.items()) if v},

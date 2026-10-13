@@ -1,11 +1,11 @@
-"""Model A vs model B on clapha engines (x86_64 Linux), with the live deploy delay.
+"""Model A vs model B on clapha engines (x86_64 Linux), plays landing 23-27 ticks after the decision (il.policy).
 
     PYTHONPATH=. python -m il.arena ~/clapha-engine runs/il-003/best.pt runs/il-002/best.pt --games 400 --procs 16
 
 Decks are the two players' opening hand + cycle of cached human games (one cached game per arena game),
 or one fixed deck for both players with --deck (a mirror match); seats alternate so each model plays both
-sides of each deck pair equally often. Abilities are not played
-(clapha does not support them yet).
+sides of each deck pair equally often. clapha-il checkpoints play il.policy's policy (as self-play); --decode is for
+checkpoints of the old il.model.
 """
 import argparse
 import json
@@ -18,8 +18,8 @@ import time
 
 import numpy as np
 
-from . import data as D
 from . import defense
+from .policy import PLAY_DELAY
 
 
 def decks(cache, count, seed):
@@ -75,16 +75,16 @@ def worker(index, args, jobs, out):
     os.dup2(log, 2)
     time.sleep(index // 4 * 8)  # boot 4 engines at a time
     import torch
-    from native_engine import Play
+    from native_engine import ABILITY, Play
     from native_engine.build_cache import ENTITY_TYPES
     from native_engine.clapha import ClaphaEngine
-    from . import clapha_agent
+    from . import policy
     from .model import Agent, load
     torch.set_num_threads(1)
     engine = ClaphaEngine(args.clapha)
-    kinds = [clapha_agent.is_clapha_il(path) for path in (args.a, args.b)]  # clapha-il checkpoints play from raw records
-    models = [clapha_agent.load(path) if new else load(path) for path, new in zip((args.a, args.b), kinds)]
-    legal = clapha_agent.legal_fn() if any(kinds) else None
+    kinds = [policy.is_clapha_il(path) for path in (args.a, args.b)]  # clapha-il checkpoints play from raw records
+    models = [policy.load(path)[:2] if new else load(path) for path, new in zip((args.a, args.b), kinds)]
+    legal = policy.legal_fn() if any(kinds) else None
     lag = args.delay if isinstance(args.delay, int) else sum(args.delay) // 2  # for il.defense: about when plays land
     for game, pair in jobs:
         a_owner = game % 2
@@ -92,25 +92,25 @@ def worker(index, args, jobs, out):
             pair = dict(pair, decks=[mirror(args.a_deck)['decks'][0] if o == a_owner else pair['decks'][o] for o in (0, 1)])
         match = make_match(pair, game + 1)
         state = engine.reset(match=match)
-        record = engine.record() if any(kinds) else None
-        agents = [clapha_agent.Agent(*models[m], owner, match, record, legal) if kinds[m] else
-                  Agent(*models[m], owner, decode=args.decode)
-                  for owner in (0, 1) for m in [0 if owner == a_owner else 1]]
-        commands = clapha_agent.Commands()
+        seats = [0 if owner == a_owner else 1 for owner in (0, 1)]  # the model of each owner
+        agents = [policy.Agent(models[m][0], owner) if kinds[m] else Agent(*models[m], owner, decode=args.decode)
+                  for owner, m in enumerate(seats)]
+        inputs = policy.Inputs(engine, match, {o: models[m][1] for o, m in enumerate(seats) if kinds[m]}, legal) \
+            if any(kinds) else None
         started, plays = time.perf_counter(), [0, 0]
         frames, landed = [], []
         while not state.finalized and state.tick < 7200:
             frames.append((state.tick, np.array([(e.owner, e.card, e.x, e.y, -1 if e.hp is None else e.hp,
                                                   -1 if e.max_hp is None else e.max_hp, ENTITY_TYPES.index(e.entity_type))
                                                  for e in state.entities], np.int64).reshape(-1, 7)))
-            if any(kinds):
-                record, issued = engine.record(), commands.update(state, engine)
-            choices = [a.act(record, issued) if isinstance(a, clapha_agent.Agent) else a.act(state) for a in agents]
-            chosen = [Play(a.owner, *c[1:]) for a, c in zip(agents, choices) if c[0] == 'card']
+            rows = inputs(state) if inputs else {}
+            choices = [a.act(rows[a.owner]) if isinstance(a, policy.Agent) else a.act(state) for a in agents]
+            chosen = [Play(a.owner, ABILITY, 0, 0) if c[0] == 'ability' else Play(a.owner, *c[1:])
+                      for a, c in zip(agents, choices) if c[0] != 'wait']
             transition = engine.step(chosen, 5, delay=args.delay)
             for p, ok in zip(chosen, transition.executed):
-                plays[p.owner] += ok
-                if ok:
+                if ok and p.slot != ABILITY:
+                    plays[p.owner] += 1
                     landed.append((state.tick + lag, p.owner, p.x, p.y))
             state = transition.state
         guard = defense.game(frames, landed)
@@ -133,7 +133,7 @@ def mirror(deck_text):
     return {'decks': [deck, deck], 'lvlcap': LEVEL, 'cardlvlmin': LEVEL, 'kt': [LEVEL] * 2, 'exp': [LEVEL] * 2}
 
 
-def run(clapha, a, b, pairs, procs=16, delay=D.DEPLOY_DELAY, decode='gate', out=None, report_every=20, logs='runs/arena-logs',
+def run(clapha, a, b, pairs, procs=16, delay=PLAY_DELAY, decode='gate', out=None, report_every=20, logs='runs/arena-logs',
         a_deck=None):
     """Plays A against B on `pairs` [(game index, deck pair)] across `procs` engines; returns the game records."""
     from native_engine.clapha import raise_thread_limit
@@ -177,8 +177,8 @@ def main():
     parser.add_argument('--games', type=int, default=400)
     parser.add_argument('--procs', type=int, default=16)
     parser.add_argument('--delay', type=lambda v: tuple(map(int, v.split('-'))) if '-' in v else int(v),
-                        default=D.DEPLOY_DELAY, help="decision -> landing ticks (0: instant), or a range drawn per play "
-                        "(23-27: il.data.PLAY_DELAY, as clapha-il models were labelled)")
+                        default=PLAY_DELAY, help="decision -> landing ticks (0: instant), or a range drawn per play "
+                        "(default 23-27, as clapha-il models were labelled)")
     parser.add_argument('--decode', choices=('gate', 'sample', 'argmax', 'policy'), default='gate',
                         help="policy: il.rl's training policy (wait with p(wait), else card x cell at its temperature)")
     parser.add_argument('--deck', help='8 comma-separated cards, id or id:el (el = evolution flag as in replays): '

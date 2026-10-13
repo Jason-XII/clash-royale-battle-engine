@@ -3,9 +3,11 @@ servers (batched GPU decisions for every collector, each seat's LSTM state kept 
 job's collectors (and, with --servers, decision servers) for a learner started with --remote.
 
 One process per collector plays the learner's games: a spec (decks, seed, which model plays each seat, which server
-answers) in, a trajectory per learning seat out. Decision servers (--servers processes) answer their share of
-collectors in batched GPU calls with the learner's latest weights, published through shared memory (one Python thread
-answering every decision was the bottleneck: GPU 17% busy, that thread 100%), and run under NVIDIA MPS.
+answers) in, a trajectory per learning seat out. Each decision's inputs are built in the collector (il.policy.Inputs:
+clapha-il's PlayerView on ClaphaEngine.record()) and sent packed (il.policy.pack). Decision servers (--servers
+processes) answer their share of collectors in batched GPU calls with the learner's latest weights, published through
+shared memory (one Python thread answering every decision was the bottleneck: GPU 17% busy, that thread 100%), and run
+under NVIDIA MPS.
 Reward: +1 win / -1 loss at the end, -OVERFLOW_PENALTY per decision at full elixir, and FirstLight's tower shaping:
 spec shaping * (gamma * potential' - potential), the potential being crowns taken minus lost plus each tower's lost hp
 fraction (king x3), + for theirs and - for ours, and 0 once the game ends (so it adds no bonus for a fast three-crown
@@ -29,10 +31,9 @@ import time
 import numpy as np
 import torch
 
-from . import data as D
 from . import defense
+from . import policy
 from .defense import board_rows
-from .model import ABILITY_EXPLORE, INPUT_KEYS, Policy, distribution, load_weights, log_prob, sample
 
 REPLY_TIMEOUT = 180  # s; the learner can be busy with an update (~20 s). A node that dies sends nothing, so a
                      # collector that waits longer treats the connection as gone and reconnects (il.rl join).
@@ -70,7 +71,7 @@ def opponent_dir(args):
 
 # ---- collectors ---------------------------------------------------------------------------------------------------------
 def collector_engine(name, out, clapha, stagger):
-    """A collector process's log, CPU priority and booted engine (+ the run's vocab)."""
+    """A collector process's log, CPU priority and booted engine (+ the run's vocabulary and legal tiles)."""
     log = os.open(f'{out}/logs/collector-{name}.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     os.dup2(log, 1)
     os.dup2(log, 2)
@@ -78,13 +79,13 @@ def collector_engine(name, out, clapha, stagger):
     os.nice(5)  # the decision servers are the bottleneck on a busy node: let them run first
     torch.set_num_threads(1)
     from native_engine.clapha import ClaphaEngine
-    return ClaphaEngine(clapha), D.load_vocab(Path(out) / 'vocab.json')
+    return ClaphaEngine(clapha), policy.FE.Vocab.load(Path(out) / 'vocab.json'), policy.legal_fn()
 
 
 def collector(index, args, learner, servers):
     """A collector on the learner's node, connected by pipes (one to every decision server)."""
-    engine, vocab = collector_engine(index, args.out, args.clapha, index // 4 * 8)
-    play_games(index, args.delay, engine, vocab, learner, servers)
+    engine, vocab, legal = collector_engine(index, args.out, args.clapha, index // 4 * 8)
+    play_games(index, args.delay, engine, vocab, legal, learner, servers)
     for conn in servers:
         conn.close()
     os._exit(0)  # the engine segfaults in its exit-time destructors
@@ -97,13 +98,13 @@ def receive(conn):
     return conn.recv()
 
 
-def play_games(index, delay, engine, vocab, learner, servers):
+def play_games(index, delay, engine, vocab, legal, learner, servers):
     """Plays the learner's games until it sends None: games and trajectories through the learner (`learner`),
     actions from the decision server the learner names for each game (one of `servers`: a frozen opponent lives on
     one server, so its games go there). Local pipes or TCP connections (il.rl join) alike."""
     from native_engine import ABILITY, Play
-    from .data import InFlight, Observer
     from .arena import make_match
+    lag = delay if isinstance(delay, int) else sum(delay) // 2  # for il.defense: about when plays land
     while True:
         learner.send(('new_game', index, None))
         spec = receive(learner)
@@ -112,9 +113,9 @@ def play_games(index, delay, engine, vocab, learner, servers):
         match = make_match(spec['decks'], spec['seed'])
         models = spec['models']  # per seat: 'current' or a frozen opponent's key
         conn = servers[spec['server'] % len(servers)]  # il.rl join --servers may run fewer servers than the learner
-        observer = Observer(vocab)  # both seats' rows, built once per state
         steps = [defaultdict(list) for _ in (0, 1)]
         state = engine.reset(match=match)
+        inputs = policy.Inputs(engine, match, {0: vocab, 1: vocab}, legal)
         expired = engine.expired
         shaping, gamma = spec.get('shaping', (0.0, 1.0))
         start = tower_hp(state)
@@ -123,12 +124,10 @@ def play_games(index, delay, engine, vocab, learner, servers):
         timing = defaultdict(float)  # seconds per part of a decision, for the learner's log
         while True:
             t0 = time.perf_counter()
-            # A player with a play or ability press in flight can do nothing else (ClaphaEngine drops it): the
-            # Observer masks everything for that seat, so what is stored is what happened (wait, log-prob 0).
-            rows = observer.observe(state, [InFlight(p['owner'], p['card'], p['cost'], p['due']) for p in engine.pending])
+            rows = {o: policy.pack(x) for o, x in inputs(state).items()}
             frames.append((state.tick, board_rows(state)))
             t1 = time.perf_counter()
-            conn.send(('act', index, [((index, o), models[o], pack(rows[o])) for o in (0, 1)]))
+            conn.send(('act', index, [((index, o), models[o], rows[o]) for o in (0, 1)]))
             replies = receive(conn)
             t2 = time.perf_counter()
             timing['features'] += t1 - t0
@@ -138,26 +137,23 @@ def play_games(index, delay, engine, vocab, learner, servers):
             for o, (action, logp, value) in enumerate(replies):
                 full = state.players[o].elixir >= 100000
                 s = steps[o]
-                for k, v in rows[o].items():
-                    s[k].append(v)
+                s['rows'].append(rows[o])
                 s['action'].append(action)
                 s['logp'].append(logp)
                 s['value'].append(value)
                 s['reward'].append(-OVERFLOW_PENALTY * full)
                 s['full'].append(full)
-                s['towers'].append(damage(state, start, o))  # il.rl's auxiliary targets
-                if action == D.ABILITY:
+                choice = policy.decode(action, o)
+                if choice[0] == 'ability':
                     plays.append(Play(o, ABILITY, 0, 0))
-                elif action >= 2:
-                    slot, cell = divmod(action - 2, D.CELLS)
-                    x, y = D.cell_center(cell, o)
-                    plays.append(Play(o, int(slot), int(x), int(y)))
+                elif choice[0] == 'card':
+                    plays.append(Play(o, *choice[1:]))
             if state.finalized or state.tick >= 7200:
                 break
             t3 = time.perf_counter()
             transition = engine.step(plays, 5, delay=delay)
             timing['dropped'] += transition.executed.count(False)  # plays the engine refused
-            landed += [(state.tick + delay, p.owner, p.x, p.y) for p, ok in zip(plays, transition.executed)
+            landed += [(state.tick + lag, p.owner, p.x, p.y) for p, ok in zip(plays, transition.executed)
                        if ok and p.slot != ABILITY]
             state = transition.state
             timing['engine'] += time.perf_counter() - t3
@@ -172,8 +168,9 @@ def play_games(index, delay, engine, vocab, learner, servers):
             outcome = 0.0 if state.result not in (0, 1) else (1.0 if state.result == o else -1.0)
             steps[o]['reward'][-1] += outcome
             if o in spec.get('train', [s for s in (0, 1) if models[s] == 'current']):
-                trajectory = {k: np.array(v) for k, v in steps[o].items()}
+                trajectory = {k: np.array(v) for k, v in steps[o].items() if k != 'rows'}
                 trajectory = {k: v.astype(np.float32) if v.dtype == np.float64 else v for k, v in trajectory.items()}
+                trajectory['inputs'] = policy.stack(steps[o]['rows'])
                 learner.send(('trajectory', index, dict(trajectory, outcome=outcome, opponent=models[1 - o], timing=timing,
                                                          defense=guard[o], tag=spec.get('tag'))))
                 timing = {}  # counted once per game
@@ -181,158 +178,60 @@ def play_games(index, delay, engine, vocab, learner, servers):
 
 
 # ---- decision servers ------------------------------------------------------------------------------------------------------------
-def load_policy(path, device):
-    saved = torch.load(path, map_location='cpu', weights_only=False)
-    model = Policy(**saved['config'])
-    load_weights(model, saved['model'])
-    return model.to(device), saved
-
-
-GRAPH_BUCKETS = (8, 16, 32, 64, 128)  # batch sizes a recorded decision is padded to
-
-# A feature row travels as one byte row (8-byte aligned: int64 fields, then float32, then bool), so a server copies
-# a model's whole batch to the GPU at once and views the fields back out of it.
-LAYOUT = [(k, np.int64, (D.MAX_ENTITIES,)) for k in ('ent_obj', 'ent_side', 'ent_type', 'ent_cell')] + [
-    ('rev_card', np.int64, (D.REVEALED,)), ('hand_card', np.int64, (4,)), ('next_card', np.int64, ()),
-    ('cycle_card', np.int64, (3,)), ('pending_card', np.int64, ()), ('opp_deck', np.int64, (8,)),
-    ('ent_float', np.float32, (D.MAX_ENTITIES, D.ENTITY_FLOATS)), ('rev_age', np.float32, (D.REVEALED,)),
-    ('scalars', np.float32, (D.SCALARS,)), ('hand_cost', np.float32, (4,)), ('extras', np.float32, (D.EXTRAS,)),
-    ('slot_ok', np.bool_, (4,)), ('ability_ok', np.bool_, ())]
-assert sorted(k for k, _, _ in LAYOUT) == sorted(INPUT_KEYS)
-
-
-def _fields():
-    fields, start = [], 0
-    for key, dtype, shape in LAYOUT:
-        end = start + int(np.prod(shape)) * np.dtype(dtype).itemsize
-        fields.append((key, dtype, shape, start, end))
-        start = end
-    return fields, -(-start // 8) * 8
-
-
-FIELDS, ROW_BYTES = _fields()  # (key, dtype, shape, start byte, end byte); bytes per row
-TORCH_DTYPES = {np.int64: torch.int64, np.float32: torch.float32, np.bool_: torch.bool}
-
-
-def pack(row):
-    """A feature row (dict of arrays, il.data.features) -> one uint8 array of ROW_BYTES."""
-    out = np.zeros(ROW_BYTES, np.uint8)
-    for key, dtype, shape, start, end in FIELDS:
-        out[start:end] = np.ascontiguousarray(row[key], dtype).reshape(-1).view(np.uint8)
-    return out
-
-
-def unpack(rows):
-    """[n, ROW_BYTES] uint8 tensor -> model inputs ([n, 1, ...] views of it, no copy)."""
-    return {key: rows[:, start:end].view(TORCH_DTYPES[dtype]).reshape(len(rows), 1, *shape)
-            for key, dtype, shape, start, end in FIELDS}
+def load_policy(path, device, vocab=None):
+    """A checkpoint's model and saved dict; with `vocab`, the model must read its inputs with that vocabulary (every
+    model of a run sees the same collectors' inputs)."""
+    model, own, saved = policy.load(path, device)
+    if vocab is not None and own.index != vocab.index:
+        raise ValueError(f'{path} uses another vocabulary than this run')
+    return model, saved
 
 
 class Server:
-    """Batched decisions for every collector. Each seat's LSTM state lives in one row of a preallocated GPU tensor
-    (the last row is a scratch row for padding). One decision of one model - gather the seats' states, forward,
-    write the states back, sample, log-prob - is one function; on a GPU it is recorded as a CUDA graph per batch
-    bucket (checked against an eager pass when recorded; a failed check falls back to eager calls), so a model's
-    share of a round is one input copy, one graph launch and one copy back."""
+    """Batched decisions for every collector. Each seat's LSTM state lives in one row of a preallocated GPU tensor. One
+    decision of one model gathers its seats' states, runs the model, writes the states back and samples
+    (il.policy.sample)."""
 
     def __init__(self, models, device, core, capacity=256):
         self.models, self.device, self.core = models, device, core
         self.rows = {}  # seat -> row in self.h / self.c
+        self.h = self.c = None
         self._allocate(capacity)
 
     def _allocate(self, capacity):
-        h = torch.zeros(1, capacity + 1, self.core, device=self.device)
+        h = torch.zeros(1, capacity, self.core, device=self.device)
         c = torch.zeros_like(h)
-        if hasattr(self, 'h'):
-            h[:, :self.capacity], c[:, :self.capacity] = self.h[:, :self.capacity], self.c[:, :self.capacity]
+        if self.h is not None:
+            h[:, :self.capacity], c[:, :self.capacity] = self.h, self.c
         self.h, self.c, self.capacity = h, c, capacity
-        self.graphs = {} if self.device.type == 'cuda' else None  # (model key, bucket) -> recorded decision
-
-    def _decide(self, model, rows, index):
-        """Decisions for `rows` (uint8 [n, ROW_BYTES]) of seats in state rows `index`: [n, 3] (action, logp, value)."""
-        h, c = self.h.index_select(1, index), self.c.index_select(1, index)
-        # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
-        with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda', cache_enabled=False):
-            logits, value, (h, c) = model(unpack(rows), (h, c))
-        self.h.index_copy_(1, index, h.float())
-        self.c.index_copy_(1, index, c.float())
-        dist = distribution(logits[:, 0], explore=ABILITY_EXPLORE)
-        action = sample(dist)
-        return torch.stack([action.float(), log_prob(dist, action), value[:, 0].float()], 1), logits, value
-
-    def _record(self, model, rows, index):
-        """`rows` / `index` padded to a bucket -> a recorded decision for that bucket, or None (logged)."""
-        saved = self.h.clone(), self.c.clone()
-
-        def restore():
-            self.h.copy_(saved[0])
-            self.c.copy_(saved[1])
-        try:
-            g = {'rows': rows.clone(), 'index': index.clone(), 'graph': torch.cuda.CUDAGraph()}
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(3):
-                    self._decide(model, g['rows'], g['index'])
-            torch.cuda.current_stream().wait_stream(side)
-            restore()
-            with torch.cuda.graph(g['graph']):
-                g['out'], logits, value = self._decide(model, g['rows'], g['index'])
-            g['graph'].replay()
-            got = logits.float().clone(), value.float().clone()
-            restore()
-            want = [t.float() for t in self._decide(model, rows, index)[1:]]
-            restore()
-            finite = torch.isfinite(want[0])
-            same = (torch.equal(finite, torch.isfinite(got[0]))
-                    and torch.allclose(got[0][finite], want[0][finite], atol=0.05, rtol=0.05)
-                    and torch.allclose(got[1], want[1], atol=0.05, rtol=0.05))
-            print(f'CUDA graph for batch {len(index)}: {"ok" if same else "MISMATCH, using eager calls"}', flush=True)
-            return g if same else None
-        except Exception as error:  # noqa: BLE001 - any recording failure: keep the eager path
-            restore()
-            print(f'CUDA graph for batch {len(index)} failed ({error!r}); using eager calls', flush=True)
-            return None
 
     def _rows(self, seats):
         for seat in seats:
             if seat not in self.rows:
                 self.rows[seat] = len(self.rows)
-        if len(self.rows) > self.capacity:  # more seats than rows: grow (recorded graphs point at the old rows)
+        if len(self.rows) > self.capacity:
             self._allocate(2 * len(self.rows))
-        return np.array([self.rows[seat] for seat in seats], np.int64)
+        return torch.tensor([self.rows[seat] for seat in seats], device=self.device)
 
     @torch.no_grad()
     def act(self, requests):
-        """requests: [(seat, model key, packed feature row)] -> [(action, logp, value)] in the same order."""
+        """requests: [(seat, model key, packed input row)] -> [(action, logp, value)] in the same order."""
         by_model = defaultdict(list)
         for i, (seat, key, row) in enumerate(requests):
             by_model[key].append(i)
-        pending = []
-        for key, idx in by_model.items():  # every model's share launched before the first copy back waits
-            n, index = len(idx), self._rows([requests[i][0] for i in idx])
-            bucket = next((b for b in GRAPH_BUCKETS if b >= n), None) if self.graphs is not None else None
-            rows = np.stack([requests[i][2] for i in idx])
-            if bucket:
-                rows = np.concatenate([rows, np.zeros((bucket - n, ROW_BYTES), np.uint8)])
-                index = np.concatenate([index, np.full(bucket - n, self.capacity)])  # padding uses the scratch row
-            rows = torch.from_numpy(rows).to(self.device, non_blocking=True)
-            index = torch.from_numpy(index).to(self.device, non_blocking=True)
-            if bucket and (key, bucket) not in self.graphs:
-                self.graphs[(key, bucket)] = self._record(self.models[key], rows, index)
-            g = self.graphs.get((key, bucket)) if bucket else None
-            if g is None:
-                out = self._decide(self.models[key], rows, index)[0]
-            else:
-                g['rows'].copy_(rows)
-                g['index'].copy_(index)
-                g['graph'].replay()
-                out = g['out']
-            pending.append((idx, out[:n]))
         results = [None] * len(requests)
-        for idx, out in pending:
-            for i, (a, logp, v) in zip(idx, out.cpu().tolist()):
-                results[i] = (int(a), logp, v)
+        for key, idx in by_model.items():
+            model, index = self.models[key], self._rows([requests[i][0] for i in idx])
+            x = policy.tensors({k: v[:, None] for k, v in policy.stack([requests[i][2] for i in idx]).items()}, self.device)
+            state = self.h.index_select(1, index), self.c.index_select(1, index)
+            # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
+            with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda'):
+                out = model(x, state)
+                action, logp = policy.sample(model, out, x, policy.ABILITY_EXPLORE)
+            self.h.index_copy_(1, index, out['state'][0].float())
+            self.c.index_copy_(1, index, out['state'][1].float())
+            for i, a, lp, v in zip(idx, action.tolist(), logp.float().tolist(), out['value'][:, 0].float().tolist()):
+                results[i] = (a, lp, v)
         return results
 
     def reset(self, seats):
@@ -405,7 +304,8 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
         if device.index is None:  # 'cuda' (--device auto): torch.cuda.set_device needs an index
             device = torch.device('cuda', torch.cuda.current_device())
         torch.cuda.set_device(device)  # CUDA graphs and streams use the current device
-    model, _ = load_policy(args.init, device)  # the architecture; weights come from `shared`
+    vocab = policy.FE.Vocab.load(Path(args.out) / 'vocab.json')
+    model, _ = load_policy(args.init, device, vocab)  # the architecture; weights come from `shared`
 
     def refresh():
         with lock:
@@ -416,8 +316,8 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
 
     seen = refresh()
     pool = {'il': args.il or args.init, **{q.stem: str(q) for q in sorted(opponent_dir(args).glob('*.pt'))}}
-    server = Server({'current': model.eval(), **{k: load_policy(v, device)[0].eval() for k, v in pool.items()}},
-                    device, model.config['core'])
+    server = Server({'current': model.eval(), **{k: load_policy(v, device, vocab)[0] for k, v in pool.items()}},
+                    device, model.config.core)
     owners, first, window = [], None, args.batch_ms / 1000  # [(collector pipe, its requests)]
     # Collectors with a game on this server (asked since their last reset). Every collector is connected to every
     # server, so "all connections waiting" never happened and every round waited the whole window; a round is now
@@ -436,7 +336,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
             seen = refresh()
         while not snapshots.empty():
             path = Path(snapshots.get())
-            server.models[path.stem] = load_policy(path, device)[0].eval()
+            server.models[path.stem] = load_policy(path, device, vocab)[0]
         t0 = time.perf_counter()
         timeout = 1 if first is None else max(0.0, window - (t0 - first))
         for conn in wait(conns, timeout=timeout):
@@ -459,7 +359,7 @@ def decision_server(sid, args, conns, shared, version, lock, snapshots, stats, l
         if owners and (t1 - first >= window or len(owners) >= len(active)):
             requests = [r for _, payload in owners for r in payload]
             for key in {r[1] for r in requests} - server.models.keys():  # a snapshot newer than this server (il.rl join)
-                server.models[key] = load_policy(opponent_dir(args) / f'{key}.pt', device)[0].eval()
+                server.models[key] = load_policy(opponent_dir(args) / f'{key}.pt', device, vocab)[0]
             replies = server.act(requests)
             t2 = time.perf_counter()
             k = 0
@@ -488,7 +388,7 @@ def remote(slot, run, local=None):
     raise_thread_limit()
     first = endpoint(run)
     name = f'{socket.gethostname()}-{os.getppid()}-{slot}'
-    engine, vocab = collector_engine(name, first['out'], first['clapha'], slot // 4 * 8)
+    engine, vocab, legal = collector_engine(name, first['out'], first['clapha'], slot // 4 * 8)
     while True:
         learner, servers = None, []
         try:
@@ -499,7 +399,7 @@ def remote(slot, run, local=None):
             hello = receive(learner)
             servers = local or [Client(tuple(address), authkey=key) for address in ep['servers']]
             print(f'connected to {ep["host"]} as collector {hello["index"]}', flush=True)
-            play_games(hello['index'], ep['delay'], engine, vocab, learner, servers)
+            play_games(hello['index'], ep['delay'], engine, vocab, legal, learner, servers)
             print('the learner stopped; waiting for the next one', flush=True)
         except (OSError, EOFError) as error:  # learner gone, restarting, or not up yet
             print(f'not connected ({error!r}); retrying', flush=True)

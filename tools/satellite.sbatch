@@ -3,8 +3,10 @@
 # (MPS on its GPU) play the learner's games, the weights come from the learner (il.rl join --servers). It also runs
 # il.autopilot, which evaluates for ~5 min per snapshot; at nice 0 it takes the CPUs it needs from the collectors.
 #
-#   cd ~/cr-engine && sbatch tools/satellite.sbatch          # waits for the learner, reconnects when it restarts
-#   RUN=~/cr-engine/runs/other AUTOPILOT=0 sbatch tools/satellite.sbatch
+#   cd ~/cr-engine && RUN=~/cr-engine/runs/ppo-general sbatch tools/satellite.sbatch   # waits for the learner, reconnects
+#   RUN=... AUTOPILOT=0 sbatch tools/satellite.sbatch
+#   autopilot: START = the run's starting checkpoint (default the IL model the learner started from), PANEL = more
+#   "name=checkpoint" panel models, DECK = a specialist's deck
 #   scancel --name=cr-ppo                                    # stops it and the learner
 #
 # qos_p107-rtx5090 allows 16 CPUs per user (separate from the A100 job's QoS); a second GPU would add no CPUs.
@@ -20,13 +22,13 @@
 
 ulimit -u 65536
 cd "$HOME/cr-engine"
-R=$HOME/cr-engine/runs
-RUN=${RUN:-$R/ppo-ebarbs2}
+RUN=${RUN:?RUN: the run directory of the learner}
 PY="env PYTHONPATH=. /public/app/miniconda3/py312_24.4.0-0/bin/python"
 if [ "${AUTOPILOT:-1}" = 1 ]; then
-  $PY -m il.autopilot "$HOME/clapha-engine" "$RUN" --start "${START:-$R/ebarbs-start.pt}" \
-    --panel general=$R/ppo-general/latest.pt --panel il=$R/il-002/best.pt \
-    --deck 26000043:1,26000020,26000036:1,26000052,26000017:2,26000083,28000015,28000026 \
+  until [ -f "$RUN/endpoint.json" ]; do sleep 30; done
+  START=${START:-$($PY -c "import json, sys; print(json.load(open(sys.argv[1]))['init'])" "$RUN/endpoint.json")}
+  $PY -m il.autopilot "$HOME/clapha-engine" "$RUN" --start "$START" --panel "il=$START" \
+    $(for p in $PANEL; do echo --panel "$p"; done) ${DECK:+--deck "$DECK"} \
     > runs/autopilot-$SLURM_JOB_ID.out 2>&1 &
 fi
 exec nice -n 5 $PY -m il.rl join "$RUN" --collectors "${COLLECTORS:-36}" --servers "${SERVERS:-3}"

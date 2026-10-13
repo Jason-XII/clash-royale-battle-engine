@@ -20,30 +20,28 @@ def main():
     args = ap.parse_args()
     from native_engine import Play
     from native_engine.clapha import ClaphaEngine
-    from il import clapha_agent
+    from il import policy
     from il.arena import make_match, mirror
-    from il.data import PLAY_DELAY
-    FE, _ = clapha_agent._modules()
-    model, vocab = clapha_agent.load(args.checkpoint)
-    legal = clapha_agent.legal_fn()
+    FE = policy.FE
+    model, vocab, _ = policy.load(args.checkpoint)
+    legal = policy.legal_fn()
     engine = ClaphaEngine(args.clapha)
     match = make_match(mirror(args.deck), args.seed)
     state = engine.reset(match=match)
-    record = engine.record()
-    agents = [clapha_agent.Agent(model, vocab, o, match, record, legal) for o in (0, 1)]
-    seen = [[], []]
-    original = agents[0].view.step, agents[1].view.step
-    for o in (0, 1):  # keep what each agent's view built
-        agents[o].view.step = (lambda o: lambda d, c: seen[o].append(original[o](d, c)) or seen[o][-1])(o)
-    commands, records, queued, events = clapha_agent.Commands(), [], [], []
+    inputs = policy.Inputs(engine, match, {0: vocab, 1: vocab}, legal)
+    agents = [policy.Agent(model, o) for o in (0, 1)]
+    seen, records, queued, events = [[], []], [], [], []  # what each player's inputs were while playing
+    original = inputs.engine.record
+    inputs.engine.record = lambda: records.append(original()) or records[-1]  # keep every record the inputs read
     while not state.finalized and state.tick < 7200:
-        record, issued = engine.record(), commands.update(state, engine)
-        records.append(record)
+        rows = inputs(state)
         events += [(p.tick, p.owner, p.card) for p in state.plays]
         queued += [p for p in engine.pending if p.get('card') is not None and not any(p is q for q in queued)]
-        choices = [a.act(record, issued) for a in agents]
+        for o in (0, 1):
+            seen[o].append(rows[o])
+        choices = [a.act(rows[a.owner]) for a in agents]
         plays = [Play(a.owner, *c[1:]) for a, c in zip(agents, choices) if c[0] == 'card']
-        state = engine.step(plays, 5, delay=PLAY_DELAY).state
+        state = engine.step(plays, 5, delay=(23, 27)).state
     events += [(p.tick, p.owner, p.card) for p in state.plays]
     landed = []  # each play that left a hand, with the queued command it came from (its due tick is when it landed)
     for tick, owner, card in events:
