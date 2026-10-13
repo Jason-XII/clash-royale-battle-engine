@@ -22,7 +22,7 @@
 | 4. Check a checkpoint in the engine: inputs = IL inputs, decision time, arena, 5 PPO updates | `tools/check.sbatch` | |
 | 5. PPO self-play, autopilot | `il/rl.py`, `il/actors.py`, `il/policy.py`, `il/autopilot.py` | `tools/train.sbatch` + `tools/satellite.sbatch` |
 | 6. Model vs model, defense | `il/arena.py`, `il/defense.py` | |
-| 7. Live Null's Royale games | open: `il/live.py` plays only the old models (emulator probe); clapha-il models need the record live | |
+| 7. Live Null's Royale games (Mac, emulator) | `il/live.py`, `il/live_record.py` + Arron's reader ported to Nulls (`~/clapha-console`, branch `nulls`) | |
 
 The model's inputs are built by one function in every stage: clapha-il's `PlayerView` on the raw record (converted
 replays in IL, `ClaphaEngine.record()` in self-play and the arena). `tools/check_clapha_inputs.py` proves a game played
@@ -37,10 +37,12 @@ il/rl.py                 PPO learner: matchmaking (opponents, decks), the update
 il/actors.py             collectors (games, reward shaping), decision servers (GPU, MPS)
 il/arena.py              model vs model (clapha-il or old checkpoints); il/defense.py: how a player defends
 il/autopilot.py          evaluates every PPO snapshot, keeps best.pt, rolls the learner back when it degrades
+il/live.py               live Nulls games: reader frames -> il/live_record.py (clapha-il records) -> il.policy -> adb taps
 il/test_policy.py        packed inputs, log-probs, one PPO update (no engine needed)
 tools/                   Slurm jobs; check_clapha_inputs.py, time_decision.py
-old stack                il/data.py, il/model.py, il/live.py, build_cache.py, emulator.py, prebuilt/, vendor/: the
-                         il-002 / ppo-ebarbs2 models, kept as arena baselines until the clapha-il pipeline beats them
+old stack                il/data.py, il/model.py, build_cache.py, prebuilt/, vendor/: the il-002 / ppo-ebarbs2 models,
+                         kept as arena baselines until the clapha-il pipeline beats them; emulator.py still starts the
+                         emulator through FirstLight's probe
 ```
 
 ## Commands
@@ -58,6 +60,23 @@ PYTHONPATH=. python -m il.arena ~/clapha-engine A.pt B.pt --games 400         # 
 
 Never run engine games, profiling or training on the login node: in a job, or on the Mac for what needs no engine
 (`CLAPHA_IL=~/clapha-il-dev python -m il.test_policy CHECKPOINT GAMES`).
+
+## Live games (Null's Royale, Mac)
+
+The game runs in the Android Studio emulator (AVD Pixel_9_2, `python3 -m native_engine.emulator start` then `bootstrap
+--online`). Arron's live reader, ported to the Nulls build (its values and how to build and push it:
+`~/clapha-console/nulls/README.md`), reads the battle from the game's memory every 50 ms, read-only. `il/live.py` turns
+each frame into the record a clapha-il model reads in self-play (`il/live_record.py`), decides every 5 ticks from tick 90
+and plays by adb taps; a battle's log goes to `runs/live/` (`python -m il.defense --live runs/live/*.jsonl`).
+
+```bash
+CLAPHA_IL=~/clapha-il-dev python3 -m il.live CHECKPOINT --tables TABLES.json --queue --games 10   # ladder
+```
+
+TABLES: clapha-engine `crx/export_tables.py` on the August engine. Use ladder games to judge live play: Training Camp
+runs locally against the trainer (no server round-trip), so its timing differs. Measured on the ladder (2026-10-13):
+every tap lands 21-22 ticks later. Not read live yet: the opponent's plays before they land (the client's command
+queue), which imitation learning showed 13 ticks early.
 
 ## PPO
 
