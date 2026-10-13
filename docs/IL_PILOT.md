@@ -24,12 +24,10 @@ folder (`shasum -a 256 -c SHA256SUMS`); the collected battles are the **-v2** ta
 | 8. The full run | `tools/il.sbatch` (below) | the rules in "Starting the full run" all hold |
 | (later) Arron's collected battles | `tools/oracle_collected.sbatch` | not needed for the full run; for the matchup specialists |
 
-**One clapha-il.** Done 2026-10-14: Jason's branch is merged into main (b607bd1). Work on main from now on; it holds
-`PlayerView` together with clapha-il's 2026-10-12 changes to `features.py` (time since an ability was used, the Royal Chef
-cooking clock, channel names) and `train.py` (the card loss only where the whole hand is known; --resume, --patience,
-best.pt, --val-games; several --games; `cycle.own_views`, the fast hand reconstruction). The pilot, the full run and the
-arena must all run the same clapha-il commit,
-or the arena plays a model with inputs it was not trained on. Re-run `check_clapha_inputs.py` after the merge.
+**One clapha-il.** Done 2026-10-14: Jason's branch is merged into main (b607bd1), with every input and label
+byte-for-byte unchanged (168 player-games). Work on main from now on: `PlayerView`, next-play, bf16 / cosine and the
+crash recovery are there together with --resume / --patience / best.pt, the idle-game rule and the faster conversion.
+Re-run `check_clapha_inputs.py` once on main.
 
 Arron's mac checks of the same code (2026-10-12): 60 IL_Replay + 24 collected games converted, all kept, PASS, audit
 with no flags; a 300-game oracle sample: 211 exact, all of them pass the elixir check.
