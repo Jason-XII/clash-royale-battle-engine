@@ -3,10 +3,11 @@
 For Jason and his AI. The IL model and pipeline live in the private repo ClashAlpha/clapha-il; the engine side (oracle,
 readers) in ClashAlpha/clapha-engine. This page is the order of work on the cluster and what must be true after each
 step. The full checks, and what a wrong number means: clapha-il `docs/MONITOR.md`. Stop at any failed check and tell
-Arron; do not work around it.
+Arron; do not work around it. Policies, what to do when something goes wrong, and how speed-ups are done here:
+clapha-il `docs/HANDOFF.md` (private repo) — read it first.
 
 Before converting: `git pull` in ~/clapha-engine (795e83a or later: the Dagger Duchess read failed in every battle after
-an engine's first, so earlier conversions have no daggers) and in ~/clapha-il (99ebee7 or later: the training input is built ~4x faster per core and batches carry only the
+an engine's first, so earlier conversions have no daggers) and in ~/clapha-il (0155582 or later: conversion 2.7x faster with identical records; idle games left out; and from 99ebee7: the training input is built ~4x faster per core and batches carry only the
 object slots they use; every value byte-for-byte the same as before, checked on 168 player-games with
 `tools/compare_features.py`). Game files: Arron's Drive
 folder (`shasum -a 256 -c SHA256SUMS`); the collected battles are the **-v2** tar.
