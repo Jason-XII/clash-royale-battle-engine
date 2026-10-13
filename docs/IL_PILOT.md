@@ -32,7 +32,8 @@ every `metrics.jsonl`). No checkpoints, no game data. Arron's AI reads them and 
 ## Starting the full run (no need to wait for Arron when every rule below holds)
 
 Use each run's last validation line in `metrics.jsonl` (`best_score` = the lowest what + which + tile loss on held-out
-games; lower is better) and the IL audit's `baselines` (`audit-il.json`).
+games; lower is better; a run started before clapha-il 5c7aa25 has no `best_score`: take the lowest what + which + tile
+over its validation lines) and the IL audit's `baselines` (`audit-il.json`). Pull clapha-il before the pilot.
 
 **1. Every run must be healthy.** If any rule fails for `pilot-base`, stop and tell Arron; if it fails for another run,
 leave that run out of step 2 and say so in the report.
