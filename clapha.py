@@ -206,6 +206,15 @@ class ClaphaEngine:
                                 e['cycleRemaining'] or 0, bool(e['ready'])) for e in p['evolutionRuntime'])
                 for p in self.env.reader.players_lean(self.env.battle)]
 
+    def record(self):
+        """The current decision's raw record as clapha-il's convert.py stores it (the lean frame without its objects,
+        objects(), unit_states()): the input of clapha_il.features.PlayerView, so games played here and converted
+        replays are read by the same code."""
+        r, battle = self.env.reader, self.env.battle
+        lean = r.frame(battle)
+        return {'tick': self.env.tick(), 'lean': {k: v for k, v in lean.items() if k != 'objects'},
+                'objects': r.objects(battle), 'units': r.unit_states(battle)}
+
     def run(self, ticks, count):
         states = []
         for _ in range(count):

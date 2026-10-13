@@ -78,24 +78,34 @@ def worker(index, args, jobs, out):
     from native_engine import Play
     from native_engine.build_cache import ENTITY_TYPES
     from native_engine.clapha import ClaphaEngine
+    from . import clapha_agent
     from .model import Agent, load
     torch.set_num_threads(1)
     engine = ClaphaEngine(args.clapha)
-    models = [load(args.a), load(args.b)]
+    kinds = [clapha_agent.is_clapha_il(path) for path in (args.a, args.b)]  # clapha-il checkpoints play from raw records
+    models = [clapha_agent.load(path) if new else load(path) for path, new in zip((args.a, args.b), kinds)]
+    legal = clapha_agent.legal_fn() if any(kinds) else None
     for game, pair in jobs:
         a_owner = game % 2
         if args.a_deck:  # A always plays this deck, B the pair's deck on its side
             pair = dict(pair, decks=[mirror(args.a_deck)['decks'][0] if o == a_owner else pair['decks'][o] for o in (0, 1)])
         match = make_match(pair, game + 1)
-        agents = [Agent(*models[0 if owner == a_owner else 1], owner, decode=args.decode) for owner in (0, 1)]
         state = engine.reset(match=match)
+        record = engine.record() if any(kinds) else None
+        agents = [clapha_agent.Agent(*models[m], owner, match, record, legal) if kinds[m] else
+                  Agent(*models[m], owner, decode=args.decode)
+                  for owner in (0, 1) for m in [0 if owner == a_owner else 1]]
+        commands = clapha_agent.Commands()
         started, plays = time.perf_counter(), [0, 0]
         frames, landed = [], []
         while not state.finalized and state.tick < 7200:
             frames.append((state.tick, np.array([(e.owner, e.card, e.x, e.y, -1 if e.hp is None else e.hp,
                                                   -1 if e.max_hp is None else e.max_hp, ENTITY_TYPES.index(e.entity_type))
                                                  for e in state.entities], np.int64).reshape(-1, 7)))
-            chosen = [Play(a.owner, *c[1:]) for a in agents for c in [a.act(state)] if c[0] == 'card']
+            if any(kinds):
+                record, issued = engine.record(), commands.update(state, engine)
+            choices = [a.act(record, issued) if isinstance(a, clapha_agent.Agent) else a.act(state) for a in agents]
+            chosen = [Play(a.owner, *c[1:]) for a, c in zip(agents, choices) if c[0] == 'card']
             transition = engine.step(chosen, 5, delay=args.delay)
             for p, ok in zip(chosen, transition.executed):
                 plays[p.owner] += ok
