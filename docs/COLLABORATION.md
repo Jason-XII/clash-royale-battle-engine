@@ -12,9 +12,10 @@ lasting findings are recorded.
 | Pull requests from Arron (fixes, speed-ups) | this repo, from arronwang01/clash-royale-battle-engine | yes |
 | What the model's input lacks | [docs/MODEL_INPUTS.md](MODEL_INPUTS.md) | yes |
 | How the live client takes a play (deal, refill, elixir, timing) | [docs/GAME_INTEGRATION.md](GAME_INTEGRATION.md) | yes |
-| The engine: loader, per-build addresses, porting a new game build, engine reads per card | github.com/arronwang01/clapha-engine | **no** (Jason has access) |
-| Training metrics for Arron | sent by Jason on request (below) | no |
-| Arron's console: Mac app that plays on the MuMu emulator with a model (FirstLight's or this repo's), HUD, Wi-Fi phone | github.com/arronwang01/clapha-console (its README says what it is and what it needs) | **no** (Jason has access) |
+| The engine: loader, per-build addresses, porting a new game build, engine reads per card, the version oracle | github.com/ClashAlpha/clapha-engine | **no** (Jason has access) |
+| Imitation learning from scratch: converter, inputs, model, monitoring | github.com/ClashAlpha/clapha-il; the pilot's steps: [docs/IL_PILOT.md](IL_PILOT.md) | **no** (Jason has access) |
+| Training metrics for Arron | sent by Jason on request (below); IL reports on clapha-il's `reports` branch | no |
+| Arron's console: Mac app that plays on the MuMu emulator with a model (FirstLight's or this repo's), HUD, Wi-Fi phone | github.com/ClashAlpha/clapha-console (its README says what it is and what it needs) | **no** (Jason has access) |
 
 Rule of thumb: anything about the engine's insides (addresses, memory layouts, how a new game build is ported) goes to
 clapha-engine; everything else goes here.
