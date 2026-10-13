@@ -64,11 +64,18 @@ def main():
             a, b = x[k], live[k]
             if k in ('hand_card', 'cycle_card'):  # the replay path hides what the start order leaves uncertain
                 b = np.where(a == 1, 1, b)
+            if k == 'hand_float':  # and flags it (column 4)
+                a, b = np.delete(a, 4, -1), np.delete(b, 4, -1)
             diff = (a != b) if a.dtype.kind in 'biu' else ~np.isclose(a, b, atol=1e-6)
             rows = np.flatnonzero(diff.reshape(len(a), -1).any(1))
             if len(rows):
                 bad += 1
                 print(f'owner {o} {k}: {len(rows)} of {len(a)} decisions differ, first at tick {records[rows[0]]["tick"]}')
+                for r in rows[:3]:
+                    t = records[r]['tick']
+                    near = [(p['due'], p['card'], 'landed' if any(p is q for _, q in landed) else 'never landed')
+                            for p in queued if p['owner'] == o and abs(p['due'] - t) <= 40]
+                    print(f'    tick {t}: replay {a[r].tolist()} played {b[r].tolist()}; own plays near: {near}')
         unknown = (x['hand_card'] == 1).mean()
         print(f'owner {o}: {len(seen[o])} decisions, {sum(1 for _, p in landed if p["owner"] == o)} plays landed, '
               f'reconstructed hand unknown {unknown:.1%}')
