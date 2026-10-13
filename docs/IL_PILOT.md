@@ -24,7 +24,7 @@ folder (`shasum -a 256 -c SHA256SUMS`); the collected battles are the **-v2** ta
 | 8. The full run | `tools/il.sbatch` (below) | the rules in "Starting the full run" all hold |
 | (later) Arron's collected battles | `tools/oracle_collected.sbatch` | not needed for the full run; for the matchup specialists |
 
-**One clapha-il.** Done 2026-10-14: Jason's branch is merged into main (b607bd1), with every input and label
+**One clapha-il.** Done 2026-10-13: Jason's branch is merged into main (b607bd1), with every input and label
 byte-for-byte unchanged (168 player-games). Work on main from now on: `PlayerView`, next-play, bf16 / cosine and the
 crash recovery are there together with --resume / --patience / best.pt, the idle-game rule and the faster conversion.
 Re-run `check_clapha_inputs.py` once on main.
