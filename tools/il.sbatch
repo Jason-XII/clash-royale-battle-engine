@@ -6,6 +6,7 @@
 #   cd ~/cr-engine && RUN=pilot-base sbatch tools/il.sbatch
 #   RUN=pilot-no-attention FLAGS="--attention-layers 0" sbatch -A competition -p P107-RTX5090 -q qos_p107-rtx5090 tools/il.sbatch
 #
+# Then 200 arena games each against runs/ppo-ebarbs2/best.pt and runs/il-002/best.pt (<run>/arena.jsonl).
 # The pilot (docs/TRAINING.md): 20k games, 4 epochs, from a frozen copy of the first converted games (~/il-raw-pilot),
 # so the full conversion can go on appending to ~/il-raw meanwhile.
 #SBATCH --job-name=cr-il
@@ -38,5 +39,14 @@ FE.Vocab.build(sample, extra=effects | train._all_ids()).save(out + '.tmp')
 os.replace(out + '.tmp', out)
 EOF
 fi
-exec $PY train.py --games "$GAMES" --out "$HOME/il-runs/$RUN" --vocab "$VOCAB" --limit-games "${LIMIT:-20000}" \
+$PY train.py --games "$GAMES" --out "$HOME/il-runs/$RUN" --vocab "$VOCAB" --limit-games "${LIMIT:-20000}" \
     --epochs "${EPOCHS:-4}" --workers $((SLURM_CPUS_PER_TASK - 1)) --device cuda --firstlight ~/firstlight-cr $FLAGS
+# Then games in the engine (plays landing 23-27 ticks after the decision, as the labels): against the E-Barbs specialist
+# and the first imitation model, on real ladder deck pairs -> <run>/arena.jsonl
+ulimit -u 65536
+cd "$HOME/cr-engine"
+R=$HOME/cr-engine/runs
+for B in $R/ppo-ebarbs2/best.pt $R/il-002/best.pt; do
+  env PYTHONPATH=. $PY -m il.arena "$HOME/clapha-engine" "$HOME/il-runs/$RUN/latest.pt" "$B" --games 200 \
+      --procs "$SLURM_CPUS_PER_TASK" --delay 23-27 --decode policy --pool data/deck_pool.json --out "$HOME/il-runs/$RUN/arena.jsonl"
+done
