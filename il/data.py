@@ -22,6 +22,11 @@ REVEALED = 8
 # A play lands ~22 ticks (1.1 s) after the tap (measured live: 21-25), so a human decided on the
 # board ~22 ticks before the command's execution tick; labels use that board.
 DEPLOY_DELAY = 22
+# A replay's play landing at tick c is labelled at the last decision before c - DEPLOY_DELAY: 23-27 ticks before it lands,
+# by where in a decision's 5 ticks the human tapped (live: the tap a tick or two after the read, the command executing 21
+# after its issue tick). Games played for a model trained so (ClaphaEngine.step(delay=PLAY_DELAY)) land each play that
+# long after its decision.
+PLAY_DELAY = (DEPLOY_DELAY + 1, DEPLOY_DELAY + 5)
 # The game accepts a tap up to ~1 elixir short and lands the card once it is affordable; at the
 # board 22 ticks before execution humans were short by <= 0.8 elixir in 99.5% of plays.
 AFFORD_SLACK = 8000

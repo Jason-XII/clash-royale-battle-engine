@@ -85,6 +85,7 @@ def worker(index, args, jobs, out):
     kinds = [clapha_agent.is_clapha_il(path) for path in (args.a, args.b)]  # clapha-il checkpoints play from raw records
     models = [clapha_agent.load(path) if new else load(path) for path, new in zip((args.a, args.b), kinds)]
     legal = clapha_agent.legal_fn() if any(kinds) else None
+    lag = args.delay if isinstance(args.delay, int) else sum(args.delay) // 2  # for il.defense: about when plays land
     for game, pair in jobs:
         a_owner = game % 2
         if args.a_deck:  # A always plays this deck, B the pair's deck on its side
@@ -110,7 +111,7 @@ def worker(index, args, jobs, out):
             for p, ok in zip(chosen, transition.executed):
                 plays[p.owner] += ok
                 if ok:
-                    landed.append((state.tick + args.delay, p.owner, p.x, p.y))
+                    landed.append((state.tick + lag, p.owner, p.x, p.y))
             state = transition.state
         guard = defense.game(frames, landed)
         winner = None if state.result not in (0, 1) else 'A' if state.result == a_owner else 'B'
@@ -175,7 +176,9 @@ def main():
     parser.add_argument('b', help='checkpoint B')
     parser.add_argument('--games', type=int, default=400)
     parser.add_argument('--procs', type=int, default=16)
-    parser.add_argument('--delay', type=int, default=D.DEPLOY_DELAY, help='decision -> landing ticks (0: instant)')
+    parser.add_argument('--delay', type=lambda v: tuple(map(int, v.split('-'))) if '-' in v else int(v),
+                        default=D.DEPLOY_DELAY, help="decision -> landing ticks (0: instant), or a range drawn per play "
+                        "(23-27: il.data.PLAY_DELAY, as clapha-il models were labelled)")
     parser.add_argument('--decode', choices=('gate', 'sample', 'argmax', 'policy'), default='gate',
                         help="policy: il.rl's training policy (wait with p(wait), else card x cell at its temperature)")
     parser.add_argument('--deck', help='8 comma-separated cards, id or id:el (el = evolution flag as in replays): '

@@ -12,6 +12,7 @@ Differences from the probe, each filled to match it:
 """
 import ctypes
 from pathlib import Path
+import random
 import resource
 import sys
 import tempfile
@@ -96,7 +97,8 @@ class ClaphaEngine:
 
     def step(self, actions=(), ticks=5, delay=0):
         """Plays decided on the current state land `delay` ticks later (live: il.data.DEPLOY_DELAY), or on the
-        next tick with delay=0. As the live client does (engine.HOLD_TICKS), a play the elixir cannot pay for yet is held
+        next tick with delay=0; `delay` = (low, high): each play draws its own (il.data.PLAY_DELAY, as human replays
+        are labelled). As the live client does (engine.HOLD_TICKS), a play the elixir cannot pay for yet is held
         until it can, for at most HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
         for within that is refused. As il.live does, a player with a play in flight cannot start another.
         `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
@@ -104,7 +106,8 @@ class ClaphaEngine:
         executed = []
         for a in actions:
             free = all(p['owner'] != a.owner for p in self.pending)
-            due = before.tick + max(delay, 1)
+            lag = max(delay if isinstance(delay, int) else random.randint(*delay), 1)
+            due = before.tick + lag
             if a.slot == ABILITY:  # a tap on the ability button: lands like a card, if a carrier is still ready then
                 ok = free and any(x.ready for x in before.players[a.owner].abilities)
                 if ok:
@@ -115,7 +118,7 @@ class ClaphaEngine:
             card = next((h for h in me.hand if h.slot == a.slot), None)
             ok = card is not None and free and card.cost * 10000 <= me.elixir + hold_slack(before.tick)
             if ok:
-                self.pending.append(dict(due=due, delay=max(delay, 1), held=card.cost * 10000 > me.elixir,
+                self.pending.append(dict(due=due, delay=lag, held=card.cost * 10000 > me.elixir,
                                          hold_until=before.tick + HOLD_TICKS, owner=a.owner, slot=a.slot,
                                          card=card.card, cost=card.cost, x=a.x, y=a.y))
             executed.append(ok)

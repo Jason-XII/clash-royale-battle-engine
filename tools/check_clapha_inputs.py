@@ -22,7 +22,7 @@ def main():
     from native_engine.clapha import ClaphaEngine
     from il import clapha_agent
     from il.arena import make_match, mirror
-    from il.data import DEPLOY_DELAY
+    from il.data import PLAY_DELAY
     FE, _ = clapha_agent._modules()
     model, vocab = clapha_agent.load(args.checkpoint)
     legal = clapha_agent.legal_fn()
@@ -43,7 +43,7 @@ def main():
         queued += [p for p in engine.pending if p.get('card') is not None and not any(p is q for q in queued)]
         choices = [a.act(record, issued) for a in agents]
         plays = [Play(a.owner, *c[1:]) for a, c in zip(agents, choices) if c[0] == 'card']
-        state = engine.step(plays, 5, delay=DEPLOY_DELAY).state
+        state = engine.step(plays, 5, delay=PLAY_DELAY).state
     events += [(p.tick, p.owner, p.card) for p in state.plays]
     landed = []  # each play that left a hand, with the queued command it came from (its due tick is when it landed)
     for tick, owner, card in events:
