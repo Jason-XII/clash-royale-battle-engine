@@ -25,7 +25,7 @@ UNIT_STATE_NAMES = ('hidden', 'immune', 'invisible', 'airborne', 'stops_movement
                     'special_cooldown_s', 'invisible_again_s', 'dash_hop')
 OBJ_FLOAT_NAMES = ('x', 'y', 'dx', 'dy', 'hp_frac', 'log_max_hp', 'deploy_s', 'has_target', 'target_dx', 'target_dy',
                    'own', 'is_tower') + UNIT_STATE_NAMES + ('king_awake', 'daggers', 'spare_1', 'spare_2')
-HAND_FLOAT_NAMES = ('cost', 'affordable', 'evo_ready', 'evo_progress', 'unknown', 'spare_1', 'spare_2')
+HAND_FLOAT_NAMES = ('cost', 'affordable', 'evo_ready', 'evo_progress', 'unknown', 'level', 'spare_2')
 SCALAR_NAMES = ('elixir_own', 'elixir_opp', 'rate_1x', 'rate_2x', 'rate_3x', 'overtime', 'period_left_min',
                 'next_rate_min', 'crowns_own', 'crowns_opp', 'chef_cooking_own', 'chef_cooking_opp', 'spare_3', 'spare_4')
 assert len(UNIT_STATE_NAMES) == UNIT_STATES and len(OBJ_FLOAT_NAMES) == OBJ_FLOATS
@@ -39,6 +39,32 @@ EFFECT_VECTOR = {name: np.array(v, np.float32) for name, v in _EFF['effects'].it
 EFFECT_FIELDS = len(_EFF['fields'])
 _EFFECT_NAMES = {int(i): n for i, n in json.loads((ASSETS / 'effect_ids.json').read_text())['effects']}
 MIRROR = 28000006
+# Card levels (a model input when its Config says levels=True). A deck entry's native 'l' is the level above the
+# rarity's first level (convert.prepare writes it that way); objects need no level input: their max HP (log_max_hp)
+# already shows the level they were deployed at, Mirror's +1 and a Royal Chef pancake included.
+FIRST_LEVEL = {'Common': 1, 'Rare': 3, 'Epic': 6, 'Legendary': 9, 'Champion': 11}
+MAX_LEVEL = 16
+
+
+def deck_levels(match, owner):
+    """{card id: level} of `owner`'s deck in a native match (as convert.prepare and arena.make_match build them)."""
+    out = {}
+    for entry in match['battle'][f'deck{owner}']['sp']:
+        first = FIRST_LEVEL.get(RARITY.get(str(entry['d'])))
+        if first:
+            out[int(entry['d'])] = min(first + int(entry.get('l', 0)), MAX_LEVEL)
+    return out
+
+
+def hand_level(levels, card, last_own):
+    """The level a hand card would be played at, / MAX_LEVEL (Mirror: the copied card's + 1); 0 where unknown."""
+    if not levels:
+        return 0.0
+    if card == MIRROR:
+        level = levels.get(last_own) and min(levels[last_own] + 1, MAX_LEVEL)
+    else:
+        level = levels.get(card)
+    return level / MAX_LEVEL if level else 0.0
 UNKNOWN = -1                 # a hand card the replay reconstruction is not sure of
 WAIT, PLAY, ABILITY1, ABILITY2 = 0, 1, 2, 3
 NEXT_EDGES = (1, 2, 3, 5, 9, 17)
@@ -361,8 +387,9 @@ class PlayerView:
     starting hands that fit a replay's plays (convert.own_starts), where the hand is reconstructed; None where it is read
     (always known)."""
 
-    def __init__(self, owner, vocab, opp_heroes, legal=None, candidates=None):
+    def __init__(self, owner, vocab, opp_heroes, legal=None, candidates=None, levels=None):
         self.owner, self.vocab, self.opp_heroes, self.legal, self.candidates = owner, vocab, opp_heroes, legal, candidates
+        self.levels = {int(k): int(v) for k, v in (levels or {}).items()}  # own deck {card id: level}; empty: no input
         self.state = {'dropped': 0, 'effects_dropped': 0}
         self.prev, self.views, self.clock_state = {}, {}, {}
         self.states, self.played = (None, 0) if candidates is None else (set(candidates), 0)  # candidate states so far
@@ -402,7 +429,8 @@ class PlayerView:
             cost = (COSTS.get(last_own, 3) + 1) if real == MIRROR and last_own else COSTS.get(real, 3)
             e = evo.get(real) or {}
             hf[i] = (cost / 10, float(me['elixirRaw'] >= cost * 10000), float(bool(e.get('ready'))),
-                     (e.get('progress') or 0) / max(1, e.get('cycleRequired') or 1), float(c == UNKNOWN), 0.0, 0.0)
+                     (e.get('progress') or 0) / max(1, e.get('cycleRequired') or 1), float(c == UNKNOWN),
+                     0.0 if c == UNKNOWN else hand_level(self.levels, real, last_own), 0.0)
         x['hand_float'] = hf
         x['cycle_card'] = np.array([vocab(q) if q is not None else 1 for q in queue] + [1] * (4 - len(queue)), np.int64)
         ab = np.zeros((2, 4), np.float32)

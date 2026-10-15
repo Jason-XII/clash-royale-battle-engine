@@ -406,9 +406,10 @@ class Commands:
 
 class Inputs:
     """The inputs of the players in `vocabs` ({owner: vocabulary}), decision by decision, in one ClaphaEngine game: the
-    raw record once per decision, a PlayerView per player."""
+    raw record once per decision, a PlayerView per player. `levels` ({owner: bool}): that player's model reads card
+    levels (Config.levels); its own deck's come from the match."""
 
-    def __init__(self, engine, match, vocabs, legal):
+    def __init__(self, engine, match, vocabs, legal, levels=None):
         record = engine.record()
         self.engine, self.commands = engine, Commands()
         self.views = {}
@@ -416,7 +417,8 @@ class Inputs:
             other = 1 - owner
             forms = [c.get('el', 0) for c in match['battle'][f'deck{other}']['sp']]  # 1 evolution, 2 hero (as replays)
             heroes = C.opponent_heroes(record, forms, owner)
-            self.views[owner] = C.PlayerView(owner, vocab, heroes, legal)
+            self.views[owner] = C.PlayerView(owner, vocab, heroes, legal,
+                                             levels=C.deck_levels(match, owner) if (levels or {}).get(owner) else None)
 
     def __call__(self, state):
         record, issued = self.engine.record(), self.commands.update(state, self.engine)
@@ -439,7 +441,8 @@ def evaluate(engine, models, pair, seed, a_owner):
     state = engine.reset(match=match)
     seats = [0 if owner == a_owner else 1 for owner in (0, 1)]
     agents = [train.Agent(models[index][0], owner) for owner, index in enumerate(seats)]
-    inputs = Inputs(engine, match, {owner: models[index][1] for owner, index in enumerate(seats)}, C.cached_legal())
+    inputs = Inputs(engine, match, {owner: models[index][1] for owner, index in enumerate(seats)}, C.cached_legal(),
+                    {owner: models[index][0].config.levels for owner, index in enumerate(seats)})
     plays = [0, 0]
     while not state.finalized and state.tick < 7200:
         rows = inputs(state)

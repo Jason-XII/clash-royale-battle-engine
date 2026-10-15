@@ -434,13 +434,13 @@ def board(record):
              -1 if o['maxHp'] is None else o['maxHp'], kind(o)] for o in record['objects']]
 
 
-def play_battle(stream, first, model, vocab, records, owner, taps, log):
+def play_battle(stream, first, model, vocab, records, owner, taps, log, levels=None):
     """One battle from its first frame to its end -> the last record."""
     other = 1 - owner
     records.reset()
     record = records(first)
     forms = next(p['deck_form_flags'] for p in first['players'] if p['side'] == other)
-    view = C.PlayerView(owner, vocab, C.opponent_heroes(record, forms, owner), C.cached_legal())
+    view = C.PlayerView(owner, vocab, C.opponent_heroes(record, forms, owner), C.cached_legal(), levels=levels)
     agent, plays = train.Agent(model, owner), LivePlays()
     log({'event': 'start', 'owner': owner, 'tick': first['game_tick']})
     decided, pending, reported = None, None, 0  # pending: {'card', 'tick', 'due', 'x', 'y'} of a card tap not landed
@@ -500,10 +500,16 @@ def main():
     parser.add_argument('--games', type=int, default=1)
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--out', type=Path, default=Path.home() / 'cr-live/runs/live')
+    parser.add_argument('--levels', type=Path, help='JSON {card id: level} of our deck (models with Config.levels)')
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each ladder game')
     args = parser.parse_args()
     torch.set_num_threads(2)
     model, vocab, _ = train.load(args.checkpoint)
+    levels = None
+    if model.config.levels:  # the reader does not read card levels yet: our deck's, as the collection shows them
+        if not args.levels:
+            parser.error('this model reads card levels: pass --levels (JSON {card id: level} of our deck)')
+        levels = {int(k): int(v) for k, v in json.loads(args.levels.read_text()).items()}
     records = LiveRecords(args.tables)
     prepare(args.serial)
     taps, stream = Taps(args.serial), frames(args.serial)
@@ -541,7 +547,7 @@ def main():
                 raise SystemExit(f'account {args.account:#x} is not exactly one seat: {[hex(i) for i in ids]}')
             owner = ids.index(args.account)
             log({'event': 'roster', 'accounts': ids, 'owner': owner})
-            last = play_battle(stream, frame, model, vocab, records, owner, taps, log)
+            last = play_battle(stream, frame, model, vocab, records, owner, taps, log, levels)
             alive = {'objects': [o for o in last['objects'] if o['hp'] is None or o['hp'] > 0]}  # the last frame still
             score = (C.crowns(alive, owner), C.crowns(alive, 1 - owner))                     # lists a tower at 0 hp
             log({'event': 'end', 'tick': last['tick'], 'crowns': score})
