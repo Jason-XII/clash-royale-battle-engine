@@ -30,7 +30,7 @@ import common as C
 
 # ---- replay -> native match and commands --------------------------------------------------------------------------------
 CARDS = json.loads((C.ASSETS / 'replay_cards.json').read_text())
-FIRST_LEVEL = {'Common': 1, 'Rare': 3, 'Epic': 6, 'Legendary': 9, 'Champion': 11}
+FIRST_LEVEL = C.FIRST_LEVEL
 TOWER_FIRST_LEVEL = {159000000: 1, 159000001: 6, 159000002: 9, 159000004: 9}
 DEAL = (((2, 0, 4, 7), (6, 1, 3, 5)), ((7, 1, 4, 3), (6, 0, 2, 5)))
 SEED = 1784463263
@@ -483,6 +483,31 @@ def play_replay(native, payload):
 
 
 # ---- a played game -> inputs and labels ---------------------------------------------------------------------------------
+# Idle games (Arron, 2026-10-13): friends who do not want to beat each other play almost nothing for five minutes and
+# draw; learning from them teaches waiting and leaking elixir. Left out when either side leaked more than IDLE_LEAKED
+# elixir (RoyaleAPI's own figure). On 30,000 IL_Replay games: 105 (0.35%), median 4 plays per game; between 40 and 50
+# leaked the games already look normal (median 18 plays).
+IDLE_LEAKED = 50.0
+
+
+def leaked(payload):
+    """(team, opponent) elixir leaked as RoyaleAPI recorded it, None where not recorded. IL_Replay: battle.<side>.players[0]
+    .elixir_leaked; collected battles: replay.aggregate_stats.<side>.leaked."""
+    out = []
+    stats = (payload.get('replay') or {}).get('aggregate_stats') or {}
+    for side in ('team', 'opponent'):
+        players = ((payload.get('battle') or {}).get(side) or {}).get('players') or [{}]
+        value = players[0].get('elixir_leaked')
+        if value is None:
+            value = (stats.get(side) or {}).get('leaked')
+        out.append(None if value is None else float(value))
+    return tuple(out)
+
+
+def idle(leaked_pair):
+    return any(v is not None and v > IDLE_LEAKED for v in leaked_pair)
+
+
 def own_starts(deck_ids, plays):
     """Every starting (hand as a frozenset, queue as a tuple) of an 8-card deck that the play sequence fits. At most
     70 x 24 = 1,680 to try. Cards never played can sit anywhere among the slots the plays leave open."""
@@ -510,7 +535,8 @@ def game_features(game, owner, vocab, legal=None, compact=True):
     first = [p for p in decisions[0]['lean']['state']['players'] if p['owner'] == owner][0]
     forms = (header.get('episode') or {}).get(f'deck{1 - owner}_form_availability')
     view = C.PlayerView(owner, vocab, C.opponent_heroes(decisions[0], forms, owner), legal,
-                        own_starts([c['cardId'] for c in first['deck']], own_plays))
+                        own_starts([c['cardId'] for c in first['deck']], own_plays),
+                        levels=(header.get('levels') or {}).get(str(owner)))
     if compact:
         view.state['object_slots'] = min(C.MAX_OBJECTS, max(1, max(len(d['objects']) for d in decisions)))
     rows = [view.step(d, landed) for d in decisions]
@@ -543,7 +569,10 @@ def _snap_to_legal(inputs, labels):
 
 def _labels(header, decisions, ticks, owner, vocab, inputs):
     """The human's action at each decision: a play landing at tick c (the replay's tick) is labelled at the last
-    decision before c - 22 (the board at the tap). Ability presses the same way, at their own tick."""
+    decision before c - 22 (the board at the tap). Ability presses the same way: the replay's tick is when the
+    activation executes, and a press goes through the same command path as a card (arena.Engine.step lands it 23-27
+    ticks after the decision), so it is labelled at the tap too. Labelled at the execution tick (before 2026-10-15),
+    every learned press landed ~1.2 s late in self-play and the arena."""
     T = len(decisions)
     out = {'action_kind': np.zeros(T, np.int64), 'action_card': np.zeros(T, np.int64),
            'action_cell': np.zeros(T, np.int64), 'action_controller': np.zeros(T, np.int64),
@@ -556,8 +585,7 @@ def _labels(header, decisions, ticks, owner, vocab, inputs):
     for c in header['commands']:
         if c['owner'] != owner or (c['kind'] == 'card' and c.get('executed_tick', 0) is None):
             continue
-        i = int(np.searchsorted(ticks, c['tick'] - C.DEPLOY_DELAY)) - 1 if c['kind'] == 'card' else \
-            int(np.searchsorted(ticks, c['tick'])) - 1
+        i = int(np.searchsorted(ticks, c['tick'] - C.DEPLOY_DELAY)) - 1
         if i < 0 or i >= T or out['action_kind'][i]:
             continue
         if c['kind'] == 'card':
@@ -703,6 +731,13 @@ def worker(index, engine, jobs, out, clapha_engine):
         started = time.perf_counter()
         (out / f'current-{name}-{index}.txt').write_text(job['tag'])  # a native crash kills the worker here
         game = None
+        entry['leaked'] = leaked(payload)
+        if idle(entry['leaked']):
+            entry.update(kept=False, why='idle', seconds=0.0)
+            write_archive(archive_path(out, job['tag']), None, vocab, legal, entry)
+            index_file.write(json.dumps(entry) + '\n')
+            index_file.flush()
+            continue
         try:
             rec = Recorder(env)
             result = play_replay(rec, payload)
@@ -724,7 +759,8 @@ def worker(index, engine, jobs, out, clapha_engine):
                     entry['cut_at'] = dropped[0][0]
                     rec.decisions = [d for d in rec.decisions if d['tick'] < dropped[0][0]]
                 game = {'header': {'tag': job['tag'], 'commands': _jsonable(played['commands']),
-                                   'terminal': _jsonable(played['terminal']), 'episode': _jsonable(played['episode'])},
+                                   'terminal': _jsonable(played['terminal']), 'episode': _jsonable(played['episode']),
+                                   'levels': {str(o): _jsonable(C.deck_levels(played['match'], o)) for o in (0, 1)}},
                         'decisions': rec.decisions}
                 entry['kept'] = bool(rec.decisions)
                 if not rec.decisions:
@@ -812,7 +848,8 @@ def convert(args):
             rejected.append(dict(tag=r['tag'], why=meta.get('why')))
     if missing:
         raise SystemExit(f'{len(missing)} games have no archive yet (first: {missing[:5]}); rerun to finish')
-    manifest = dict(schema=dict(vocab=sorted(C.Vocab.load().index), legal=True), entries=entries, rejected=rejected)
+    manifest = dict(schema=dict(vocab=sorted(C.Vocab.load().index), legal=True, levels=True), entries=entries,
+                    rejected=rejected)
     (out / 'manifest.tmp').write_text(json.dumps(manifest))
     (out / 'manifest.tmp').replace(out / 'manifest.json')
     print(f'{len(entries) // 2} games kept, {len(rejected)} rejected -> {out / "manifest.json"}', flush=True)

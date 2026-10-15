@@ -80,6 +80,17 @@ The first 20 updates train the critic alone. Progress goes to `RUN/metrics.jsonl
 `games_per_hour`, ...). Rerunning the learner resumes from `RUN/latest.pt`; actors reconnect by themselves.
 `scancel --name=cr-ppo` stops everything.
 
+**One matchup:** `--pool` with a single deck pair (e.g. Hog 2.6 against itself) plays only that matchup, so what the
+model learns can be traced to one game plan. **Exploiters** (AlphaStar's main exploiters): a second learner with
+`--exploit MAIN_RUN` plays only MAIN_RUN's newest snapshot (`pool/v*.pt`). Once it wins 80% of its last 200 games
+(`--qualify 0.6` mean outcome, `--qualify-games 200`) it is saved into `MAIN_RUN/pool/x-<name>-NNN-vVERSION.pt`, which
+the main run's PFSP offers from then on, and starts over from the IL model.
+
+```bash
+torchrun --standalone --nproc_per_node=1 ppo.py learn --init IL.pt --out X1 --exploit MAIN_RUN --engine ~/clapha-engine --pool POOL
+python ppo.py act X1 --collectors 8
+```
+
 ## Arena and tests
 
 ```bash

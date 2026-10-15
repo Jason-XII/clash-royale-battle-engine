@@ -300,3 +300,56 @@ def test_wire_rows_stage_like_padded_rows():
         assert got.dtype == v.dtype, k
         assert torch.equal(got[(slice(None), *map(slice, v.shape[1:]))], v), k
         assert not staged[k][3].any() and (k not in C.OBJECT_KEYS or not got[:, v.shape[1]:].any()), k
+
+
+# ---- 2026-10-15: ability labels at the tap, idle games, card levels, exploiters ------------------------------------------
+def test_ability_presses_are_labelled_at_the_tap_like_cards():
+    vocab = C.Vocab.load()
+    ticks = list(range(90, 400, 5))
+    decisions = [dict(tick=t, lean=dict(players=[dict(owner=0, abilityRuntime=[
+        dict(controllerSlot=1, actionDataName='Dash')])])) for t in ticks]
+    hog = 26000021
+    header = dict(terminal=dict(winner=0), commands=[
+        dict(owner=0, kind='card', tick=200, card_id=hog, x=3500, y=10500),
+        dict(owner=0, kind='ability', tick=300, hints=('dash',))])
+    inputs = {'hand_card': np.full((len(ticks), 4), vocab(hog), np.int64)}
+    y = convert._labels(header, decisions, np.array(ticks), 0, vocab, inputs)
+    labelled = {ticks[i]: int(k) for i, k in enumerate(y['action_kind']) if k}
+    # both at the last decision before they land minus 22: the card at 175 (lands 200), the press at 275 (lands 300)
+    assert labelled == {175: 1, 275: 2}
+
+
+def test_idle_games_are_left_out():
+    payload = lambda team, opp: {'battle': {'team': {'players': [{'elixir_leaked': team}]},  # noqa: E731
+                                            'opponent': {'players': [{'elixir_leaked': opp}]}}}
+    assert convert.leaked(payload(12.5, 3.0)) == (12.5, 3.0) and not convert.idle(convert.leaked(payload(12.5, 3.0)))
+    assert convert.idle(convert.leaked(payload(51.0, 0.0)))
+    collected = {'battle': {}, 'replay': {'aggregate_stats': {'team': {'leaked': 2}, 'opponent': {'leaked': 60}}}}
+    assert convert.idle(convert.leaked(collected))
+    assert convert.leaked({'battle': {}}) == (None, None) and not convert.idle((None, None))
+
+
+def test_hand_levels_from_the_match_with_mirror_one_higher():
+    match = C.standard_match()
+    sp = match['battle']['deck0']['sp']
+    sp[0]['l'] = 13            # Knight (common, first level 1) -> 14
+    sp[4]['l'] = 6             # Fireball (rare, first level 3) -> 9
+    levels = C.deck_levels(match, 0)
+    assert levels[26000000] == 14 and levels[28000000] == 9 and levels[26000001] == 1
+    assert C.hand_level(levels, 26000000, None) == 14 / 16
+    assert C.hand_level(levels, C.MIRROR, 26000000) == 15 / 16, 'Mirror plays the copied card one level higher'
+    assert C.hand_level(levels, C.MIRROR, None) == 0.0 and C.hand_level({}, 26000000, None) == 0.0
+
+
+def test_league_offers_exploiters_and_an_exploiter_plays_only_the_newest_main(tmp_path):
+    main, x = tmp_path / 'main', tmp_path / 'x1'
+    for d in (main / 'pool', x / 'pool'):
+        d.mkdir(parents=True)
+    results = {}
+    assert ppo.league(x, 'il.pt', results, 6, main) == {'il': ('il.pt', 1.0)}, 'no main snapshot yet: the IL model'
+    for name in ('v000100.pt', 'v000200.pt', 'x-x1-000-v000050.pt'):
+        (main / 'pool' / name).touch()
+    assert list(ppo.league(x, 'il.pt', results, 6, main)) == ['main-v000200']
+    from collections import defaultdict
+    offered = ppo.league(main, 'il.pt', defaultdict(list), 6)
+    assert set(offered) == {'il', 'v000100', 'v000200', 'x-x1-000-v000050'}

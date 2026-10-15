@@ -390,7 +390,7 @@ def collector(index, run, address, key):
             models = [('current', None)] * 2
         match = make_match(rng.choice(pool), rng.randrange(1 << 30))
         state = engine.reset(match=match)
-        inputs = Inputs(engine, match, {0: vocab, 1: vocab}, legal)
+        inputs = Inputs(engine, match, {0: vocab, 1: vocab}, legal, {0: s['levels'], 1: s['levels']})
         seats = {o: Seat() for o in (0, 1) if models[o][0] == 'current'}
         start = tower_hp(state)
         phi = [potential(state, start, o) for o in (0, 1)]
@@ -793,9 +793,23 @@ def reachable_ip():
         probe.close()
 
 
+def league(out, init, results, pool_size, main_run=None):
+    """{name: (checkpoint, PFSP weight)}: the IL model, the latest snapshots and the qualified exploiters (x-*.pt in
+    pool/), weighted by how often they still beat the policy. An exploiter (main_run set: ppo.py learn --exploit
+    MAIN_RUN) plays only the main run's newest snapshot (the IL model until the main run has one)."""
+    if main_run:
+        newest = sorted((main_run / 'pool').glob('v*.pt'))[-1:]
+        return {'main-' + newest[0].stem: (str(newest[0]), 1.0)} if newest else {'il': (init, 1.0)}
+    names = {'il': init, **{p.stem: str(p) for p in sorted((out / 'pool').glob('v*.pt'))[-pool_size:]},
+             **{p.stem: str(p) for p in sorted((out / 'pool').glob('x-*.pt'))[-pool_size:]}}
+    win = {n: (np.mean(results[n]) + 1) / 2 if results[n] else 0.5 for n in names}
+    return {n: (path, (1 - win[n]) ** 2 + 0.05) for n, path in names.items()}
+
+
 DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibatch=8, clip=0.2, gamma=0.999, lam=0.95,
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
-                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1)
+                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, exploit='', qualify=0.6,
+                qualify_games=200)
 
 
 def learn(args, settings):
@@ -836,11 +850,10 @@ def learn(args, settings):
 
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> the learning seat's recent outcomes
 
+    main_run = Path(s.exploit).expanduser().resolve() if s.exploit else None
+
     def opponents():
-        """{name: (checkpoint, PFSP weight)}: the IL model and the latest snapshots."""
-        names = {'il': init, **{p.stem: str(p) for p in sorted((out / 'pool').glob('v*.pt'))[-s.pool_size:]}}
-        win = {n: (np.mean(results[n]) + 1) / 2 if results[n] else 0.5 for n in names}
-        return {n: (path, (1 - win[n]) ** 2 + 0.05) for n, path in names.items()}
+        return league(out, init, results, s.pool_size, main_run)
 
     key = [os.urandom(16).hex()]
     if world > 1:
@@ -855,7 +868,8 @@ def learn(args, settings):
         (out / 'vocab.json').write_text(json.dumps(saved['vocab']))
         tmp = out / 'endpoint.tmp'
         tmp.write_text(json.dumps(dict(host=reachable_ip(), ports=ports, authkey=key[0], init=init, settings=dict(
-            settings, engine=str(args.engine.expanduser().resolve()), pool=str(args.pool.expanduser().resolve())))))
+            settings, engine=str(args.engine.expanduser().resolve()), pool=str(args.pool.expanduser().resolve()),
+            levels=bool(saved['config'].get('levels'))))))  # every seat plays this checkpoint's descendants
         tmp.replace(out / 'endpoint.json')
         print(f'learner on {socket.gethostname()} ports {ports}, version {version}', flush=True)
     log = (out / 'metrics.jsonl').open('a') if rank == 0 else None
@@ -904,6 +918,22 @@ def learn(args, settings):
             for row in r['results']:
                 if row['opponent'] != 'self':
                     results[row['opponent']].append(row['outcome'])
+        if main_run:  # an exploiter that beats the main run's newest snapshot joins its pool and starts over from IL
+            target = next(iter(opponents()))
+            done = list(results[target])[-s.qualify_games:]
+            if target != 'il' and len(done) >= s.qualify_games and np.mean(done) >= s.qualify:
+                if rank == 0:
+                    gen = len(list((main_run / 'pool').glob(f'x-{out.name}-*.pt')))
+                    name = f'x-{out.name}-{gen:03d}-v{version:06d}.pt'
+                    torch.save(dict(config=saved['config'], model=model.state_dict(), vocab=saved['vocab'],
+                                    version=version), main_run / 'pool' / 'exploiter.tmp')
+                    (main_run / 'pool' / 'exploiter.tmp').replace(main_run / 'pool' / name)
+                    print(f'qualified against {target} ({np.mean(done):.2f} over {len(done)}): {name}; reset to IL',
+                          flush=True)
+                model.load_state_dict(reference.state_dict())
+                optimizer.state.clear()
+                fresh = version  # a fresh Adam: ramp up again
+                results.clear()
         if rank == 0 and version % s.snapshot_every == 0:
             torch.save(dict(config=saved['config'], model=model.state_dict(), vocab=saved['vocab'], version=version),
                        out / 'pool' / 'snapshot.tmp')
@@ -967,6 +997,8 @@ def main():
     (args.out / 'pool').mkdir(exist_ok=True)
     saved = args.out / 'settings.json'
     settings = {k: getattr(args, k) for k in DEFAULTS}
+    if settings['exploit']:
+        settings['self_play'] = 0.0  # an exploiter only plays the main run
     if saved.exists():
         settings = {**settings, **json.loads(saved.read_text())}  # a resumed run keeps its settings
     elif int(os.environ.get('RANK', 0)) == 0:
