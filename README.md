@@ -1,162 +1,95 @@
-# Clash Royale Battle Engine
+# Clash Royale imitation learning
 
-这个仓库把皇室战争的原生战斗引擎（[clapha-engine](https://github.com/arronwang01/clapha-engine)：x86_64 Linux 上直接加载游戏的 `libg.so`）当成 API 来调用，用 PPO 自博弈训练 [clapha-il](https://github.com/ClashAlpha/clapha-il) 在 25 万场真人回放上模仿学习出的模型，最后在 Null's Royale 上实战。它源于对 [FirstLight-CR](https://gitlab.com/firstlight3/FirstLight_CR) 逆向工作的改进。
+Replays → native engine → compact games → imitation learning → live play on Null's Royale.
 
-## Where things live
-
-| What | Where |
-|---|---|
-| Self-play (PPO), arena, defense stats, the engine wrapper | this repo (`~/cr-engine` on the cluster; `git push cluster main`) |
-| Model, inputs, replay conversion, imitation learning | clapha-il, branch `jason` (`~/clapha-il-dev` on the Mac, `~/clapha-il` on the cluster; `git push cluster jason`) |
-| The engine (loader, per-build reads, version oracle) | clapha-engine (Arron, private; `~/clapha-engine`) |
-| Legal tiles, replay converter | FirstLight's `native_runner` (`~/firstlight-cr`) |
-| Replays, converted games, runs | `~/cr-engine/data/IL_Replay`, `~/oracle`, `~/il-raw`, `~/il-runs`, `~/cr-engine/runs` |
-
-## The pipeline
-
-| Stage | Code | Job |
+| File | What it does | Where it runs |
 |---|---|---|
-| 1. Keep the replays the engine replays exactly (all six towers end as recorded, ~69.5%) | clapha-engine `crx/version_oracle.py` | `tools/oracle.sbatch` |
-| 2. Convert them: the raw record (lean frame, objects, unit states) every 5 ticks | clapha-il `convert.py` | `tools/convert.sbatch` |
-| 3. Imitation learning, then 400 arena games | clapha-il `train.py` | `tools/il.sbatch` |
-| 4. Check a checkpoint in the engine: inputs = IL inputs, decision time, arena, 5 PPO updates | `tools/check.sbatch` | |
-| 5. PPO self-play, autopilot | `il/rl.py`, `il/actors.py`, `il/policy.py`, `il/autopilot.py` | `tools/train.sbatch` + `tools/satellite.sbatch` |
-| 6. Model vs model, defense | `il/arena.py`, `il/defense.py` | |
-| 7. Live Null's Royale games (Mac, emulator) | `il/live.py`, `il/live_record.py` + Arron's reader ported to Nulls (`~/clapha-console`, branch `nulls`) | |
+| `convert.py` | Replays the collected battles in the native engine and writes one archive per game (both players' inputs and labels) | Linux, Slurm |
+| `train.py` | The policy network, its loss, the data loader and the training loop; inference helpers | GPU, Slurm |
+| `play.py` | Boots the emulator, reads the game's memory, runs the model and taps | Mac |
+| `common.py` | What all three share: the observation of one decision, legal placement, the clock and elixir timing | — |
+| `arena.py` | Paired-seat native battles between two models | Linux, Slurm |
+| `ppo.py` | Self-play PPO from the IL model: a DDP learner with a separate critic, and actor jobs (native games, batched GPU decisions) | GPU, Slurm |
 
-The model's inputs are built by one function in every stage: clapha-il's `PlayerView` on the raw record (converted
-replays in IL, `ClaphaEngine.record()` in self-play and the arena). `tools/check_clapha_inputs.py` proves a game played
-here gives the same inputs as the same game converted.
+`assets/` holds the game-build tables (card costs and rarities, effects, placement masks, replay card names, the
+881-token vocabulary, the supported client's hashes). The device reader binary `assets/clapha-reader-nulls` is not in
+the repository: get it from Arron and put it there before playing live. `test_pipeline.py` checks it all
+without an engine, emulator or GPU.
 
-```
-__init__.py, engine.py   the State / Play every stage uses (and Engine: the emulator probe, old live path)
-clapha.py                ClaphaEngine: clapha-engine in-process; reset / step with plays landing 23-27 ticks later; record()
-il/policy.py             a clapha-il checkpoint playing: load, Inputs (PlayerView per player), packed rows, the policy
-                         (what / which card / which tile), Agent
-il/rl.py                 PPO learner: matchmaking (opponents, decks), the update, `il.rl join` (another job's collectors)
-il/actors.py             collectors (games, reward shaping), decision servers (GPU, MPS)
-il/arena.py              model vs model (clapha-il or old checkpoints); il/defense.py: how a player defends
-il/autopilot.py          evaluates every PPO snapshot, keeps best.pt, rolls the learner back when it degrades
-il/live.py               live Nulls games: reader frames -> il/live_record.py (clapha-il records) -> il.policy -> adb taps
-il/test_policy.py        packed inputs, log-probs, one PPO update (no engine needed)
-tools/                   Slurm jobs; check_clapha_inputs.py, time_decision.py
-old stack                il/data.py, il/model.py, build_cache.py, prebuilt/, vendor/: the il-002 / ppo-ebarbs2 models,
-                         kept as arena baselines until the clapha-il pipeline beats them; emulator.py still starts the
-                         emulator through FirstLight's probe
-```
+## Convert
 
-## Commands
+Needs the clapha-engine native adapter, the engine builds and pyarrow (not torch). The version oracle's
+`assignment.jsonl` says which engine build replays each game exactly.
 
 ```bash
-cd ~/cr-engine
-sbatch tools/oracle.sbatch && sbatch tools/convert.sbatch                     # stages 1-2 (stu QoS, resumable)
-RUN=pilot-base FLAGS="" sbatch -J pilot-base tools/il.sbatch                  # stage 3 (A100; FLAGS: train.py options)
-CKPT=~/il-runs/pilot-base/latest.pt sbatch tools/check.sbatch                 # stage 4 (REF=<branch> checks a branch)
-INIT=~/il-runs/<run>/latest.pt RUN=~/cr-engine/runs/ppo-general sbatch tools/train.sbatch   # stage 5: learner (A100)
-RUN=~/cr-engine/runs/ppo-general sbatch tools/satellite.sbatch                # + collectors and autopilot (RTX 5090)
-scancel --name=cr-ppo                                                         # stop both; a restart resumes latest.pt
-PYTHONPATH=. python -m il.arena ~/clapha-engine A.pt B.pt --games 400         # stage 6, in a job
+sbatch -A stu -p Students -q qos_stu_medium_2gpu -c 24 --mem=100G -t 1-00:00:00 --wrap "ulimit -u 65536; \
+  python convert.py --assignment ~/oracle/assignment.jsonl --replays ~/cr-engine/data/IL_Replay/replays \
+  --engine d86 ~/engine-86/engine ~/engine-86/data/assets --engine d29 ~/engine-29/engine ~/engine-29/data/assets \
+  --clapha-engine ~/clapha-engine --out ~/il-data/next --workers 23"
 ```
 
-Never run engine games, profiling or training on the login node: in a job, or on the Mac for what needs no engine
-(`CLAPHA_IL=~/clapha-il-dev python -m il.test_policy CHECKPOINT GAMES`).
+Each game's archive is written whole or not at all, so rerunning the same command continues where it stopped. A game
+that does not replay exactly, or that crashes the engine twice, gets an archive marked rejected with the reason.
+`manifest.json` appears once every assigned game has an archive; that is what `train.py` reads.
 
-## Live games (Null's Royale, Mac)
-
-The game runs in the Android Studio emulator (AVD Pixel_9_2, `python3 -m native_engine.emulator start` then `bootstrap
---online`). Arron's live reader, ported to the Nulls build (its values and how to build and push it:
-`~/clapha-console/nulls/README.md`), reads the battle from the game's memory every 50 ms, read-only. `il/live.py` turns
-each frame into the record a clapha-il model reads in self-play (`il/live_record.py`), decides every 5 ticks from tick 90
-and plays by adb taps; a battle's log goes to `runs/live/` (`python -m il.defense --live runs/live/*.jsonl`).
+## Train
 
 ```bash
-CLAPHA_IL=~/clapha-il-dev python3 -m il.live CHECKPOINT --tables TABLES.json --queue --games 10   # ladder
+sbatch -A competition -p P107-A100 -q qos_p107-a100 --gres=gpu:3 -c 16 --mem=100G -t 10:00:00 --exclude=anode02 \
+  --wrap "torchrun --standalone --nproc_per_node=3 train.py --data ~/il-data/full-reuse-20261014 --out ~/il-runs/next"
 ```
 
-TABLES: clapha-engine `crx/export_tables.py` on the August engine. Use ladder games to judge live play: Training Camp
-runs locally against the trainer (no server round-trip), so its timing differs. Measured on the ladder (2026-10-13):
-every tap lands 21-22 ticks later. Not read live yet: the opponent's plays before they land (the client's command
-queue), which imitation learning showed 13 ticks early.
+The defaults are the current teacher's (4 epochs, global batch 32, chunks of 128 decisions, lr 3e-4 with 500 warm-up
+steps, next-play loss 0.5). On CUDA it trains in bf16 with `torch.compile`. `--device cpu --workers 0` is for small
+checks. A larger model on the same data: `--card_dim 64 --object_dim 128 --attention_layers 2 --conv_channels 96
+--conv_layers 5 --core 512`.
+
+`latest.pt` is saved every 1,000 steps. Running the same command again resumes it with the settings in
+`settings.json`, so a job killed at its time limit loses at most 1,000 steps. A resumed run shuffles the data afresh
+instead of replaying the interrupted order exactly. Progress goes to `metrics.jsonl`, with validation after each pass.
+Don't change the code under a running job: copy the checkout for long runs.
+
+## Play
+
+```bash
+python play.py ~/cr-live/models/full-compact-20261014/latest.pt --tables ~/cr-live/models/unit_state_tables_150535029.json
+```
+
+It boots the visible `Pixel_9_2` emulator if needed (`-gpu host`), verifies the game library, installs the reader,
+re-applies the review-crash patch an emulator snapshot may have rolled back, and waits for a battle. Start a friendly
+battle by hand, or add `--queue` to press Battle on the ladder. `--games N` plays several. Logs go to
+`~/cr-live/runs/live` (OneDrive stalls writes). The model sees advance opponent commands from the reader's queue.
 
 ## PPO
 
-**Processes.** *Collectors* (one engine each) play games: both players' inputs from the record (`il.policy.Inputs`),
-sent packed (present objects, int32 ids, legal tiles as bits: ~4 kB a decision); a play lands 23-27 ticks after the
-decision (as humans' plays in the labels), a slightly unaffordable card waits for elixir as the game does, one play in
-flight per player. *Decision servers* (`--servers`, GPU, MPS) answer batched decisions and keep each seat's LSTM state
-in one GPU tensor; each frozen opponent lives on one server. The *learner* assigns games (decks, opponent, server), runs
-PPO, publishes weights to the servers through shared memory, snapshots into the opponent pool. `--remote` and
-`il.rl join` (the satellite job) add another job's collectors and servers.
+```bash
+# the learner (3 GPUs) and 13 collectors on the 4th GPU, in one A100 job
+sbatch -J cr-ppo -A competition -p P107-A100 -q qos_p107-a100 --gres=gpu:4 -c 16 --mem=100G -t 4-00:00:00 --exclude=anode02 \
+  --wrap "python ppo.py act RUN --collectors 13 --gpus 3 & torchrun --standalone --nproc_per_node=3 ppo.py learn \
+  --init ~/il-runs/full-compact-ddp-20261014/latest.pt --out RUN --engine ~/clapha-engine --pool ~/cr-engine/data/deck_pool.json"
+# more actors in any job with CPUs to spare; they find the learner through RUN/endpoint.json
+sbatch -J cr-ppo ... --gres=gpu:4 -c 16 --wrap "python ppo.py act RUN --collectors 34 --servers 4"
+```
 
-**Policy** (`il/policy.py`): what to do, which hand card, which tile, each sampled from its head; only waiting while a
-play is in flight; P(ability) >= 1% while one is ready. The arena plays the same policy.
+Each collector plays one native game at a time; a decision server per GPU answers the waiting collectors in one CUDA-graph
+call. Half the games are self-play, the rest against the IL model or recent snapshots (`RUN/pool/`), chosen by how often
+they still beat the policy. Reward: the result (±1), a small penalty per decision at full elixir, and tower-damage
+shaping. The critic is a separate network used only in training: the policy's network (from the IL weights) plus the
+opponent's hand, next cards and ability, with a P(win) head trained on the outcome and a head for the shaping rewards.
+The first 20 updates train the critic alone. Progress goes to `RUN/metrics.jsonl` (`score`, `win_ev`, `kl_ref`,
+`games_per_hour`, ...). Rerunning the learner resumes from `RUN/latest.pt`; actors reconnect by themselves.
+`scancel --name=cr-ppo` stops everything.
 
-**Algorithm.** Half the games self-play, half against a frozen pool (the IL model + snapshots) by PFSP, weight
-(1 − win rate)² + 0.05. Reward: ±1 result, −0.002 per decision at full elixir, FirstLight's tower shaping β (γΦ′ − Φ)
-(Φ = crowns taken − lost + each tower's lost hp fraction, king ×3; 0 once the game ends: damage dealt and prevented is
-credited when it happens, no bonus for a crown margin). PPO (clip 0.2, γ 0.999, whole games as LSTM sequences), KL
-penalty towards the IL policy (exact for what / card, the k3 estimate for the tile taken). Decks: real ladder pairs
-with evolutions and levels (`data/deck_pool.json`). A specialist (`--learner-deck`) plays our deck against ladder
-decks: 30% the most played, 40% any, 30% decks with the cards we score worst against.
+## Arena and tests
 
-**Autopilot** (in the satellite job): every snapshot plays the panel (the IL model, more with PANEL); one line per
-snapshot in `<run>/autopilot.jsonl`; a better snapshot that does not defend or play less becomes `<run>/best.pt`; two
-bad ones in a row write `rollback.json` (restart from best.pt at half the learning rate).
+```bash
+python arena.py A.pt B.pt --engine ~/clapha-engine --pool ~/cr-engine/data/deck_pool.json --games 20 --out runs/arena.jsonl
+OMP_NUM_THREADS=2 python -m pytest test_pipeline.py
+```
 
-**Log** (`<run>/metrics.jsonl`, one line per update): `pool` (score vs each frozen opponent), `kl_ref`, `approx_kl`,
-`clip_frac`, `value_ev_mc` / `value_ev_gae` (is the value an informative baseline?), `plays_per_game`, `full_elixir`,
-`defense`, and where time goes: `collector_ms` (features / wait / engine), `server_ms_per_call`, `mean_batch`,
-`games_per_hour`, `backlog`.
+Python 3.10+, NumPy and PyTorch; pyarrow for conversion; pytest for the tests. On a Mac, torchrun needs
+`--nnodes=1 --master_addr=127.0.0.1` because the hostname does not resolve.
 
-**Throughput.** CPUs are the limit: each QoS gives 16 (A100, RTX 5090) or 24 (stu) per user. The old model cost
-~1 CPU-s a game (~67k games/h on two jobs); the clapha-il path ~1.4 CPU-s (engine 0.4, record 0.3, inputs 0.7;
-`tools/time_decision.py`).
-
-## Defense
-
-`il/defense.py`: a push is enemy troops on our side of the river; it is answered when our play lands in its lane (or
-the middle) before it ends: answered or not, latency from the crossing to our landing, tower hp lost. The same numbers
-for humans (cache), arena games (`defense_a/b`), training (`defense` in metrics.jsonl) and live games.
-
-| mid pushes (3–6k hp) | answered | latency | tower hp lost / push |
-|---|---|---|---|
-| humans (cache) | 91% | 0.4 s | 4.9% |
-| humans with our E-Barbs deck | 88% | 0.4 s | 7.1% |
-| il-002 with E-Barbs vs General | 90% | 1.6 s | 12.9% |
-| specialist update 2709 vs General | 82% | 2.1 s | 13.0% |
-
-Humans tap ~0.6 s before a push crosses; the old models decided 0.75–1.5 s after it. Deciding "play now?" by a coin
-flip every 0.25 s on a diffuse P(play) gives geometric waits; clapha-il's `--next-play` head (when the next play
-comes, on every decision) is the pilot testing whether a sharper timing fixes it. Judge pilots by `timing_gain` and
-the arena's defense numbers.
-
-## How we got here
-
-1. **The engine as an API** (2026-10-07). After months on a from-scratch simulator whose quirks the agents learned, we
-   switched to the real engine and human data, as FirstLight did (IL → General PPO → a specialist that reached Hall of
-   Fame): FirstLight's probe in an emulator, then Arron's clapha-engine on the GPU nodes (no KVM there).
-2. **The old pipeline** (il-002 → ppo-general → ppo-ebarbs2): a 0.9 M model on cached states, 9–3 live; PPO up to
-   ~67k games/h. It plateaued (value_ev_mc 0.21–0.30) and raced instead of defending: answers ~1.5 s late, tower
-   shaping and IL opponents did not fix it.
-3. **The IL rebuild** (2026-10-13): Arron's clapha-il: only replays the engine replays exactly, the full record (unit
-   states, effects, targets, 128 objects, legal tiles, plays in flight both sides, counted opponent cycle), one input
-   function for IL, self-play and live. Pilots: base, no-attention, no-unit-states, next-play. PPO ported to it.
-
-## Pitfalls (read before changing things)
-
-- **Levels.** A bare match template plays everything at level 1. Matches need `lvlcap`, `cardlvlmin`,
-  `avatar*.expLevel` **and the king tower `hbd[*].kt`** (a level-1 king: 2400 hp instead of 7728). `il.arena.make_match`
-  takes care of it. Decks with evolutions come from `data/deck_pool.json`.
-- **Threads.** `ulimit -u` counts every thread of the user. `ClaphaEngine` tells the engine it has 2 CPUs (70 → 25
-  threads) and `raise_thread_limit()` runs in the parent before any engine process starts.
-- **CUDA and fork.** Touching CUDA before forking (even `torch.cuda.is_available()`) breaks forked GPU processes;
-  `il.rl` picks the device after forking.
-- **A new head or a fresh Adam** collapsed a run within 15 updates: `il.rl` warms the learning rate up after any fresh
-  Adam; watch the first ~15 updates after a restart that changes the model.
-- **Slurm.** `qos_p107-a100` and `qos_p107-rtx5090`: 16 CPUs per user each; the stu route only as account `stu`,
-  partition `Students`, `qos_stu_medium_2gpu` (24 CPUs, 1 day). anode02 cannot start CUDA (excluded in the jobs).
-- **Git on the cluster.** GitHub is often unreachable from campus: push to the cluster over SSH (`updateInstead`).
-- **OneDrive** flips file modes: `git config core.fileMode false`.
-
-Docs: [how the live client takes a play](docs/GAME_INTEGRATION.md), [working with Arron](docs/COLLABORATION.md),
-[the IL rebuild's handoff](docs/HANDOFF-2026-10-13.md); the model's inputs: clapha-il's docs/INPUTS.md.
+Measured game behaviour (timing, the client's held taps, the reader) is in
+[docs/GAME_INTEGRATION.md](docs/GAME_INTEGRATION.md). Model and features came from ClashAlpha/clapha-il; native execution
+from clapha-engine and FirstLight's reverse engineering.

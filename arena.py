@@ -1,16 +1,12 @@
-"""The battle engine on x86_64 Linux through clapha-engine (the game's own libg.so loaded in-process: no
-emulator). Same interface and State as Engine, so il/ agents and features run unchanged.
+"""Paired-seat native battles between two trained models (Linux, inside a Slurm allocation).
 
-    engine = ClaphaEngine('~/clapha-engine')        # after its prepare.py; boots in ~8 s
-    state = engine.reset(seed=1)                     # or reset(match=replay dict); tick 90, like Engine
-    transition = engine.step([Play(owner, slot, x, y)], 5)
-
-Differences from the probe, each filled to match it:
-  - card costs: COSTS (from the cache); variable-cost cards ask the engine's card selection
-  - card plays: the probe logs them as consumed; here a card that left a hand between snapshots was played
-  - projectile vs area (objects without hitpoints): by the class of the object's data global id
+    python arena.py A.pt B.pt --engine ~/clapha-engine --pool data/deck_pool.json --games 20 --out runs/arena.jsonl
 """
+import argparse
 import ctypes
+from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
 import random
 import resource
@@ -18,27 +14,119 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
-from .engine import ABILITY, HOLD_TICKS, Transition, hold_slack, standard_match
-from .engine import Ability, CardPlay, Entity, Evolution, HandCard, Player, State
+import numpy as np
+import torch
 
-# Elixir cost of every fixed-cost card in the IL cache (Mirror 28000006 and 28000025 vary: the engine is asked).
-COSTS = {
-    26000000: 3, 26000001: 3, 26000002: 2, 26000003: 5, 26000004: 7, 26000005: 3, 26000006: 5, 26000007: 5,
-    26000008: 5, 26000009: 8, 26000010: 1, 26000011: 4, 26000012: 3, 26000013: 2, 26000014: 4, 26000015: 4,
-    26000016: 5, 26000017: 5, 26000018: 4, 26000019: 2, 26000020: 6, 26000021: 4, 26000022: 5, 26000023: 3,
-    26000024: 6, 26000025: 3, 26000026: 3, 26000027: 4, 26000028: 9, 26000029: 7, 26000030: 1, 26000031: 1,
-    26000032: 3, 26000033: 6, 26000034: 5, 26000035: 4, 26000036: 4, 26000037: 4, 26000038: 2, 26000039: 3,
-    26000040: 3, 26000041: 3, 26000042: 4, 26000043: 6, 26000044: 4, 26000045: 5, 26000046: 3, 26000047: 7,
-    26000048: 4, 26000049: 2, 26000050: 3, 26000051: 5, 26000052: 4, 26000053: 5, 26000054: 5, 26000055: 7,
-    26000056: 3, 26000057: 4, 26000058: 2, 26000059: 5, 26000060: 6, 26000061: 3, 26000062: 4, 26000063: 5,
-    26000064: 3, 26000065: 4, 26000067: 3, 26000068: 4, 26000069: 4, 26000072: 5, 26000074: 4, 26000077: 5,
-    26000080: 4, 26000083: 4, 26000084: 1, 26000085: 7, 26000087: 4, 26000093: 3, 26000095: 4, 26000096: 5,
-    26000097: 2, 26000099: 5, 26000101: 4, 26000102: 2, 26000103: 6, 26000106: 5, 27000000: 3, 27000001: 4,
-    27000002: 4, 27000003: 5, 27000004: 4, 27000005: 6, 27000006: 4, 27000007: 6, 27000008: 6, 27000009: 3,
-    27000010: 4, 27000012: 4, 27000013: 4, 28000000: 4, 28000001: 3, 28000002: 2, 28000003: 6, 28000004: 3,
-    28000005: 4, 28000007: 6, 28000008: 2, 28000009: 4, 28000010: 5, 28000011: 2, 28000012: 3, 28000013: 3,
-    28000014: 3, 28000015: 2, 28000016: 1, 28000017: 2, 28000018: 3, 28000023: 5, 28000024: 2, 28000026: 3,
-}
+import common as C
+import train
+
+PLAY_DELAY = (23, 27)  # decision -> landing ticks, drawn per play: a replay's play is labelled 23-27 ticks before it lands
+# the engine is asked the cost of variable-cost cards (Mirror, ...) and cards outside the original table
+FIXED_COSTS = {k: v for k, v in C.COSTS.items() if k not in (28000006, 28000025, 26000107)}
+
+
+@dataclass(frozen=True)
+class HandCard:
+    slot: int
+    card: int
+    cost: int
+    parameter: int  # Native command encoding; never a policy feature.
+    form_card: int  # Card id of the form that would be played (evolution/hero), else == card.
+
+
+@dataclass(frozen=True)
+class Ability:
+    """A hero / champion controller (the probe's abilityRuntime)."""
+    button: int  # 1 no unit, 2 ready, 3 unit deploying, 4 limited availability, 6 no charges, 8 cooldown, 10 casting, ...
+    cooldown_ms: int
+    cooldown_total_ms: int
+    charges: int  # left; -1 unlimited
+    max_charges: int
+    units: tuple[int, ...]  # native object ids of the units carrying it
+
+    @property
+    def ready(self):
+        return self.button in (2, 4) and self.cooldown_ms == 0 and self.charges != 0 and bool(self.units)
+
+
+@dataclass(frozen=True)
+class Evolution:
+    """Evolution progress of one deck slot (the probe's evolutionRuntime)."""
+    deck_slot: int
+    card: int
+    evolvable: bool
+    required: int  # cycles
+    remaining: int
+    ready: bool  # its next play is evolved
+
+
+@dataclass(frozen=True)
+class Player:
+    owner: int
+    elixir: int  # Fixed-point native units: 10,000 = one elixir.
+    hand: tuple[HandCard, ...]
+    cycle: tuple[int, ...]
+    abilities: tuple[Ability, ...] = ()
+    evolution: tuple[Evolution, ...] = ()
+
+
+@dataclass(frozen=True)
+class Entity:
+    id: int
+    owner: int
+    card: int  # -1 for towers.
+    x: int
+    y: int
+    hp: int | None
+    max_hp: int | None
+    target_id: int | None  # Stable entity ID held by the native attack component.
+    attack_cooldown_ms: int | None  # Zero means ready; rounded up to a 50 ms tick.
+    entity_type: str  # troop, building, projectile or area
+    deployment_remaining_ms: int | None
+
+
+@dataclass(frozen=True)
+class CardPlay:
+    sequence: int
+    tick: int
+    owner: int
+    card: int
+    cost: int
+
+
+@dataclass(frozen=True)
+class State:
+    generation: int
+    tick: int
+    finalized: bool
+    result: int | None
+    crowns: tuple[int, int]
+    players: tuple[Player, ...]
+    entities: tuple[Entity, ...]
+    plays: tuple[CardPlay, ...]
+    next_sequence: int
+
+
+
+@dataclass(frozen=True)
+class Play:
+    owner: int
+    slot: int  # ABILITY: activate the hero / champion ability (x, y unused)
+    x: int
+    y: int
+
+
+ABILITY = -1
+
+
+@dataclass(frozen=True)
+class Transition:
+    state: State
+    advanced: int
+    executed: tuple[bool, ...]  # One result per submitted Play, in submission order.
+
+
+
 ENGINE_CPUS = 2  # what the engine is told about the machine: it sized its thread pool from all 128 CPUs (~70 threads)
 PROJECTILE_CLASS = 10  # data global id // 1e6 of LogicProjectileData (the probe checks type 0x0a); measured
 
@@ -69,7 +157,7 @@ def _report_cpus(loader):
     loader.shim('get_nprocs_conf', ctypes.c_int)(lambda: ENGINE_CPUS)
 
 
-class ClaphaEngine:
+class Engine:
     def __init__(self, clapha_dir, workdir=None):
         raise_thread_limit()  # also here, for scripts that start a single engine
         clapha = Path(clapha_dir).expanduser().resolve()
@@ -84,10 +172,10 @@ class ClaphaEngine:
 
     def reset(self, seed=1, match=None):
         if match is None:
-            match = standard_match(seed)
+            match = C.standard_match(seed)
         self.env.create_match(match)
         self.generation += 1
-        self.hands, self.pending = None, []
+        self.hands, self.pending, self.played = None, [], []
         r = self.env.reader
         logic = r.logic(self.env.battle)  # a deck never changes within a battle: read its card ids once
         self.deck = [[r.card_id(r.card_data(slot)) for slot in r.deck_slots(logic, owner)] for owner in (0, 1)]
@@ -96,13 +184,14 @@ class ClaphaEngine:
         return self.state
 
     def step(self, actions=(), ticks=5, delay=0):
-        """Plays decided on the current state land `delay` ticks later (live: il.data.DEPLOY_DELAY), or on the
-        next tick with delay=0; `delay` = (low, high): each play draws its own (il.data.PLAY_DELAY, as human replays
-        are labelled). As the live client does (engine.HOLD_TICKS), a play the elixir cannot pay for yet is held
-        until it can, for at most HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
-        for within that is refused. As il.live does, a player with a play in flight cannot start another.
+        """Plays decided on the current state land `delay` ticks later (live: common.DEPLOY_DELAY), or on the
+        next tick with delay=0; `delay` = (low, high): each play draws its own (PLAY_DELAY, as human replays
+        are labelled). As the live client does (C.HOLD_TICKS), a play the elixir cannot pay for yet is held
+        until it can, for at most C.HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
+        for within that is refused. As live does, a player with a play in flight cannot start another.
         `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
         before = self.state
+        self.played = []  # confirmed card consumption this step, with exact tick and commanded position
         executed = []
         for a in actions:
             free = all(p['owner'] != a.owner for p in self.pending)
@@ -116,16 +205,22 @@ class ClaphaEngine:
                 continue
             me = before.players[a.owner]
             card = next((h for h in me.hand if h.slot == a.slot), None)
-            ok = card is not None and free and card.cost * 10000 <= me.elixir + hold_slack(before.tick)
+            ok = card is not None and free and card.cost * 10000 <= me.elixir + C.hold_slack(before.tick)
             if ok:
                 self.pending.append(dict(due=due, delay=lag, held=card.cost * 10000 > me.elixir,
-                                         hold_until=before.tick + HOLD_TICKS, owner=a.owner, slot=a.slot,
+                                         hold_until=before.tick + C.HOLD_TICKS, owner=a.owner, slot=a.slot,
                                          card=card.card, cost=card.cost, x=a.x, y=a.y))
             executed.append(ok)
         for _ in range(ticks):
-            if self.pending:
-                self._release()
+            released = self._release() if self.pending else []
             self.env.step(1)
+            if released:
+                players = self._players()
+                for p in released:
+                    if players[p['owner']][0].get(p['slot'], (None, None))[1] != p['card']:
+                        self.played.append(dict(p, tick=self.env.tick()))
+                    else:
+                        self.expired += 1
         after = self._capture()
         self.state = after
         return Transition(after, after.tick - before.tick, tuple(executed))
@@ -152,12 +247,13 @@ class ClaphaEngine:
         return out
 
     def _release(self):
-        """Issue held plays once the elixir pays for them (or drop them after HOLD_TICKS), and hand the plays due on the
+        """Issue held plays once the elixir pays for them (or drop them after C.HOLD_TICKS), and hand the plays due on the
         next tick to the engine if their card is still there."""
         now = self.env.tick()
         if not any(p['held'] or p['due'] <= now + 1 for p in self.pending):
-            return
+            return []
         players = self._players()
+        released = []
         for p in list(self.pending):
             if p['slot'] != ABILITY and p['held']:
                 if players[p['owner']][2] >= p['cost'] * 10000:
@@ -178,8 +274,10 @@ class ClaphaEngine:
             if hand.get(p['slot'], (None, None))[1] == p['card'] and elixir >= p['cost'] * 10000:
                 self.env.queue_hand_action_at(SimpleNamespace(owner=p['owner'], hand_index=p['slot'], x=p['x'],
                                                               y=p['y']), execute_tick=now + 1)
+                released.append(p)
             else:
                 self.expired += 1
+        return released
 
     def _activate(self, owner):
         """Activate the first ready hero / champion ability of `owner`, if any (a press on a button no longer ready
@@ -210,8 +308,8 @@ class ClaphaEngine:
                 for p in self.env.reader.players_lean(self.env.battle)]
 
     def record(self):
-        """The current decision's raw record as clapha-il's convert.py stores it (the lean frame without its objects,
-        objects(), unit_states()): the input of clapha_il.features.PlayerView, so games played here and converted
+        """The current decision's raw record as convert.py records it (the lean frame without its objects,
+        objects(), unit_states()): the input of common.PlayerView, so games played here and converted
         replays are read by the same code."""
         r, battle = self.env.reader, self.env.battle
         lean = r.frame(battle)
@@ -246,7 +344,7 @@ class ClaphaEngine:
                 for i, card in self.hands[owner].items():
                     if hands[owner].get(i) != card:
                         self.sequence += 1
-                        plays.append(CardPlay(self.sequence, tick, owner, card, COSTS.get(card, -1)))
+                        plays.append(CardPlay(self.sequence, tick, owner, card, FIXED_COSTS.get(card, -1)))
         if self.hands is None or plays:
             self.evolution = self._evolution()
         self.hands = hands
@@ -258,7 +356,7 @@ class ClaphaEngine:
                      tuple(players), entities, tuple(plays), self.sequence + 1)
 
     def _cost(self, owner, deck_slot, card):
-        cost = COSTS.get(card)
+        cost = FIXED_COSTS.get(card)
         if cost is None:  # variable cost (Mirror, ...) or unseen card: the engine's own selection
             chosen = self.env._selection(owner, deck_slot)
             cost = chosen[1] >> 28 if chosen else -1
@@ -287,3 +385,114 @@ class ClaphaEngine:
         return Entity(o['nativeObjectId'], o['owner'], o['cardId'], o['x'], o['y'], o['hp'], o['maxHp'], target,
                       _ms(phase['loadRemainingMs']) if attack else None,
                       'building' if o['cardId'] == -1 else 'troop', _ms(phase['deployRemainingMs']))
+
+
+class Commands:
+    """Card plays issued so far as (execution tick, command), as a converted game's header holds them: landed plays from
+    confirmed per-tick hand consumption, plays in flight from the engine queue (their predicted landing tick)."""
+
+    def __init__(self):
+        self.landed, self.last_tick = [], None
+
+    def update(self, state, engine):
+        if state.tick != self.last_tick:
+            self.landed += [(p['tick'], {'owner': p['owner'], 'card_id': p['card'], 'x': p['x'], 'y': p['y']})
+                            for p in engine.played]
+            self.last_tick = state.tick
+        flying = [(p['due'], {'owner': p['owner'], 'card_id': p['card'], 'x': p['x'], 'y': p['y']})
+                  for p in engine.pending if p.get('card') is not None]
+        return self.landed + flying
+
+
+class Inputs:
+    """The inputs of the players in `vocabs` ({owner: vocabulary}), decision by decision, in one ClaphaEngine game: the
+    raw record once per decision, a PlayerView per player."""
+
+    def __init__(self, engine, match, vocabs, legal):
+        record = engine.record()
+        self.engine, self.commands = engine, Commands()
+        self.views = {}
+        for owner, vocab in vocabs.items():
+            other = 1 - owner
+            forms = [c.get('el', 0) for c in match['battle'][f'deck{other}']['sp']]  # 1 evolution, 2 hero (as replays)
+            heroes = C.opponent_heroes(record, forms, owner)
+            self.views[owner] = C.PlayerView(owner, vocab, heroes, legal)
+
+    def __call__(self, state):
+        record, issued = self.engine.record(), self.commands.update(state, self.engine)
+        return {owner: view.step(record, issued) for owner, view in self.views.items()}
+
+
+def make_match(pair, seed):
+    match = C.standard_match(seed)
+    battle = match['battle']
+    battle['lvlcap'], battle['cardlvlmin'] = pair['lvlcap'], pair['cardlvlmin']
+    for owner in (0, 1):
+        battle[f'deck{owner}']['sp'] = pair['decks'][owner]
+        battle[f'avatar{owner}']['expLevel'] = pair['exp'][owner]
+        battle['hbd'][owner]['kt'] = pair['kt'][owner]
+    return match
+
+
+def evaluate(engine, models, pair, seed, a_owner):
+    match = make_match(pair, seed)
+    state = engine.reset(match=match)
+    seats = [0 if owner == a_owner else 1 for owner in (0, 1)]
+    agents = [train.Agent(models[index][0], owner) for owner, index in enumerate(seats)]
+    inputs = Inputs(engine, match, {owner: models[index][1] for owner, index in enumerate(seats)}, C.cached_legal())
+    plays = [0, 0]
+    while not state.finalized and state.tick < 7200:
+        rows = inputs(state)
+        choices = [agent.act(rows[agent.owner]) for agent in agents]
+        actions = [Play(agent.owner, ABILITY, 0, 0) if choice[0] == 'ability' else Play(agent.owner, *choice[1:])
+                   for agent, choice in zip(agents, choices) if choice[0] != 'wait']
+        state = engine.step(actions, 5, delay=PLAY_DELAY).state
+        for play in engine.played:
+            plays[play['owner']] += 1
+    if not state.finalized:
+        raise RuntimeError('native battle did not finalize before tick 7200')
+    winner = None if state.result not in (0, 1) else 'A' if state.result == a_owner else 'B'
+    return dict(winner=winner, a_owner=a_owner, crowns_a=state.crowns[a_owner], crowns_b=state.crowns[1-a_owner],
+                plays_a=plays[a_owner], plays_b=plays[1-a_owner], tick=state.tick)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('a', type=Path)
+    parser.add_argument('b', type=Path)
+    parser.add_argument('--engine', type=Path, required=True)
+    parser.add_argument('--pool', type=Path, required=True, help='deck pairs with actual levels and evolution flags')
+    parser.add_argument('--games', type=int, default=20)
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    if args.games < 2 or args.games % 2:
+        parser.error('games must be positive and even for paired seats')
+    torch.set_num_threads(1)
+    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+    pool = json.loads(args.pool.read_text())
+    if not pool:
+        parser.error('deck pool is empty')
+    models = [train.load(path)[:2] for path in (args.a, args.b)]
+    engine = Engine(args.engine)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    results = []
+    with args.out.open('x') as stream:
+        for pair_index, index in enumerate(rng.integers(len(pool), size=args.games // 2)):
+            for seat in (0, 1):
+                result = dict(game=len(results), **evaluate(engine, models, pool[index], args.seed + pair_index, seat))
+                results.append(result)
+                stream.write(json.dumps(result) + '\n')
+                stream.flush()
+                print(json.dumps(result), flush=True)
+    wins = sum(r['winner'] == 'A' for r in results)
+    draws = sum(r['winner'] is None for r in results)
+    print(json.dumps(dict(games=len(results), wins=wins, losses=len(results)-wins-draws, draws=draws,
+                          score=(wins + 0.5 * draws) / len(results))), flush=True)
+    sys.stdout.flush()
+    os._exit(0)  # Native exit destructors are unsafe; all result files have been flushed.
+
+
+if __name__ == '__main__':
+    main()

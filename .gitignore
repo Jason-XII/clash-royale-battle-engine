@@ -1,10 +1,9 @@
 # Large local artifacts (data -> ~/cr-data, outside OneDrive)
 data
-build/
 runs/
 __pycache__/
 .DS_Store
-.ipynb_checkpoints/
 .idea/
 *.pt
 docs/agent-memory/
+assets/clapha-reader-nulls
