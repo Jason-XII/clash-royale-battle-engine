@@ -440,20 +440,24 @@ def evaluate(engine, models, pair, seed, a_owner):
     seats = [0 if owner == a_owner else 1 for owner in (0, 1)]
     agents = [train.Agent(models[index][0], owner) for owner, index in enumerate(seats)]
     inputs = Inputs(engine, match, {owner: models[index][1] for owner, index in enumerate(seats)}, C.cached_legal())
-    plays = [0, 0]
+    plays, refused = [0, 0], [0, 0]
     while not state.finalized and state.tick < 7200:
         rows = inputs(state)
         choices = [agent.act(rows[agent.owner]) for agent in agents]
         actions = [Play(agent.owner, ABILITY, 0, 0) if choice[0] == 'ability' else Play(agent.owner, *choice[1:])
                    for agent, choice in zip(agents, choices) if choice[0] != 'wait']
-        state = engine.step(actions, 5, delay=PLAY_DELAY).state
+        transition = engine.step(actions, 5, delay=PLAY_DELAY)
+        state = transition.state
+        for action, ok in zip(actions, transition.executed):
+            refused[action.owner] += not ok
         for play in engine.played:
             plays[play['owner']] += 1
     if not state.finalized:
         raise RuntimeError('native battle did not finalize before tick 7200')
     winner = None if state.result not in (0, 1) else 'A' if state.result == a_owner else 'B'
     return dict(winner=winner, a_owner=a_owner, crowns_a=state.crowns[a_owner], crowns_b=state.crowns[1-a_owner],
-                plays_a=plays[a_owner], plays_b=plays[1-a_owner], tick=state.tick)
+                plays_a=plays[a_owner], plays_b=plays[1-a_owner], refused_a=refused[a_owner], refused_b=refused[1-a_owner],
+                tick=state.tick)
 
 
 def main():
@@ -465,6 +469,7 @@ def main():
     parser.add_argument('--games', type=int, default=20)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--unmasked_b', action='store_true', help="B samples as before PR 11 (no elixir mask)")
     args = parser.parse_args()
     if args.games < 2 or args.games % 2:
         parser.error('games must be positive and even for paired seats')
@@ -475,6 +480,7 @@ def main():
     if not pool:
         parser.error('deck pool is empty')
     models = [train.load(path)[:2] for path in (args.a, args.b)]
+    models[1][0].elixir_mask = not args.unmasked_b
     engine = Engine(args.engine)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     results = []
@@ -489,7 +495,9 @@ def main():
     wins = sum(r['winner'] == 'A' for r in results)
     draws = sum(r['winner'] is None for r in results)
     print(json.dumps(dict(games=len(results), wins=wins, losses=len(results)-wins-draws, draws=draws,
-                          score=(wins + 0.5 * draws) / len(results))), flush=True)
+                          score=(wins + 0.5 * draws) / len(results),
+                          refused_per_game_a=sum(r['refused_a'] for r in results) / len(results),
+                          refused_per_game_b=sum(r['refused_b'] for r in results) / len(results))), flush=True)
     sys.stdout.flush()
     os._exit(0)  # Native exit destructors are unsafe; all result files have been flushed.
 

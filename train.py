@@ -498,12 +498,19 @@ def _log_softmax(logits):
     return safe.masked_fill(~torch.isfinite(logits), float('-inf'))
 
 
-def what_logp(what, x, explore=0.0):
-    """log p(what) [N, 4]: only waiting while a play of ours is in flight, and P(ability) >= explore while one is ready."""
+def what_logp(what, x, explore=0.0, which=None):
+    """log p(what) [N, 4]: only waiting while a play of ours is in flight, and P(ability) >= explore while one is ready.
+    With `which` (the card head's logits): a play of a card the client would refuse (not playable()) becomes a wait, as it
+    does live, instead of moving to the cards it can pay for; p(play, card) of every playable card is unchanged."""
     busy = (x['own_flight_card'] > 0).unsqueeze(-1) & (torch.arange(4, device=what.device) != WAIT)
-    if 'legal' in x:  # no card the client would take: playing is not an option
-        busy = busy | ((~playable(x).any(-1)).unsqueeze(-1) & (torch.arange(4, device=what.device) == PLAY))
     logp = _log_softmax(what.float().masked_fill(busy, float('-inf')))
+    if which is not None and 'scalars' in x:
+        base = _log_softmax(which.float().masked_fill(~x['legal'].flatten(2).any(-1), float('-inf')))
+        ok = playable(x)  # log P(a playable card | play); -1e9, not -inf, inside: logsumexp's gradient over all -inf is NaN
+        keep = torch.where(ok.any(-1), base.masked_fill(~ok, -1e9).logsumexp(-1), float('-inf'))
+        lost = logp[:, PLAY] + (-torch.expm1(keep)).clamp(min=1e-30).log()  # log P(play, then a refused card)
+        logp = torch.cat([torch.logaddexp(logp[:, WAIT], lost)[:, None], (logp[:, PLAY] + keep)[:, None],
+                          logp[:, ABILITY1:]], -1)
     if explore:
         ready = torch.isfinite(logp[:, ABILITY1:])
         n = ready.sum(-1, keepdim=True)
@@ -558,7 +565,8 @@ def _gumbel_argmax(logp):
 def sample(model, out, x, explore=0.0):
     """One action per decision of a forward pass on [N, 1] inputs -> (action [N], its log-prob [N])."""
     out, x = flat(out, x)
-    what_lp, which_lp = what_logp(out['what'], x, explore), which_logp(out['which'], x)
+    mx = x if getattr(model, 'elixir_mask', True) else {k: x[k] for k in ('legal', 'own_flight_card')}  # off: as before PR 11
+    what_lp, which_lp = what_logp(out['what'], mx, explore, out['which']), which_logp(out['which'], mx)
     what, slot = _gumbel_argmax(what_lp), _gumbel_argmax(which_lp)
     tile_lp = tile_logp(model, out, x, slot)
     cell_ = _gumbel_argmax(tile_lp)

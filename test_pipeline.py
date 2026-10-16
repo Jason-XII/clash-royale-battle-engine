@@ -385,9 +385,20 @@ def test_unaffordable_cards_are_not_offered_and_held_taps_are_in_flight():
     assert train.playable(x).tolist() == [[True, True, False, False]]
     which = train.which_logp(torch.zeros(1, 4), x)
     assert torch.isinf(which[0, 2:]).all() and torch.isfinite(which[0, :2]).all()
+    # a refused card's share of PLAY goes to WAIT (as live: the tap does nothing); playable cards keep p(play, card)
+    what, which_logits = torch.zeros(1, 4, requires_grad=True), torch.tensor([[0., 0., 1., 1.]], requires_grad=True)
+    lp = train.what_logp(what, x, 0.0, which_logits)
+    p_card = torch.softmax(which_logits[0].detach(), -1)                # costs 3 and 4 playable: 2 / (2 + 2e)
+    assert torch.allclose(lp.exp().sum(), torch.tensor(1.))
+    assert torch.allclose(lp[0, train.PLAY].exp(), 0.25 * p_card[:2].sum())
+    assert torch.allclose(lp[0, train.WAIT].exp(), 0.25 + 0.25 * p_card[2:].sum())
+    joint = lp[0, train.PLAY] + train.which_logp(which_logits, x)[0, :2]
+    assert torch.allclose(joint.exp(), 0.25 * p_card[:2]), 'p(play, card) unchanged for cards the client takes'
     sc[0, 0] = 0.0                                           # nothing affordable: playing is not an option
-    what = train.what_logp(torch.zeros(1, 4), x)
-    assert torch.isinf(what[0, train.PLAY]) and torch.isfinite(what[0, train.WAIT])
+    lp = train.what_logp(what, x, 0.0, which_logits)
+    assert torch.isinf(lp[0, train.PLAY]) and torch.allclose(lp[0, train.WAIT].exp(), torch.tensor(.5))
+    (lp[torch.isfinite(lp)].sum() + train.which_logp(which_logits, x)[torch.isfinite(train.which_logp(which_logits, x))].sum()).backward()
+    assert torch.isfinite(what.grad).all() and torch.isfinite(which_logits.grad).all(), 'no NaN gradient'
     # PlayerView's own-flight rule: a held tap (tap known) is in flight from the tap, not only from landing - 22
     landed = [(200, {'owner': 0, 'card_id': 26000021, 'x': 3500, 'y': 10500, 'tap': 150})]
     assert [tt for tt, c in landed if c.get('tap', tt - C.DEPLOY_DELAY) <= 160 < tt] == [200]
