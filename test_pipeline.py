@@ -346,6 +346,10 @@ def test_search_targets_and_distillation(tmp_path, monkeypatch):
         last = ppo.update(model, reference, optimizer, batches, args, device)
     assert np.isfinite(first['search_loss']) and last['search_loss'] < first['search_loss']
     assert last['search_agree'] == 1.0, 'the tile head now prefers the cell the search chose'
+    xt = train.tensors({k: np.stack([r[k] for r in rows])[None] for k in rows[0]}, 'cpu')
+    with torch.no_grad(), torch.autocast('cpu', torch.bfloat16):
+        f, fx = train.flat(model(xt), xt)
+        assert model.tiles(f, fx, torch.zeros(T, dtype=torch.long)).dtype == torch.float32, 'tile scores stay fp32'
 
 
 def test_decision_server_returns_the_sampled_cards_legal_top_tiles(tmp_path, monkeypatch):

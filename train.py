@@ -153,9 +153,12 @@ class Policy(nn.Module):
         illegal tiles -inf when x has legal masks."""
         N = out['core'].shape[0]
         card = self.card(x['hand_card'].reshape(N, 4).gather(1, slot.unsqueeze(1)).squeeze(1))
-        scale, shift = self.film(torch.cat([out['core'], card], -1)).chunk(2, -1)
-        g = F.relu(out['grid'] * (1 + scale[..., None, None]) + shift[..., None, None])
-        scores = self.tile(g).reshape(N, CELLS)
+        # in fp32 even under autocast: the scores drift together (softmax ignores a shared offset) into the hundreds or
+        # thousands, where bf16 rounds neighbouring tiles to the same score (2026-10-16: 85% of plays tied, loss 2.8 -> 5)
+        with torch.autocast(out['core'].device.type, enabled=False):
+            scale, shift = self.film(torch.cat([out['core'].float(), card.float()], -1)).chunk(2, -1)
+            g = F.relu(out['grid'].float() * (1 + scale[..., None, None]) + shift[..., None, None])
+            scores = self.tile(g).reshape(N, CELLS)
         if 'legal' in x:
             legal = x['legal'].reshape(N, 4, CELLS).gather(1, slot.view(N, 1, 1).expand(-1, 1, CELLS)).squeeze(1)
             scores = scores.masked_fill(~legal, float('-inf'))

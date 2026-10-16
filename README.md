@@ -41,8 +41,10 @@ sbatch -A competition -p P107-A100 -q qos_p107-a100 --gres=gpu:3 -c 16 --mem=100
 
 The defaults are the current teacher's (4 epochs, global batch 32, chunks of 128 decisions, lr 3e-4 with 500 warm-up
 steps, next-play loss 0.5). On CUDA it trains in bf16 with `torch.compile`. `--device cpu --workers 0` is for small
-checks. A larger model on the same data: `--card_dim 64 --object_dim 128 --attention_layers 2 --conv_channels 96
---conv_layers 5 --core 512`.
+checks. The tile scores are computed in fp32 even under bf16: they drift together into the thousands, where bf16
+rounds neighbouring tiles to the same score. `--final_lr 0.1` decays the learning rate linearly to a tenth by the last
+step (default: constant). The medium model (3.4M parameters, ~12 steps/s on 3 A100s; ahead of the default 1.26M model
+at every step): `--card_dim 64 --object_dim 96 --attention_layers 3 --conv_channels 96 --conv_layers 6 --core 384`.
 
 `latest.pt` is saved every 1,000 steps. Running the same command again resumes it with the settings in
 `settings.json`, so a job killed at its time limit loses at most 1,000 steps. A resumed run shuffles the data afresh
