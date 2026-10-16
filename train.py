@@ -498,6 +498,8 @@ def _log_softmax(logits):
 def what_logp(what, x, explore=0.0):
     """log p(what) [N, 4]: only waiting while a play of ours is in flight, and P(ability) >= explore while one is ready."""
     busy = (x['own_flight_card'] > 0).unsqueeze(-1) & (torch.arange(4, device=what.device) != WAIT)
+    if 'legal' in x:  # no card the client would take: playing is not an option
+        busy = busy | ((~playable(x).any(-1)).unsqueeze(-1) & (torch.arange(4, device=what.device) == PLAY))
     logp = _log_softmax(what.float().masked_fill(busy, float('-inf')))
     if explore:
         ready = torch.isfinite(logp[:, ABILITY1:])
@@ -509,9 +511,27 @@ def what_logp(what, x, explore=0.0):
     return logp
 
 
+HOLD_ELIXIR = C.HOLD_TICKS / 56  # elixir regenerated during the client's hold at 1x (C.REGEN: 1 per 56 ticks)
+
+
+def playable(x):
+    """[N, 4]: hand slots the client would play now: a legal tile, and the cost paid within the client's hold
+    (C.HOLD_TICKS; a tap still short after it is refused, as arena.Engine.step and the live client do). From inputs every
+    model already has: hand_float cost (Mirror's +1 included), scalars elixir_own and the elixir-rate one-hot."""
+    legal = x['legal'].flatten(2).any(-1)
+    if 'hand_float' not in x or 'scalars' not in x:
+        return legal
+    s = x['scalars'].float()
+    elixir = 10 * s[:, 0]
+    rate = s[:, 2] + 2 * s[:, 3] + 3 * s[:, 4]
+    cost = 10 * x['hand_float'][..., 0].float()
+    return legal & (cost <= (elixir + HOLD_ELIXIR * rate + 1e-3).unsqueeze(-1))
+
+
 def which_logp(which, x):
-    """log p(hand slot | play) [N, 4]: a card with no legal tile now (Mirror before any play) cannot be chosen."""
-    return _log_softmax(which.float().masked_fill(~x['legal'].flatten(2).any(-1), float('-inf')))
+    """log p(hand slot | play) [N, 4]: only playable() cards (no legal tile now, e.g. Mirror before any play, or not paid
+    for within the client's hold: the engine and the live client refuse those taps)."""
+    return _log_softmax(which.float().masked_fill(~playable(x), float('-inf')))
 
 
 def tile_logp(model, out, x, slot, rows=None):

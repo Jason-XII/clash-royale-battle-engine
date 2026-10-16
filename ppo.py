@@ -49,7 +49,9 @@ import train as policy  # the inference helpers live in train.py
 
 KING_WEIGHT = 3.0  # the king tower's share of the shaping potential (FirstLight)
 OVERFLOW_PENALTY = 0.002
-REFUSED_PENALTY = 0.01  # per play the engine refuses (no elixir even after the hold, or one already pending): it does nothing
+# Per play the engine refuses. 0 since refused plays are masked out (train.playable: unaffordable within the hold) and a
+# held tap counts as in flight from the tap (PlayerView): what is left are rare mismatches, counted in refused_per_game.
+REFUSED_PENALTY = 0.0
 ADAM_WARMUP = 20  # updates of learning-rate ramp after a fresh Adam (a fresh Adam at full lr collapsed ppo-ebarbs2)
 REPLY_TIMEOUT = 180  # s; a learner that says nothing for longer is gone (a failed node never closes its sockets)
 MAX_TICKS = 7200
@@ -134,7 +136,7 @@ def evaluate(model, x, action, valid, search=None):
     full = model(x)
     out, x = policy.flat(full, x)
     v = valid.reshape(-1)
-    xv = {k: x[k][v] for k in ('own_flight_card', 'legal')}
+    xv = {k: x[k][v] for k in ('own_flight_card', 'legal', 'hand_float', 'scalars')}
     what, slot, cell, play = policy.split(action.reshape(-1)[v])
     what_lp = policy.what_logp(out['what'][v], xv, policy.ABILITY_EXPLORE)
     which_lp = policy.which_logp(out['which'][v], xv)

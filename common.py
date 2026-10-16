@@ -413,7 +413,9 @@ class PlayerView:
                      (a['remainingCooldownMs'] / a['configuredCooldownMs']) if a['configuredCooldownMs'] else 0.0)
         x['ability'] = ab
         # plays in flight: own from the tap (landing - 22), the opponent's from 13 ticks before landing
-        own_f = [(tt, c) for tt, c in landed if c['owner'] == owner and tt - DEPLOY_DELAY <= t < tt]
+        # a tap the client is still holding for elixir is in flight from the tap ('tap', when known), not only from
+        # landing - 22: otherwise the model saw nothing in flight and tapped again (refused)
+        own_f = [(tt, c) for tt, c in landed if c['owner'] == owner and c.get('tap', tt - DEPLOY_DELAY) <= t < tt]
         opp_f = [(tt, c) for tt, c in landed if c['owner'] == other and tt - OPP_VISIBLE <= t < tt][:2]
 
         def flight(tt, c):
