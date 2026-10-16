@@ -207,7 +207,7 @@ class Engine:
             card = next((h for h in me.hand if h.slot == a.slot), None)
             ok = card is not None and free and card.cost * 10000 <= me.elixir + C.hold_slack(before.tick)
             if ok:
-                self.pending.append(dict(due=due, delay=lag, held=card.cost * 10000 > me.elixir,
+                self.pending.append(dict(due=due, tap=before.tick, delay=lag, held=card.cost * 10000 > me.elixir,
                                          hold_until=before.tick + C.HOLD_TICKS, owner=a.owner, slot=a.slot,
                                          card=card.card, cost=card.cost, x=a.x, y=a.y))
             executed.append(ok)
@@ -399,7 +399,7 @@ class Commands:
             self.landed += [(p['tick'], {'owner': p['owner'], 'card_id': p['card'], 'x': p['x'], 'y': p['y']})
                             for p in engine.played]
             self.last_tick = state.tick
-        flying = [(p['due'], {'owner': p['owner'], 'card_id': p['card'], 'x': p['x'], 'y': p['y']})
+        flying = [(p['due'], {'owner': p['owner'], 'card_id': p['card'], 'x': p['x'], 'y': p['y'], 'tap': p['tap']})
                   for p in engine.pending if p.get('card') is not None]
         return self.landed + flying
 

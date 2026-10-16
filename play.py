@@ -419,7 +419,7 @@ class LivePlays:
         flying = list(self.flying)
         if pending and not any(c['owner'] == owner and c['card_id'] == pending['card'] for _, c in flying):
             flying.append((pending['due'], {'owner': owner, 'card_id': pending['card'],
-                                            'x': pending['x'], 'y': pending['y']}))
+                                            'x': pending['x'], 'y': pending['y'], 'tap': pending['tick']}))
         return self.landed + flying
 
 

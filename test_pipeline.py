@@ -373,3 +373,22 @@ def test_decision_server_returns_the_sampled_cards_legal_top_tiles(tmp_path, mon
             assert all(legal[c] for c in top if c >= 0) and any(c >= 0 for c in top)
             played += 1
     assert played, 'the untrained policy played at least one card'
+
+
+def test_unaffordable_cards_are_not_offered_and_held_taps_are_in_flight():
+    legal = torch.ones(1, 4, C.H, C.W, dtype=torch.bool)
+    hf = torch.zeros(1, 4, C.HAND_FLOATS)
+    hf[0, :, 0] = torch.tensor([3, 4, 5, 9]) / 10          # costs 3, 4, 5, 9
+    sc = torch.zeros(1, C.SCALARS)
+    sc[0, 0], sc[0, 2] = 0.40, 1.0                           # 4.0 elixir, 1x rate: the hold adds ~0.41
+    x = {'legal': legal, 'hand_float': hf, 'scalars': sc, 'own_flight_card': torch.zeros(1, dtype=torch.long)}
+    assert train.playable(x).tolist() == [[True, True, False, False]]
+    which = train.which_logp(torch.zeros(1, 4), x)
+    assert torch.isinf(which[0, 2:]).all() and torch.isfinite(which[0, :2]).all()
+    sc[0, 0] = 0.0                                           # nothing affordable: playing is not an option
+    what = train.what_logp(torch.zeros(1, 4), x)
+    assert torch.isinf(what[0, train.PLAY]) and torch.isfinite(what[0, train.WAIT])
+    # PlayerView's own-flight rule: a held tap (tap known) is in flight from the tap, not only from landing - 22
+    landed = [(200, {'owner': 0, 'card_id': 26000021, 'x': 3500, 'y': 10500, 'tap': 150})]
+    assert [tt for tt, c in landed if c.get('tap', tt - C.DEPLOY_DELAY) <= 160 < tt] == [200]
+    assert not [tt for tt, c in landed if tt - C.DEPLOY_DELAY <= 160 < tt]
