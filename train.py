@@ -310,11 +310,12 @@ def collate(items):
 
 
 # ---- training -----------------------------------------------------------------------------------------------------------
-DEFAULTS = dict(epochs=4, batch=32, chunk=128, workers=4, lr=3e-4, weight_decay=0.01, warmup=500, value_coef=0.5,
+DEFAULTS = dict(epochs=4, batch=32, chunk=128, workers=4, lr=3e-4, final_lr=1.0, weight_decay=0.01, warmup=500, value_coef=0.5,
                 next_play=0.5, card_dim=32, object_dim=32, attention_layers=1, conv_channels=48, conv_layers=4, core=256,
                 seed=0, log_every=50, checkpoint_every=1000, device='cuda')
-# larger model on the same data: --card_dim 64 --object_dim 128 --attention_layers 2 --conv_channels 96 --conv_layers 5
-# --core 512
+# final_lr: the learning rate falls linearly to lr x final_lr by the last step (1.0 = constant)
+# medium model (3.4M, 2026-10-16): --card_dim 64 --object_dim 96 --attention_layers 3 --conv_channels 96 --conv_layers 6
+# --core 384
 
 
 def train(data, out, settings):
@@ -395,7 +396,8 @@ def train(data, out, settings):
             for xs, ts in loader(train_entries, settings['seed'] * 1_000_003 + step, rank=rank, world=world):
                 xs, ts = ({k: v.to(device, non_blocking=True) for k, v in g.items()} for g in (xs, ts))
                 for group in optimizer.param_groups:
-                    group['lr'] = settings['lr'] * min(1.0, (step + 1) / max(1, settings['warmup']))
+                    group['lr'] = settings['lr'] * min(1.0, (step + 1) / max(1, settings['warmup'])) * \
+                        (1 - (1 - settings.get('final_lr', 1.0)) * step / total)
                 optimizer.zero_grad(set_to_none=True)
                 with autocast():
                     loss, metrics = objective(xs, ts)

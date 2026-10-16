@@ -211,7 +211,7 @@ def test_packed_inputs_and_ppo_update(tmp_path, monkeypatch):
     trajectories[-1]['reward'][-1] = trajectories[-1]['outcome'] = -1.0
     reference = copy.deepcopy(model).requires_grad_(False)
     critic = ppo.Critic(copy.deepcopy(model))
-    args = argparse.Namespace(gamma=0.999, lam=0.95, minibatch=2, epochs=1, critic_epochs=2, clip=0.2, entropy=0.002,
+    args = argparse.Namespace(gamma=0.999, lam=0.95, upgo=0.5, minibatch=2, epochs=1, critic_epochs=2, clip=0.2, entropy=0.002,
                               kl_coef=0.05)
     device = torch.device('cpu')
     batches = ppo.minibatches(trajectories, args, device)
@@ -228,6 +228,9 @@ def test_packed_inputs_and_ppo_update(tmp_path, monkeypatch):
     assert last['win_loss'] < first['win_loss'], 'the critic learns who won'
     advantage, returns = ppo.advantages(np.array([1., 0., -1.], np.float32), np.zeros(3, np.float32), gamma=1., lam=1.)
     np.testing.assert_array_equal(advantage, [0., -1., -1.])
+    value = np.array([0., .5, .9], np.float32)  # UPGO follows the path while it beats the critic, else bootstraps
+    np.testing.assert_allclose(ppo.upgo(np.array([0., 0., 1.], np.float32), value, 1.), [1., .5, .1], atol=1e-6)
+    np.testing.assert_allclose(ppo.upgo(np.array([0., 0., -1.], np.float32), value, 1.), [.9, .4, -1.9], atol=1e-6)
 
 
 # ---- live play ----------------------------------------------------------------------------------------------------------
@@ -300,3 +303,69 @@ def test_wire_rows_stage_like_padded_rows():
         assert got.dtype == v.dtype, k
         assert torch.equal(got[(slice(None), *map(slice, v.shape[1:]))], v), k
         assert not staged[k][3].any() and (k not in C.OBJECT_KEYS or not got[:, v.shape[1]:].any()), k
+
+
+def test_search_targets_and_distillation(tmp_path, monkeypatch):
+    """Search scores -> targets; trajectories carry them; the PPO update pulls the tile head to the search's choice."""
+    assert ppo.search_target([0.5, 0.5, 0.5], 0.02) is None, 'scores that do not differ give no label'
+    target = ppo.search_target([0.0, 0.04, 0.02], 0.02)
+    assert target.argmax() == 1 and abs(target.sum() - 1) < 1e-6
+    root = dataset(tmp_path / 'data', monkeypatch)
+    torch.manual_seed(0)
+    model = train.Policy(train.Config(vocab_size=len(C.Vocab([26000000])), card_dim=4, object_dim=4, conv_channels=4,
+                                      conv_layers=1, core=8, attention_layers=0))
+    entry = json.loads((root / 'manifest.json').read_text())['entries'][0]
+    x, _ = next(train.chunks(train.read(root / entry['file'], entry['owner']), 300, True, None))
+    T = len(x['scalars'])
+    rows = [train.pack({k: v[t] for k, v in x.items()}) for t in range(T)]
+    seat = ppo.Seat()
+    for t, r in enumerate(rows):
+        seat.rows.append(r)
+        seat.opp.append(r)
+        seat.action.append(0)
+        seat.logp.append(0.0)
+        seat.value.append(0.0)
+        seat.reward.append(0.0)
+        legal = x['legal'][t].reshape(4, -1)
+        slot = int(legal.any(1).argmax())
+        cells = [int(c) for c in np.flatnonzero(legal[slot])[:3]]
+        if t % 3 == 0 and len(cells) == 3:
+            seat.search.append((t, slot, cells, np.array([0.1, 0.8, 0.1], np.float32)))
+    trajectory = seat.trajectory(version=0, opponent='il', outcome=1.0)
+    S = len(seat.search)
+    assert S and trajectory['search_cells'].shape == (S, ppo.SEARCH_K + 1)
+    assert (trajectory['search_cells'][:, 3:] == -1).all() and trajectory['search_t'].tolist() == [e[0] for e in seat.search]
+    trajectory['adv'] = np.zeros(T, np.float32)
+    reference = copy.deepcopy(model).requires_grad_(False)
+    args = argparse.Namespace(minibatch=1, epochs=1, clip=0.2, entropy=0.0, kl_coef=0.0, search_coef=1.0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-2)
+    device = torch.device('cpu')
+    batches = ppo.minibatches([trajectory], args, device)
+    first = ppo.update(model.train(), reference, optimizer, batches, args, device)
+    for _ in range(15):
+        last = ppo.update(model, reference, optimizer, batches, args, device)
+    assert np.isfinite(first['search_loss']) and last['search_loss'] < first['search_loss']
+    assert last['search_agree'] == 1.0, 'the tile head now prefers the cell the search chose'
+
+
+def test_decision_server_returns_the_sampled_cards_legal_top_tiles(tmp_path, monkeypatch):
+    root = dataset(tmp_path / 'data', monkeypatch)
+    torch.manual_seed(0)
+    model = train.Policy(train.Config(vocab_size=len(C.Vocab([26000000])), card_dim=4, object_dim=4, conv_channels=4,
+                                      conv_layers=1, core=8, attention_layers=0)).eval()
+    entry = json.loads((root / 'manifest.json').read_text())['entries'][0]
+    x, _ = next(train.chunks(train.read(root / entry['file'], entry['owner']), 300, True, None))
+    rows = [train.pack({k: v[t] for k, v in x.items()}) for t in range(len(x['scalars']))]
+    decider = ppo.Decider({'current': model}, torch.device('cpu'), 8)
+    decider.shape = ppo.layout(rows[0])
+    decider.reset(0)
+    played = 0
+    for t, row in enumerate(rows):
+        (a, lp, v, top), = decider.act([((0, 0), 'current', None, ppo.wire(row, decider.shape))])
+        assert len(top) == ppo.SEARCH_K
+        if a >= train.CARD:
+            slot, cell = divmod(a - train.CARD, train.CELLS)
+            legal = x['legal'][t].reshape(4, -1)[slot]
+            assert all(legal[c] for c in top if c >= 0) and any(c >= 0 for c in top)
+            played += 1
+    assert played, 'the untrained policy played at least one card'

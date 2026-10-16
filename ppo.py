@@ -13,8 +13,9 @@ RUN/latest.pt with RUN/settings.json; actors reconnect by themselves.
 
 Opponents: self-play (--self-play of the games, both seats learn) or a frozen one by PFSP, weight (1 - win rate)^2 + 0.05,
 over the IL model and the --pool-size latest snapshots. Reward: +1 win / -1 loss, -OVERFLOW_PENALTY per decision at full
-elixir, and FirstLight's tower shaping, shaping * (gamma * potential' - potential), the potential being crowns plus lost
-tower hp fractions (king x3), theirs minus ours, and 0 once the game ends (no bonus for a fast or a big win).
+elixir, -REFUSED_PENALTY per play the engine refuses, and FirstLight's tower shaping, shaping * (gamma * potential' -
+potential), the potential being crowns plus lost tower hp fractions (king x3), theirs minus ours, and 0 once the game ends
+(no bonus for a fast or a big win).
 """
 import argparse
 from collections import defaultdict, deque
@@ -23,10 +24,13 @@ import json
 import multiprocessing as mp
 from multiprocessing.connection import Client, Listener, wait
 import os
+import pickle
 from pathlib import Path
 import queue
 import random
+import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -45,6 +49,7 @@ import train as policy  # the inference helpers live in train.py
 
 KING_WEIGHT = 3.0  # the king tower's share of the shaping potential (FirstLight)
 OVERFLOW_PENALTY = 0.002
+REFUSED_PENALTY = 0.01  # per play the engine refuses (no elixir even after the hold, or one already pending): it does nothing
 ADAM_WARMUP = 20  # updates of learning-rate ramp after a fresh Adam (a fresh Adam at full lr collapsed ppo-ebarbs2)
 REPLY_TIMEOUT = 180  # s; a learner that says nothing for longer is gone (a failed node never closes its sockets)
 MAX_TICKS = 7200
@@ -63,6 +68,20 @@ def advantages(reward, value, gamma, lam):
         last = reward[t] + gamma * next_value - value[t] + gamma * lam * last
         adv[t] = last
     return adv.astype(np.float32), (adv + value).astype(np.float32)
+
+
+def upgo(reward, value, gamma):
+    """UPGO (AlphaStar): the return that follows the actual path while it beats the critic's estimate (one-step
+    look-ahead r' + gamma V'' >= V') and bootstraps from V' where it doesn't -> advantages (that return - value)."""
+    out = np.zeros_like(value)
+    for t in reversed(range(len(reward))):
+        if t + 1 == len(reward):
+            out[t] = reward[t]
+            continue
+        after = value[t + 2] if t + 2 < len(value) else 0.0
+        follow = reward[t + 1] + gamma * after >= value[t + 1]
+        out[t] = reward[t] + gamma * (out[t + 1] if follow else value[t + 1])
+    return (out - value).astype(np.float32)
 
 
 def discounted(reward, gamma):
@@ -107,10 +126,11 @@ def _kl(logp, ref):
     return (logp.exp() * (logp.masked_fill(torch.isinf(logp), 0) - ref.masked_fill(torch.isinf(ref), 0))).sum(-1)
 
 
-def evaluate(model, x, action, valid):
+def evaluate(model, x, action, valid, search=None):
     """A forward pass on a padded batch -> per real decision ([n], in the mask's order): log p(action), the what and
     card heads' log-probs [n, 4], the log-prob of the tile taken and its head's entropy (0 where no card was played),
-    whether a card was played, and the value."""
+    whether a card was played, and the value. search: (flat rows b * T + t, hand slots) -> also 'search', the tile
+    log-probs [S, CELLS] of those decisions for those cards."""
     full = model(x)
     out, x = policy.flat(full, x)
     v = valid.reshape(-1)
@@ -124,8 +144,11 @@ def evaluate(model, x, action, valid):
     tile_entropy[play] = _entropy(tiles)
     pick = lambda lp, i: lp.gather(1, i.unsqueeze(1)).squeeze(1)  # noqa: E731
     logp = pick(what_lp, what) + torch.where(play, pick(which_lp, slot) + tile, torch.zeros_like(tile))
-    return dict(logp=logp, what=what_lp, which=which_lp, tile=tile, tile_entropy=tile_entropy, play=play,
-                value=full['value'].reshape(-1)[v])
+    result = dict(logp=logp, what=what_lp, which=which_lp, tile=tile, tile_entropy=tile_entropy, play=play,
+                  value=full['value'].reshape(-1)[v])
+    if search is not None:
+        result['search'] = policy.tile_logp(model, out, x, search[1], search[0])
+    return result
 
 
 class Evaluate(nn.Module):
@@ -135,8 +158,8 @@ class Evaluate(nn.Module):
         super().__init__()
         self.policy = model
 
-    def forward(self, x, action, valid):
-        return evaluate(self.policy, x, action, valid)
+    def forward(self, x, action, valid, search=None):
+        return evaluate(self.policy, x, action, valid, search)
 
 
 class Critic(nn.Module):
@@ -181,6 +204,8 @@ def critic_targets(batches, critic, args, device):
         a_win, _ = advantages(r_win, t['v_win'], 1.0, args.lam)
         a_short, t['ret_short'] = advantages(r_short, t['v_short'], args.gamma, args.lam)
         t['adv'] = a_win + a_short
+        if args.upgo:
+            t['adv'] += args.upgo * (upgo(r_win, t['v_win'], 1.0) + upgo(r_short, t['v_short'], args.gamma))
         t['p_win'] = np.full(n, (t['outcome'] + 1) / 2, np.float32)
         late = np.arange(n) >= 3 * n // 4
         out['outcome'].append(np.full(n, t['outcome'], np.float32))
@@ -249,8 +274,17 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
         for _ in range(args.epochs):
             for chunk, x, _, valid in random.sample(batches, len(batches)):
                 y = targets(chunk, ('action', 'logp', 'adv'), device)
+                T = x['scalars'].shape[1]
+                searched = sum(len(t.get('search_t', ())) for t in chunk)
+                search = None
+                if searched:  # the search's targets for this chunk's searched decisions
+                    rows = np.concatenate([b * T + t['search_t'] for b, t in enumerate(chunk)])
+                    search = (torch.from_numpy(rows).to(device), torch.from_numpy(np.concatenate(
+                        [t['search_slot'] for t in chunk])).to(device))
+                    cells = torch.from_numpy(np.concatenate([t['search_cells'] for t in chunk])).to(device)
+                    target = torch.from_numpy(np.concatenate([t['search_target'] for t in chunk])).to(device)
                 with torch.autocast(**autocast):
-                    new = objective(x, y['action'], valid)
+                    new = objective(x, y['action'], valid, search)
                 ref_what, ref_which, ref_tile = (torch.cat(parts) for parts in zip(*(t['ref'] for t in chunk)))
                 ratio = (new['logp'] - y['logp'][valid]).exp()
                 adv = (y['adv'][valid] - mean) / std
@@ -262,6 +296,14 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
                           + torch.where(new['play'], log_r.exp() - 1 - log_r, torch.zeros_like(log_r))).mean()
                 # the policy's own value head is left alone (0 x keeps a gradient on every parameter DDP expects)
                 loss = policy_loss - args.entropy * ent + args.kl_coef * kl_ref + 0 * new['value'].sum()
+                if search is not None:  # cross-entropy of the tile head to the search's distribution over its candidates
+                    lp = new['search'].float().gather(1, cells.clamp(min=0))
+                    ok = (cells >= 0) & torch.isfinite(lp)
+                    search_loss = -(target * lp.masked_fill(~ok, 0)).sum(1).mean()
+                    loss = loss + getattr(args, 'search_coef', 0.0) * search_loss
+                    stats['search_loss'].append(search_loss.item())
+                    stats['search_agree'].append((lp.masked_fill(~ok, float('-inf')).argmax(1)
+                                                  == target.argmax(1)).float().mean().item())
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -296,6 +338,69 @@ def potential(state, start, owner):
         else:
             dealt += lost
     return dealt - taken
+
+
+# ---- search ------------------------------------------------------------------------------------------------------------
+SEARCH_K = 8  # the policy's top tiles a search compares (plus the one it sampled)
+SEARCH_TIMEOUT = 30  # s for one search's rollouts; a copy that hangs is killed and the search dropped
+
+
+def rollout_score(engine, play, owner, start, princess, horizon, material):
+    """In a forked copy of the game: drop the opponent's plays `owner` cannot see yet, make `play`, run `horizon` ticks
+    with no further plays -> tower damage (the shaping potential) + material x (our units' hp - theirs, in princess
+    towers)."""
+    from arena import PLAY_DELAY
+    now = engine.state.tick
+    engine.pending[:] = [p for p in engine.pending if p['owner'] == owner or p['due'] - now <= C.OPP_VISIBLE]
+    state = engine.step([play], 5, delay=sum(PLAY_DELAY) // 2).state
+    while state.tick - now < horizon and not state.finalized:
+        state = engine.step((), 5).state
+    units = sum((e.hp if e.owner == owner else -e.hp) for e in state.entities if e.card != -1 and e.hp)
+    return potential(state, start, owner) + material * units / princess
+
+
+def search_tiles(engine, owner, slot, cells, start, princess, horizon, material):
+    """Score playing hand slot `slot` on each of `cells`, each in its own forked copy of the game (all at once; os.fork
+    copies the native engine exactly: ~12 ms) -> [score], or None if any copy failed."""
+    from arena import Play
+    kids = []
+    for cell in cells:
+        row, col = divmod(cell, C.W)
+        play = Play(owner, slot, *C.rotate(col * 1000 + 500, row * 1000 + 500, owner))
+        rd, wr = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # the copy: never touches the sockets it inherited, and exits without native destructors
+            try:
+                os.close(rd)
+                os.write(wr, pickle.dumps(rollout_score(engine, play, owner, start, princess, horizon, material)))
+            finally:
+                os._exit(0)
+        os.close(wr)
+        kids.append((pid, rd))
+    scores, deadline = [], time.time() + SEARCH_TIMEOUT
+    for pid, rd in kids:
+        buf = b''
+        while time.time() < deadline:
+            ready, _, _ = select.select([rd], [], [], max(0.0, deadline - time.time()))
+            chunk = os.read(rd, 1 << 16) if ready else b''
+            if not chunk:
+                break
+            buf += chunk
+        if time.time() >= deadline:
+            os.kill(pid, signal.SIGKILL)
+        os.close(rd)
+        os.waitpid(pid, 0)
+        scores.append(pickle.loads(buf) if buf else None)
+    return None if any(not isinstance(x, float) for x in scores) else scores
+
+
+def search_target(scores, tau):
+    """Scores -> a distribution over the candidates (softmax at temperature tau), or None when they do not differ."""
+    scores = np.asarray(scores, np.float64)
+    if scores.max() - scores.min() < 1e-3:
+        return None
+    w = np.exp((scores - scores.max()) / tau)
+    return (w / w.sum()).astype(np.float32)
 
 
 # ---- actors -------------------------------------------------------------------------------------------------------------
@@ -346,12 +451,21 @@ class Seat:
 
     def __init__(self):
         self.rows, self.opp, self.action, self.logp, self.value, self.reward = [], [], [], [], [], []
+        self.search = []  # (decision index, hand slot, candidate cells, target distribution)
 
     def trajectory(self, **extra):
+        n = SEARCH_K + 1
+        cells = np.full((len(self.search), n), -1, np.int64)
+        target = np.zeros((len(self.search), n), np.float32)
+        for i, (_, _, c, p) in enumerate(self.search):
+            cells[i, :len(c)], target[i, :len(p)] = c, p
         return dict(inputs={k: policy.pad_stack([r[k] for r in self.rows]) for k in self.rows[0]},
                     opp={k: np.stack([r[k] for r in self.opp]) for k in PRIVATE},
                     action=np.array(self.action, np.int64), logp=np.array(self.logp, np.float32),
-                    value=np.array(self.value, np.float32), reward=np.array(self.reward, np.float32), **extra)
+                    value=np.array(self.value, np.float32), reward=np.array(self.reward, np.float32),
+                    search_t=np.array([x[0] for x in self.search], np.int64),
+                    search_slot=np.array([x[1] for x in self.search], np.int64), search_cells=cells,
+                    search_target=target, **extra)
 
 
 def redirect(run, name):
@@ -380,6 +494,9 @@ def collector(index, run, address, key):
     server = Client(address, authkey=key)
     timing = defaultdict(float)
     while True:
+        # every game: a learner (re)started after this collector may have new settings (an actor that starts with its
+        # learner can read the previous endpoint.json)
+        s = endpoint(run)['settings']
         names = list(opponents)
         if names and rng.random() >= s['self_play']:
             name = rng.choices(names, [opponents[n][1] for n in names])[0]
@@ -393,6 +510,7 @@ def collector(index, run, address, key):
         inputs = Inputs(engine, match, {0: vocab, 1: vocab}, legal)
         seats = {o: Seat() for o in (0, 1) if models[o][0] == 'current'}
         start = tower_hp(state)
+        princess = max(hp for _, hp, king in start.values() if not king)
         phi = [potential(state, start, o) for o in (0, 1)]
         version, shape = None, None
         while True:
@@ -406,8 +524,22 @@ def collector(index, run, address, key):
             replies, used = receive(server)
             version = used if version is None else version  # the game counts as played by its first weights
             t2 = time.perf_counter()
-            plays = []
-            for o, (a, lp, v) in enumerate(replies):
+            plays, searched = [], 0.0
+            for o, (a, lp, v, top) in enumerate(replies):
+                if o in seats and a >= policy.CARD and rng.random() < s.get('search_frac', 0.0):
+                    t3 = time.perf_counter()
+                    slot, sampled = divmod(a - policy.CARD, policy.CELLS)
+                    cells = list(dict.fromkeys([sampled] + [c for c in top if c >= 0]))
+                    scores = search_tiles(engine, o, slot, cells, start, princess, s['search_horizon'],
+                                          s['search_material'])
+                    target = search_target(scores, s['search_tau']) if scores else None
+                    if target is not None:
+                        seats[o].search.append((len(seats[o].action), slot, cells, target))
+                    timing['searches'] += 1
+                    timing['search_failed'] += scores is None
+                    timing['search_labels'] += target is not None
+                    timing['search_changed'] += target is not None and int(np.argmax(target)) != 0
+                    searched += time.perf_counter() - t3
                 if o in seats:
                     seat = seats[o]
                     seat.rows.append(rows[o])
@@ -423,6 +555,9 @@ def collector(index, run, address, key):
                     plays.append(Play(o, *choice[1:]))
             transition = engine.step(plays, 5, delay=PLAY_DELAY)
             timing['refused'] += transition.executed.count(False)
+            for play, ok in zip(plays, transition.executed):
+                if not ok and play.owner in seats:
+                    seats[play.owner].reward[-1] -= REFUSED_PENALTY
             state = transition.state
             ended = state.finalized or state.tick >= MAX_TICKS
             for o, seat in seats.items():
@@ -431,7 +566,8 @@ def collector(index, run, address, key):
                 phi[o] = new
             timing['features'] += t1 - t0
             timing['wait'] += t2 - t1
-            timing['engine'] += time.perf_counter() - t2
+            timing['engine'] += time.perf_counter() - t2 - searched
+            timing['search'] += searched
             timing['steps'] += 1
             if ended:
                 break
@@ -506,9 +642,9 @@ class Decider:
     each call replays a CUDA graph of the whole decision (forward pass and sampling) for its bucket of rows and objects:
     run op by op, a call launched ~280 kernels, 9 ms of CPU for 0.7 ms of GPU work, whatever the batch."""
 
-    def __init__(self, models, device, core, capacity=1024):
+    def __init__(self, models, device, core, capacity=1024, top=True):
         torch.backends.mha.set_fastpath_enabled(False)  # the learner's attention path: same numerics, and capturable
-        self.models, self.device, self.capacity = models, device, capacity
+        self.models, self.device, self.capacity, self.top = models, device, capacity, top
         self.rows = {}  # (collector, owner) -> row of self.h / self.c; row `capacity` is scratch (padding rows)
         self.h = torch.zeros(1, capacity + 1, core, device=device)
         self.c = torch.zeros_like(self.h)
@@ -542,7 +678,14 @@ class Decider:
             action, logp = policy.sample(model, out, x, policy.ABILITY_EXPLORE)
             self.h.index_copy_(1, index, out['state'][0].float())
             self.c.index_copy_(1, index, out['state'][1].float())
-        return action, logp.float(), out['value'][:, 0].float()
+            if not self.top:  # no search: -1s, at no cost
+                return action, logp.float(), out['value'][:, 0].float(), action.new_full((len(action), SEARCH_K), -1)
+            # the sampled card's most likely tiles (what a collector's search compares); -1 for illegal ones
+            f, fx = policy.flat(out, x)
+            tiles = policy.tile_logp(model, f, fx, ((action - policy.CARD).clamp(min=0) // policy.CELLS))
+            best, top = tiles.topk(SEARCH_K, -1)
+            top = torch.where(torch.isfinite(best), top, torch.full_like(top, -1))
+        return action, logp.float(), out['value'][:, 0].float(), top
 
     def _graph(self, name, staged):
         B, O = staged['obj_side'].shape[0], staged['obj_side'].shape[2]
@@ -564,7 +707,8 @@ class Decider:
         return self.graphs[key]
 
     def act(self, requests):
-        """requests: [(seat, model name, its checkpoint, wire() row)] -> [(action, logp, value)], same order."""
+        """requests: [(seat, model name, its checkpoint, wire() row)] -> [(action, logp, value, the sampled card's top
+        tiles)], same order."""
         by_model = defaultdict(list)
         for i, (_, name, path, _) in enumerate(requests):
             by_model[name].append(i)
@@ -589,9 +733,9 @@ class Decider:
                         x[k].copy_(torch.from_numpy(v), non_blocking=True)
                     static_index.copy_(torch.tensor(index), non_blocking=True)
                     graph.replay()
-                action, logp, value = (o[:len(rows)].tolist() for o in outputs)
-                for i, a, lp, v in zip(part, action, logp, value):
-                    results[i] = (a, lp, v)
+                action, logp, value, top = (o[:len(rows)].tolist() for o in outputs)
+                for i, a, lp, v, t in zip(part, action, logp, value, top):
+                    results[i] = (a, lp, v, t)
         return results
 
 
@@ -611,7 +755,9 @@ def server(sid, run, listener, gpu, mps):
     current = policy.load(endpoint(run)['init'], device)[0]
     link = Link(run)
     weights, opponents = link.exchange([], [], {})
-    decider = Decider({'current': current}, device, current.config.core)
+    # the top tiles cost ~2 ms a step; a server started while search is off skips them
+    decider = Decider({'current': current}, device, current.config.core,
+                      top=endpoint(run)['settings'].get('search_frac', 0.0) > 0)
     conns, arrivals, polled, stats = [], queue.Queue(), time.monotonic(), defaultdict(float)
 
     def accept():
@@ -795,7 +941,8 @@ def reachable_ip():
 
 DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibatch=8, clip=0.2, gamma=0.999, lam=0.95,
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
-                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1)
+                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0,
+                search_frac=0.0, search_horizon=160, search_material=0.3, search_tau=0.02, search_coef=1.0)
 
 
 def learn(args, settings):
@@ -931,7 +1078,10 @@ def learn(args, settings):
                 stale=sum(r['stale'] for r in everyone), lag=float(np.mean([x for r in everyone for x in r['lag']] or [0])),
                 actors=sum(r['actors'] for r in everyone), wait_s=round(t1 - t0, 1), update_s=round(t2 - t1, 1), lr=lr,
                 value_only=version - 1 < s.value_warmup,
-                actor_ms={k: round(1000 * sum(t.get(k, 0) for t in times) / steps, 2) for k in ('features', 'wait', 'engine')},
+                actor_ms={k: round(1000 * sum(t.get(k, 0) for t in times) / steps, 2)
+                          for k in ('features', 'wait', 'engine', 'search')},
+                search={k: round(sum(t.get(k, 0) for t in times) / max(1, sum(t.get('games', 0) for t in times)), 2)
+                        for k in ('searches', 'search_labels', 'search_changed', 'search_failed')},
                 refused_per_game=round(sum(t.get('refused', 0) for t in times) / max(1, sum(t.get('games', 0) for t in times)), 2),
                 score={n: round(float(np.mean(results[n])), 3) for n in sorted(results) if results[n]},
                 ticks=float(np.mean([row['tick'] for row in finished] or [0])),
