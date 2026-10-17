@@ -598,7 +598,7 @@ class Agent:
     """One player: act(inputs) -> decode()'s action, sampled from the policy. `inputs`: one PlayerView.step()."""
 
     def __init__(self, model, owner, device='cpu'):
-        self.model, self.owner, self.device, self.lstm, self.value = model, owner, device, None, 0.0
+        self.model, self.owner, self.device, self.lstm, self.value, self.p_what = model, owner, device, None, 0.0, None
 
     @torch.no_grad()
     def act(self, inputs):
@@ -606,6 +606,7 @@ class Agent:
         out = self.model(x, self.lstm)
         self.lstm = out['state']
         self.value = float(out['value'].reshape(-1)[0])  # the IL value head: expected outcome, -1 loss .. +1 win
+        self.p_what = out['what'].float().softmax(-1).reshape(-1).tolist()  # wait / play / ability 1 / ability 2
         action, _ = sample(self.model, out, x)
         return decode(int(action[0]), self.owner)
 

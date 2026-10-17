@@ -29,7 +29,15 @@ PACKAGE = 'nullsroyale.rel.free'
 READER = '/data/local/tmp/clapha-reader-nulls'
 MANAGER_RVA, ROOT_CONTEXT = 0x19BD358, 0x20  # the Nulls build's (clapha-console nulls/README.md)
 GET_MANAGER_GLOBAL = 0x19BBDD8  # libg global getManager() returns (0xBB6508); battle = [[manager+0x248]+0x90]
-ACCOUNT = 0x043EC2F6  # the emulator's Nulls account (roster entry of our side, read 2026-10-14)
+FRIDA_SERVER = '/data/local/tmp/frida-server'
+# Our account id as the client knows it, for --account auto (Jason's clash-simulator hook_raw_capture.js, same build):
+# getLocalAccountObject(getAccountContext(), 0, 0) (libg 0xC8A954, 0xC85C28), its id the u32 at +0x20 +4.
+LOCAL_ACCOUNT_JS = '''
+const base = Process.findModuleByName('libg.so').base;
+const context = new NativeFunction(base.add(0xc85c28), 'pointer', []);
+const local = new NativeFunction(base.add(0xc8a954), 'pointer', ['pointer', 'int', 'int']);
+rpc.exports.id = () => { const a = local(context(), 0, 0); return a.isNull() ? null : a.add(0x24).readU32(); };
+'''
 FRAME_MS = 50
 FIRST_DECISION = 90  # as in imitation learning; taps earlier are not taken anyway
 STALL_S = 2.0  # the tick standing still this long once it has moved: the battle is over (the results screen keeps the
@@ -41,6 +49,7 @@ TILE_W, TILE_H = (X1 - X0) / 18, (Y1 - Y0) / 30
 BOTTOM = Y1 + TILE_H
 BUTTON = (440, 2035)  # home screen Battle (yellow) and results screen OK (blue) overlap here, below their labels
 ROAD_OK = (539, 2345)  # OK at the bottom of the trophy road page after a new arena
+PAIRED_OK = (706, 2035)  # OK on a results screen that also offers Play Again (left): BUTTON falls between the two
 ABILITY_BUTTON = (973, 1954)  # hero / champion ability, bottom right above the hand
 
 
@@ -136,7 +145,7 @@ def prepare(serial='emulator-5554', avd='Pixel_9_2', timeout=90):
 
 def screen(serial):
     """Which screen is up, by a few pixels: 'home' (Battle, yellow at BUTTON), 'results' (OK, blue at BUTTON), 'road' (the
-    trophy road page after a battle: light blue at both ends of ROAD_OK), or None (matchmaking, loading, battle)."""
+    trophy road page after a battle: light blue at both ends of ROAD_OK), 'paired' (results with Play Again and OK), or None (matchmaking, loading, battle)."""
     raw = subprocess.run([ADB, '-s', serial, 'exec-out', 'screencap'], capture_output=True).stdout
     w, h = struct.unpack('<II', raw[:8])
 
@@ -148,6 +157,9 @@ def screen(serial):
         return 'home'
     if b > 180 and r < 120:
         return 'results'
+    r, g, b = pixel(*PAIRED_OK)
+    if b > 180 and r < 120 and (r, g, b) != pixel(*BUTTON):
+        return 'paired'
     if all(r < 120 and 150 <= g <= 210 and b > 230 for r, g, b in (pixel(470, ROAD_OK[1]), pixel(610, ROAD_OK[1]))):
         return 'road'
     return None
@@ -193,6 +205,24 @@ def frames(serial):
                 yield json.loads(line)
         print(f'the reader stopped (exit {reader.wait()}; is the game running?); starting it again', flush=True)
         time.sleep(5)
+
+
+def local_account(serial):
+    """Our account id, asked of the running client through Frida (attached for this one call)."""
+    import frida  # only for --account auto
+    adb(serial, 'forward', 'tcp:27042', 'tcp:27042')
+    if not adb(serial, 'shell', 'pidof frida-server', check=False).stdout.strip():
+        subprocess.Popen([ADB, '-s', serial, 'shell', f'chmod 755 {FRIDA_SERVER}; {FRIDA_SERVER} >/dev/null 2>&1 &'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+    device = frida.get_device_manager().add_remote_device('127.0.0.1:27042')
+    session = device.attach(int(adb(serial, 'shell', f'pidof {PACKAGE}').stdout.split()[0]))
+    try:
+        script = session.create_script(LOCAL_ACCOUNT_JS)
+        script.load()
+        return script.exports_sync.id()
+    finally:
+        session.detach()
 
 
 def roster(serial):
@@ -473,7 +503,10 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
                 choice = agent.act(view.step(record, plays.commands(pending, owner)))
                 me = next(p for p in record['lean']['state']['players'] if p['owner'] == owner)
                 log({'event': 'decision', 'tick': tick, 'elixir': me['elixirRaw'], 'choice': choice[0],
-                     'value': round(agent.value, 3), 'board': board(record),
+                     'value': round(agent.value, 3), 'p_what': [round(q, 4) for q in agent.p_what], 'board': board(record),
+                     'abilities': [[a['controllerSlot'], a['available'], a['buttonState'], a['remainingChargesRaw'],
+                                    a['remainingCooldownMs']] for a in next(p for p in record['lean']['players']
+                                                                          if p['owner'] == owner)['abilityRuntime']],
                      'opponent_commands': [c for _, c in plays.flying if c['owner'] == other]})
                 if choice[0] == 'ability':  # pressed at once: nothing in flight to wait for
                     taps.tap(*ABILITY_BUTTON)
@@ -502,7 +535,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('checkpoint', type=Path, help="a train.py checkpoint (latest.pt)")
     parser.add_argument('--tables', required=True, type=Path, help="clapha-engine export_tables.py's JSON, August build")
-    parser.add_argument('--account', type=lambda s: int(s, 0), default=ACCOUNT, help='our account id (finds our seat)')
+    parser.add_argument('--account', default='auto',
+                        help="our account id (finds our seat); 'auto': ask the client each battle (Frida)")
     parser.add_argument('--games', type=int, default=1)
     parser.add_argument('--losses', type=int, default=0, help='instead of --games: play until this many losses')
     parser.add_argument('--serial', default='emulator-5554')
@@ -528,7 +562,7 @@ def main():
                 checked = time.monotonic()
                 now = screen(args.serial)  # OK on results / trophy road, then Battle
                 if now:
-                    taps.tap(*(ROAD_OK if now == 'road' else BUTTON))
+                    taps.tap(*{'road': ROAD_OK, 'paired': PAIRED_OK}.get(now, BUTTON))
             frame = next(stream)
         path = args.out / time.strftime('%Y%m%d_%H%M%S.jsonl')
         with path.open('w') as f:
@@ -537,17 +571,20 @@ def main():
                 f.flush()
             log({'event': 'checkpoint', 'path': str(args.checkpoint)})
             finished = frame['chain']['battle']
+            account = None if args.account == 'auto' else int(args.account, 0)
             for _ in range(20):  # the roster is not linked yet at the battle's first frames
                 try:
                     ids = roster(args.serial)
-                    if ids.count(args.account) == 1:
+                    if args.account == 'auto' and len(ids) >= 2:  # the client's local account reads the roster too
+                        account = local_account(args.serial)
+                    if ids.count(account) == 1:
                         break
                 except (struct.error, ValueError, StopIteration, subprocess.CalledProcessError):
                     ids = []
                 time.sleep(0.2)
-            if ids.count(args.account) != 1:
-                raise SystemExit(f'account {args.account:#x} is not exactly one seat: {[hex(i) for i in ids]}')
-            owner = ids.index(args.account)
+            if ids.count(account) != 1:
+                raise SystemExit(f'account {account if account is None else hex(account)} is not exactly one seat: {[hex(i) for i in ids]}')
+            owner = ids.index(account)
             log({'event': 'roster', 'accounts': ids, 'owner': owner})
             last = play_battle(stream, frame, model, vocab, records, owner, taps, log)
             alive = {'objects': [o for o in last['objects'] if o['hp'] is None or o['hp'] > 0]}  # the last frame still
