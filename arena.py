@@ -470,6 +470,7 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--unmasked_b', action='store_true', help="B samples as before PR 11 (no elixir mask)")
+    parser.add_argument('--deck', type=Path, help="A always plays this deck (JSON, as in the pool), B the pair's second deck")
     args = parser.parse_args()
     if args.games < 2 or args.games % 2:
         parser.error('games must be positive and even for paired seats')
@@ -479,6 +480,7 @@ def main():
     pool = json.loads(args.pool.read_text())
     if not pool:
         parser.error('deck pool is empty')
+    deck = args.deck and json.loads(args.deck.read_text())
     models = [train.load(path)[:2] for path in (args.a, args.b)]
     models[1][0].elixir_mask = not args.unmasked_b
     engine = Engine(args.engine)
@@ -487,7 +489,10 @@ def main():
     with args.out.open('x') as stream:
         for pair_index, index in enumerate(rng.integers(len(pool), size=args.games // 2)):
             for seat in (0, 1):
-                result = dict(game=len(results), **evaluate(engine, models, pool[index], args.seed + pair_index, seat))
+                pair = pool[index]
+                if deck:
+                    pair = dict(pair, decks=[deck, pair['decks'][1]][::1 if seat == 0 else -1])
+                result = dict(game=len(results), **evaluate(engine, models, pair, args.seed + pair_index, seat))
                 results.append(result)
                 stream.write(json.dumps(result) + '\n')
                 stream.flush()

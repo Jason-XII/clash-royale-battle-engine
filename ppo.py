@@ -16,6 +16,9 @@ over the IL model and the --pool-size latest snapshots. Reward: +1 win / -1 loss
 elixir, -REFUSED_PENALTY per play the engine refuses, and FirstLight's tower shaping, shaping * (gamma * potential' -
 potential), the potential being crowns plus lost tower hp fractions (king x3), theirs minus ours, and 0 once the game ends
 (no bonus for a fast or a big win).
+
+A specialist: put "deck" (a deck as in the pool) and "self_play": 0 in RUN/settings.json before the first start; a
+learning seat then always plays that deck, against the pool's decks.
 """
 import argparse
 from collections import defaultdict, deque
@@ -507,7 +510,12 @@ def collector(index, run, address, key):
                 models.reverse()
         else:
             models = [('current', None)] * 2
-        match = make_match(rng.choice(pool), rng.randrange(1 << 30))
+        pair = rng.choice(pool)
+        if s.get('deck'):  # a specialist (settings.json "deck", as in the pool): one learning seat always plays it
+            seat = rng.choice([o for o in (0, 1) if models[o][0] == 'current'])
+            deck = rng.sample(s['deck'], len(s['deck']))  # in a random order, as humans' decks come
+            pair = dict(pair, decks=[deck if o == seat else d for o, d in enumerate(pair['decks'])])
+        match = make_match(pair, rng.randrange(1 << 30))
         state = engine.reset(match=match)
         inputs = Inputs(engine, match, {0: vocab, 1: vocab}, legal)
         seats = {o: Seat() for o in (0, 1) if models[o][0] == 'current'}
