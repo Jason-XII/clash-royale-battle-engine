@@ -7,3 +7,4 @@ __pycache__/
 *.pt
 docs/agent-memory/
 assets/clapha-reader-nulls
+_native_features*.so

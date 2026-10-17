@@ -2,7 +2,15 @@
 placement, the game clock and elixir timing. NumPy only (the converter runs without torch)."""
 import json
 import math
+import os
 from pathlib import Path
+
+try:
+    import _native_features
+except ImportError:
+    _native_features = None
+if os.environ.get('CR_NATIVE_FEATURES', '1') == '0':
+    _native_features = None
 
 import numpy as np
 
@@ -232,11 +240,16 @@ def _aim(u):
     return None
 
 
-def decision_inputs(d, owner, vocab, prev_pos, state):
+def decision_inputs(d, owner, vocab, prev_pos, state, shared=None):
     """One decision's object inputs. `prev_pos`: {object id: (x, y)} at the previous decision; `state`: per-game
     counters (PlayerView.state)."""
-    units = {u['nativeObjectId']: u for u in d['units']}
-    objects = sorted(d['objects'], key=lambda o: (o['nativeObjectId'] not in TOWER_IDS, o['nativeObjectId']))
+    if shared is None:
+        shared = {}
+    if not shared:
+        shared.update(units={u['nativeObjectId']: u for u in d['units']},
+                      objects=sorted(d['objects'], key=lambda o: (o['nativeObjectId'] not in TOWER_IDS, o['nativeObjectId'])),
+                      positions={o['nativeObjectId']: (o['x'], o['y']) for o in d['objects']}, values={})
+    units, objects = shared['units'], shared['objects']
     slots = state.get('object_slots', MAX_OBJECTS)
     n = min(len(objects), slots)
     state['dropped'] += max(0, len(objects) - MAX_OBJECTS)
@@ -246,7 +259,7 @@ def decision_inputs(d, owner, vocab, prev_pos, state):
         'obj_float': np.zeros((slots, OBJ_FLOATS), np.float32),
         'eff_id': np.zeros((slots, MAX_EFFECTS), np.int64), 'eff_left': np.zeros((slots, MAX_EFFECTS), np.float32),
     }
-    positions = {o['nativeObjectId']: (o['x'], o['y']) for o in d['objects']}
+    positions = shared['positions']
     for i, o in enumerate(objects[:n]):
         oid = o['nativeObjectId']
         u = units.get(oid, {})
@@ -266,7 +279,10 @@ def decision_inputs(d, owner, vocab, prev_pos, state):
              _ms_s(phase.get('deployRemainingMs'), 5), float(tpos is not None),
              _clip((tx - ox) / 1000, -10, 10) / 10, _clip((ty - oy) / 1000, -10, 10) / 10,
              float(o['owner'] == owner), float(kind == 'tower')]
-        us = list(unit_state_values(u)) if u else [0.0] * UNIT_STATES
+        if u and oid not in shared['values']:
+            shared['values'][oid] = (_native_features.unit_state_values(u) if _native_features is not None
+                                     else unit_state_values(u))
+        us = list(shared['values'][oid]) if u else [0.0] * UNIT_STATES
         aim = _aim(u) if u else None
         if aim:
             ax, ay = rotate(aim[0], aim[1], owner)
@@ -368,12 +384,12 @@ class PlayerView:
         self.states, self.played = (None, 0) if candidates is None else (set(candidates), 0)  # candidate states so far
         self.chef = {'has': None, 'last': {0: CHEF_START_TICKS, 1: CHEF_START_TICKS}, 'fed': set()}
 
-    def step(self, d, landed):
+    def step(self, d, landed, shared=None):
         owner, vocab, other = self.owner, self.vocab, 1 - self.owner
         t = d['tick']
         ability_clock(self.clock_state, t, d['units'])
         chef_clock(self.chef, t, d)
-        x = decision_inputs(d, owner, vocab, self.prev, self.state)
+        x = decision_inputs(d, owner, vocab, self.prev, self.state, shared)
         self.prev = {o['nativeObjectId']: (o['x'], o['y']) for o in d['objects']}
         players = {p['owner']: p for p in d['lean']['state']['players']}
         lean = {p['owner']: p for p in d['lean']['players']}

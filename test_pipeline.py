@@ -303,6 +303,117 @@ def test_wire_rows_stage_like_padded_rows():
         assert got.dtype == v.dtype, k
         assert torch.equal(got[(slice(None), *map(slice, v.shape[1:]))], v), k
         assert not staged[k][3].any() and (k not in C.OBJECT_KEYS or not got[:, v.shape[1]:].any()), k
+    fresh = ppo.stage([ppo.wire(rows[2], shape)], shape, 4, 16)
+    ppo.stage([ppo.wire(rows[2], shape)], shape, 4, 16, out=staged)
+    for k in fresh:
+        np.testing.assert_array_equal(staged[k], fresh[k], err_msg=k)
+
+
+def test_shared_board_features_preserve_both_player_views():
+    card = 26000000
+    obj = dict(nativeObjectId=123, cardId=card, dataGlobalId=card, owner=0, x=4500, y=12000,
+               hp=400, maxHp=1000, targetEntityKey=None)
+    unit = dict(nativeObjectId=123, kind='unit', hidden=True, airborne=False, surfaceAt=(9000, 20000),
+                attack={'cycleMs': 500, 'hitSpeedMs': 1000}, buffs=[{'remainingMs': 700, 'stopsMovement': True}])
+    record = dict(objects=[obj], units=[unit])
+    vocab = C.Vocab([card])
+    shared = {}
+    for owner in (0, 1):
+        state = dict(dropped=0, effects_dropped=0)
+        expected = C.decision_inputs(record, owner, vocab, {}, dict(state))
+        actual = C.decision_inputs(record, owner, vocab, {}, state, shared)
+        for k in expected:
+            np.testing.assert_array_equal(actual[k], expected[k])
+    assert shared['values'][123][16:18] == (0.0, 0.0), 'relative aim must not mutate shared features'
+
+
+@pytest.mark.skipif(C._native_features is None, reason='optional native observation helpers are not built')
+def test_native_feature_helpers_match_python():
+    import ctypes
+    fast = C._native_features
+    for value in (-2147483648, -1, 0, 2147483647):
+        scalar = ctypes.c_int32(value)
+        assert fast.i32(ctypes.addressof(scalar)) == value
+    for value in (0, 1, 2 ** 63, 2 ** 64 - 1):
+        scalar = ctypes.c_uint64(value)
+        assert fast.u64(ctypes.addressof(scalar)) == value
+    rng = np.random.default_rng(17)
+    for _ in range(1000):
+        n = lambda: int(rng.integers(-1000, 30000))
+        u = dict(kind=rng.choice(['unit', 'area', 'timed', 'projectile']), state=n(), charge=n(), z=n(),
+                 hidden=bool(rng.integers(2)), immune=None, invisible=False, airborne=True, pushed=True,
+                 remainingMs=n(), fuseMs=n(), spawnTimerMs=n(), pushRemainingMs=n(), jumpRemainingMs=n(),
+                 invisibleAgainMs=n(), shield=n(), shieldMax=1000,
+                 buffs=[dict(stopsMovement=True, stopsAttacks=False, remainingMs=n(), speedPercent=n(), hitSpeedPercent=n())],
+                 attack=dict(cycleMs=n(), hitSpeedMs=1000, loadMs=n(), stage=n(), dashCooldownMs=n(),
+                             specialCooldownMs=n(), dashHop=n(), returnShot=dict(elapsedMs=n(), totalMs=1500)),
+                 ability=dict(phase=rng.choice(['active', 'casting', '']), used=True, sinceUseMs=n(), uses=n(), maxCharges=3))
+        for unit in ({}, u, dict(u, buffs=None, attack=None, ability=None, shieldMax=None)):
+            assert fast.unit_state_values(unit) == C.unit_state_values(unit)
+
+
+def test_opponent_routing_groups_games_without_changing_their_opponents():
+    import random
+    rng = random.Random(17)
+    opponents = {f'v{i}': ('unused.pt', i + 1) for i in range(7)}
+    original = dict(opponents)
+    counts, pairs = [0] * 4, set()
+    for _ in range(20000):
+        name = rng.choices(list(opponents), [p[1] for p in opponents.values()])[0]
+        sid = ppo.route_collector(name, opponents, rng, 4)
+        counts[sid] += 1
+        pairs.add((name, sid))
+    assert opponents == original
+    assert max(abs(n - 5000) for n in counts) < 250, 'routing balances traffic despite skewed opponent weights'
+    assert len(pairs) <= len(opponents) + 4 - 1
+    assert 0 <= ppo.route_collector('current', opponents, rng, 4) < 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA graph serving requires a GPU')
+@pytest.mark.parametrize('top', [False, True])
+def test_cuda_serving_preserves_recurrence_reload_and_reused_buffers(monkeypatch, top):
+    torch.set_num_threads(1)
+    torch.manual_seed(7)
+    config = train.Config(vocab_size=4, card_dim=4, object_dim=8, conv_channels=8, conv_layers=2,
+                          core=16, attention_layers=1)
+    models = {name: train.Policy(config).cuda().eval() for name in ('current', 'opponent')}
+    baseline = ppo.Decider(models, torch.device('cuda'), config.core, capacity=128, top=top, fast=False)
+    fast = ppo.Decider({k: copy.deepcopy(v) for k, v in models.items()}, torch.device('cuda'), config.core,
+                       capacity=128, top=top, fast=True)
+    x, _ = arrays(40, 1)
+    rows = [train.pack({k: v[t] for k, v in x.items()}) for t in range(40)]
+    baseline.shape = fast.shape = ppo.layout(rows[0])
+    # Exercise repeated same-shaped chunks without allocating 512 full-size rows in the test.
+    monkeypatch.setattr(ppo, 'ROW_BUCKETS', (8, 16))
+    requests = [((i, 0), 'opponent' if i % 5 == 0 else 'current', None, ppo.wire(row, fast.shape))
+                for i, row in enumerate(rows)]
+    for d in (baseline, fast):
+        d.h.zero_()
+        d.c.zero_()
+    for step in range(6):
+        if step == 1:
+            # Introduce a new object bucket while other model groups already have queued results.
+            larger = [{k: np.repeat(v[:1], 20, axis=0) if k in C.OBJECT_KEYS else v
+                       for k, v in row.items()} for row in rows]
+            requests = [((i, 0), 'opponent' if i % 5 == 0 else 'current', None, ppo.wire(row, fast.shape))
+                        for i, row in enumerate(larger)]
+        if step == 2:
+            for d in (baseline, fast):
+                d.reset(3)
+        if step == 3:
+            state = {k: v.clone() for k, v in models['current'].state_dict().items()}
+            state['what.bias'] += 0.1
+            for d in (baseline, fast):
+                d.models['current'].load_state_dict(state)
+        torch.cuda.manual_seed(100 + step)
+        expected = baseline.act(requests)
+        torch.cuda.manual_seed(100 + step)
+        actual = fast.act(requests)
+        assert actual == expected
+        torch.testing.assert_close(fast.h[:, :len(fast.rows)], baseline.h[:, :len(baseline.rows)], rtol=0, atol=0)
+        torch.testing.assert_close(fast.c[:, :len(fast.rows)], baseline.c[:, :len(baseline.rows)], rtol=0, atol=0)
+    fast.drop('opponent')
+    assert all(key[0] != 'opponent' for key in fast.graphs)
 
 
 def test_search_targets_and_distillation(tmp_path, monkeypatch):

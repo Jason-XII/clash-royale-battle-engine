@@ -480,7 +480,22 @@ def redirect(run, name):
     os.dup2(log, 2)
 
 
-def collector(index, run, address, key):
+def route_collector(opponent, opponents, rng, servers):
+    """Partition the PFSP probability interval across servers, then route within the sampled opponent's span.
+
+    Each server receives equal expected game traffic. With M frozen opponents and S servers there are at most
+    M + S - 1 frozen-model/server pairs, instead of M*S; no shared manager or game-ending barrier is needed.
+    """
+    if opponent == 'current':
+        return rng.randrange(servers)
+    names = sorted(opponents)
+    total = sum(opponents[name][1] for name in names)
+    before = sum(opponents[name][1] for name in names[:names.index(opponent)])
+    point = before + rng.random() * opponents[opponent][1]
+    return min(servers - 1, int(point / total * servers))
+
+
+def collector(index, run, addresses, key, affinity=False):
     """One native game at a time (the engine allows one per process), decided by its job's decision server at
     `address`; finished games go to the learner."""
     from arena import ABILITY, PLAY_DELAY, Engine, Inputs, Play, make_match
@@ -496,7 +511,7 @@ def collector(index, run, address, key):
     engine = Engine(s['engine'])
     link = Link(run, weights=False)
     _, opponents = link.exchange([], [], {})
-    server = Client(address, authkey=key)
+    server, address = None, None
     timing = defaultdict(float)
     while True:
         # every game: a learner (re)started after this collector may have new settings (an actor that starts with its
@@ -510,6 +525,13 @@ def collector(index, run, address, key):
                 models.reverse()
         else:
             models = [('current', None)] * 2
+        opponent = next((name for name, _ in models if name != 'current'), 'current')
+        sid = route_collector(opponent, opponents, rng, len(addresses)) if affinity else index % len(addresses)
+        if address != addresses[sid]:
+            if server is not None:
+                server.close()
+            address = addresses[sid]
+            server = Client(address, authkey=key)
         pair = rng.choice(pool)
         if s.get('deck'):  # a specialist (settings.json "deck", as in the pool): one learning seat always plays it
             seat = rng.choice([o for o in (0, 1) if models[o][0] == 'current'])
@@ -621,16 +643,24 @@ def _size(dtype, shape):
     return np.dtype(dtype).itemsize * int(np.prod(shape))
 
 
-def stage(wires, shape, B, O):
-    """wire() rows -> model inputs [B, 1, ...] as numpy (zero rows after len(wires), objects padded to O)."""
+def stage(wires, shape, B, O, out=None):
+    """wire() rows -> inputs [B, 1, ...]; `out` reuses storage, clearing all padding on every call."""
     fixed, objects = shape
     n = len(wires)
-    out = {}
+    out = {} if out is None else out
     raw, off = np.frombuffer(b''.join(w[1] for w in wires), np.uint8).reshape(n, -1), 0
     for k, dtype, s in fixed:
         size = _size(dtype, s)
-        out[k] = np.zeros((B, *s), dtype)
-        out[k][:n] = raw[:, off:off + size].copy().view(dtype).reshape(n, *s)
+        values = raw[:, off:off + size].copy().view(dtype).reshape(n, *s)
+        if k == 'legal':
+            values = np.unpackbits(values, -1)[..., :4 * policy.CELLS].reshape(n, 4, C.H, C.W)
+            dtype, s = bool, (4, C.H, C.W)
+        target = np.int64 if np.dtype(dtype) == np.dtype(np.int32) else dtype
+        if k not in out:
+            out[k] = np.zeros((B, 1, *s), target)
+        else:
+            out[k].fill(0)
+        out[k][:n, 0] = values
         off += size
     counts = np.array([w[0] for w in wires])
     block = np.zeros((B, O, sum(_size(d, s) for _, d, s in objects)), np.uint8)
@@ -641,10 +671,11 @@ def stage(wires, shape, B, O):
     off = 0
     for k, dtype, s in objects:
         size = _size(dtype, s)
-        out[k] = block[:, :, off:off + size].copy().view(dtype).reshape(B, O, *s)
+        if k not in out:
+            out[k] = np.empty((B, 1, O, *s), np.int64 if np.dtype(dtype) == np.dtype(np.int32) else dtype)
+        out[k][:, 0] = block[:, :, off:off + size].copy().view(dtype).reshape(B, O, *s)
         off += size
-    out['legal'] = np.unpackbits(out['legal'], -1)[..., :4 * policy.CELLS].reshape(B, 4, C.H, C.W).astype(bool)
-    return {k: (a.astype(np.int64) if a.dtype == np.int32 else a)[:, None] for k, a in out.items()}
+    return out
 
 
 class Decider:
@@ -652,14 +683,19 @@ class Decider:
     each call replays a CUDA graph of the whole decision (forward pass and sampling) for its bucket of rows and objects:
     run op by op, a call launched ~280 kernels, 9 ms of CPU for 0.7 ms of GPU work, whatever the batch."""
 
-    def __init__(self, models, device, core, capacity=1024, top=True):
+    def __init__(self, models, device, core, capacity=1024, top=True, fast=True, channels_last=False):
         torch.backends.mha.set_fastpath_enabled(False)  # the learner's attention path: same numerics, and capturable
         self.models, self.device, self.capacity, self.top = models, device, capacity, top
         self.rows = {}  # (collector, owner) -> row of self.h / self.c; row `capacity` is scratch (padding rows)
         self.h = torch.zeros(1, capacity + 1, core, device=device)
         self.c = torch.zeros_like(self.h)
-        self.graphs = {}  # (model name, rows, objects) -> (static inputs, static row index, static outputs, graph)
+        self.graphs = {}  # (model name, rows, objects) -> graph and its owned I/O buffers
         self.pool = torch.cuda.graph_pool_handle() if device.type == 'cuda' else None
+        self.fast = fast and device.type == 'cuda'
+        self.channels_last = channels_last and device.type == 'cuda'
+        if self.channels_last:
+            for model in models.values():
+                convolution_layout(model)
         self.shape = None  # the collectors' wire layout (sent with each 'reset')
 
     def _rows(self, seats):
@@ -716,6 +752,53 @@ class Decider:
             self.graphs[key] = (x, index, outputs, graph)
         return self.graphs[key]
 
+    def _fast_graph(self, name, staged):
+        """One pinned input transfer and one packed output per graph; retain every backing allocation."""
+        B, O = staged['obj_side'].shape[0], staged['obj_side'].shape[2]
+        key = (name, B, O)
+        if key not in self.graphs:
+            fields, size = {}, 0
+            for k, v in list(staged.items()) + [('_index', np.zeros(B, np.int64))]:
+                size = (size + 7) // 8 * 8  # typed views must be naturally aligned
+                fields[k] = (size, v.nbytes, v.dtype, v.shape)
+                size += v.nbytes
+            host = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+            device = torch.empty(size, dtype=torch.uint8, device=self.device)
+            raw, arrays, x = host.numpy(), {}, {}
+            for k, (offset, n, dtype, shape) in fields.items():
+                arrays[k] = raw[offset:offset + n].view(dtype).reshape(shape)
+                x[k] = device[offset:offset + n].view(torch.from_numpy(np.empty((), dtype)).dtype).reshape(shape)
+                arrays[k][...] = self.capacity if k == '_index' else staged[k]
+            device.copy_(host)
+            index = x.pop('_index')
+            model = self.models[name]
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    self._decide(model, x, index)
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            # Groups remain live until the aggregate readback. A shared capture pool can reuse a prior
+            # group's storage when a new shape is first captured, corrupting its queued output.
+            with torch.cuda.graph(graph):
+                action, logp, value, top = self._decide(model, x, index)
+                outputs = torch.stack((action.float(), logp, value), 1)
+                if self.top:
+                    outputs = torch.cat((outputs, top.float()), 1)
+            self.graphs[key] = (host, device, arrays, outputs, graph)
+        return self.graphs[key]
+
+    def _readback(self, pending, results):
+        """Finish every queued group together; also fences pinned buffers before they can be reused."""
+        if not pending:
+            return
+        values = torch.cat([out for _, out in pending]).cpu().tolist()
+        order = [i for part, _ in pending for i in part]
+        for i, (action, logp, value, *top) in zip(order, values):
+            results[i] = (int(action), logp, value, [int(t) for t in top] if self.top else [-1] * SEARCH_K)
+        pending.clear()
+
     def act(self, requests):
         """requests: [(seat, model name, its checkpoint, wire() row)] -> [(action, logp, value, the sampled card's top
         tiles)], same order."""
@@ -724,20 +807,41 @@ class Decider:
             by_model[name].append(i)
             if name not in self.models:
                 self.models[name] = policy.load(path, self.device)[0]
+                if self.channels_last:
+                    convolution_layout(self.models[name])
         results = [None] * len(requests)
+        pending, active = [], set()
         for name, idx in by_model.items():
             for s in range(0, len(idx), ROW_BUCKETS[-1]):
                 part = idx[s:s + ROW_BUCKETS[-1]]
                 rows = [requests[i][3] for i in part]
                 B = _bucket(len(rows), ROW_BUCKETS)
                 O = _bucket(max(1, max(r[0] for r in rows)), OBJECT_BUCKETS)
-                staged = stage(rows, self.shape, B, O)
                 index = self._rows([requests[i][0] for i in part]) + [self.capacity] * (B - len(rows))
-                if self.pool is None:
+                if self.fast:
+                    key = (name, B, O)
+                    if key in active or key not in self.graphs:
+                        # Fence both reused staging buffers and cold captures before touching their memory.
+                        self._readback(pending, results)
+                        active.clear()
+                    if key in self.graphs:
+                        host, device, arrays, outputs, graph = self.graphs[key]
+                        stage(rows, self.shape, B, O, out=arrays)
+                    else:
+                        host, device, arrays, outputs, graph = self._fast_graph(name, stage(rows, self.shape, B, O))
+                    arrays['_index'][...] = index
+                    device.copy_(host, non_blocking=True)
+                    graph.replay()
+                    pending.append((part, outputs[:len(rows)]))
+                    active.add(key)
+                    continue
+                elif self.pool is None:
+                    staged = stage(rows, self.shape, B, O)
                     outputs = self._decide(self.models[name], {k: torch.from_numpy(v).to(self.device)
                                                                for k, v in staged.items()},
                                            torch.tensor(index, device=self.device))
                 else:
+                    staged = stage(rows, self.shape, B, O)
                     x, static_index, outputs, graph = self._graph(name, staged)
                     for k, v in staged.items():
                         x[k].copy_(torch.from_numpy(v), non_blocking=True)
@@ -746,13 +850,14 @@ class Decider:
                 action, logp, value, top = (o[:len(rows)].tolist() for o in outputs)
                 for i, a, lp, v, t in zip(part, action, logp, value, top):
                     results[i] = (a, lp, v, t)
+        self._readback(pending, results)
         return results
 
 
 WEIGHTS_POLL = 5  # s between a decision server's asks for newer weights
 
 
-def server(sid, run, listener, gpu, mps):
+def server(sid, run, listener, gpu, mps, fast=True):
     """A decision server: answers whichever collectors are waiting, in one batch, as soon as the last batch is done (it
     never holds a batch back for stragglers: collectors compute while the GPU decides)."""
     redirect(run, f'server-{sid}')
@@ -767,7 +872,8 @@ def server(sid, run, listener, gpu, mps):
     weights, opponents = link.exchange([], [], {})
     # the top tiles cost ~2 ms a step; a server started while search is off skips them
     decider = Decider({'current': current}, device, current.config.core,
-                      top=endpoint(run)['settings'].get('search_frac', 0.0) > 0)
+                      top=endpoint(run)['settings'].get('search_frac', 0.0) > 0, fast=fast,
+                      channels_last=endpoint(run)['settings'].get('channels_last', False))
     conns, arrivals, polled, stats = [], queue.Queue(), time.monotonic(), defaultdict(float)
 
     def accept():
@@ -808,13 +914,15 @@ def server(sid, run, listener, gpu, mps):
                 waiting.append((conn, [((index, o), name, path, row) for o, name, path, row in payload]))
         if waiting:
             t0 = time.perf_counter()
-            replies = decider.act([r for _, payload in waiting for r in payload])
+            requests = [r for _, payload in waiting for r in payload]
+            replies = decider.act(requests)
             k = 0
             for conn, payload in waiting:
                 conn.send((replies[k:k + len(payload)], link.version))
                 k += len(payload)
             stats['batches'] += 1
             stats['rows'] += k
+            stats['model_calls'] += len({r[1] for r in requests})
             stats['busy_s'] += time.perf_counter() - t0
 
 
@@ -866,8 +974,8 @@ def act(args):
     ctx = mp.get_context('fork')
 
     def launch(kind, i):
-        target = (server, i, run, listeners[i], gpus[i % len(gpus)] if gpus else None, mps) if kind == 'server' else \
-            (collector, i, run, listeners[i % servers].address, key)
+        target = (server, i, run, listeners[i], gpus[i % len(gpus)] if gpus else None, mps, args.fast_inference) if kind == 'server' else \
+            (collector, i, run, [listener.address for listener in listeners], key, args.opponent_affinity)
         p = ctx.Process(target=_child, args=target, daemon=True)
         p.start()
         return p
@@ -952,7 +1060,16 @@ def reachable_ip():
 DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibatch=8, clip=0.2, gamma=0.999, lam=0.95,
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
                 pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0,
-                search_frac=0.0, search_horizon=160, search_material=0.3, search_tau=0.02, search_coef=1.0)
+                search_frac=0.0, search_horizon=160, search_material=0.3, search_tau=0.02, search_coef=1.0,
+                channels_last=True)
+
+
+def convolution_layout(model):
+    """Match IL's convolution layout on CUDA; keep the fp32 tile head unchanged."""
+    for conv in model.convs:
+        conv.to(memory_format=torch.channels_last)
+    model.convs[0].register_forward_pre_hook(
+        lambda m, a: (a[0].contiguous(memory_format=torch.channels_last),))
 
 
 def learn(args, settings):
@@ -982,6 +1099,9 @@ def learn(args, settings):
         version = latest['version']
         fresh = version - ADAM_WARMUP  # its Adam moments are back: no warm-up
     model.train()
+    if cuda and s.channels_last:
+        for trunk in (model, reference, critic.trunk):
+            convolution_layout(trunk)
     objective, critic_objective = Evaluate(model), critic
     if world > 1:
         objective, critic_objective = (
@@ -1041,12 +1161,16 @@ def learn(args, settings):
             group['lr'] = s.critic_lr * ramp
         batches = minibatches(games, s, device)
         stats = dict(prepare_s=time.monotonic() - t1)
+        t_targets = time.monotonic()
         stats.update(critic_targets(batches, critic, s, device))
+        stats['targets_s'] = time.monotonic() - t_targets
+        t_policy = time.monotonic()
         if version >= s.value_warmup:  # before that, the critic alone learns (the policy's advantages need it)
             stats.update(update(model, reference, optimizer, batches, s, device, objective))
-        t_policy = time.monotonic()
+        stats['policy_s'] = time.monotonic() - t_policy
+        t_critic = time.monotonic()
         stats.update(train_critic(critic, critic_optimizer, batches, s, device, critic_objective),
-                     critic_s=time.monotonic() - t_policy)
+                     critic_s=time.monotonic() - t_critic)
         del batches
         version += 1
         t2 = time.monotonic()
@@ -1085,6 +1209,7 @@ def learn(args, settings):
                 version=version, hours=round((now - started) / 3600, 4), games=total_games,
                 games_per_hour=round(len(finished) / max(now - last, 1e-6) * 3600),
                 trajectories=sum(r['games'] for r in everyone), decisions=sum(r['decisions'] for r in everyone),
+                learning_decisions_per_second=round(sum(r['decisions'] for r in everyone) / max(now - last, 1e-6), 1),
                 stale=sum(r['stale'] for r in everyone), lag=float(np.mean([x for r in everyone for x in r['lag']] or [0])),
                 actors=sum(r['actors'] for r in everyone), wait_s=round(t1 - t0, 1), update_s=round(t2 - t1, 1), lr=lr,
                 value_only=version - 1 < s.value_warmup,
@@ -1114,13 +1239,17 @@ def main():
     p.add_argument('--engine', type=Path, required=True, help='the clapha-engine checkout')
     p.add_argument('--pool', type=Path, required=True, help='deck pairs as played (arena.py --pool)')
     for k, v in DEFAULTS.items():
-        p.add_argument('--' + k.replace('_', '-'), dest=k, type=type(v), default=v)
+        p.add_argument('--' + k.replace('_', '-'), dest=k, default=v,
+                       **({'action': argparse.BooleanOptionalAction} if isinstance(v, bool) else {'type': type(v)}))
     p = sub.add_parser('act')
     p.add_argument('run', type=Path)
     p.add_argument('--collectors', type=int, default=16, help='one native game each')
     p.add_argument('--servers', type=int, help='decision servers (default one per GPU)')
     p.add_argument('--gpus', help='indices of the visible GPUs to use (default all; none: CPU)')
     p.add_argument('--mps', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--fast-inference', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--opponent-affinity', action=argparse.BooleanOptionalAction, default=True,
+                   help='route already-sampled opponents to balanced server cohorts')
     args = parser.parse_args()
     if args.command == 'act':
         return act(args)

@@ -76,7 +76,14 @@ sbatch -J cr-ppo ... --gres=gpu:4 -c 16 --wrap "python ppo.py act RUN --collecto
 ```
 
 Each collector plays one native game at a time; a decision server per GPU answers the waiting collectors in one CUDA-graph
-call. Half the games are self-play, the rest against the IL model or recent snapshots (`RUN/pool/`), chosen by how often
+call. Inputs use one pinned transfer per model group and results are read back together. Collectors route each sampled
+opponent to a balanced server cohort, reducing the number of small model groups without changing opponent selection.
+Use `act --no-fast-inference --no-opponent-affinity` for the previous serving path. PPO uses the same channels-last
+convolution layout as IL on CUDA; `learn --no-channels-last` disables it (a saved setting takes precedence on resume).
+`python build_features.py` builds optional CPython helpers for memory reads and unit features with the system C compiler;
+build once per Python/platform. They preserve the existing observation arrays. `CR_NATIVE_FEATURES=0` selects Python
+helpers at process startup. Without the extension, the Python path is used automatically.
+Half the games are self-play, the rest against the IL model or recent snapshots (`RUN/pool/`), chosen by how often
 they still beat the policy. Reward: the result (±1), a small penalty per decision at full elixir, and tower-damage
 shaping. The critic is a separate network used only in training: the policy's network (from the IL weights) plus the
 opponent's hand, next cards and ability, with a P(win) head trained on the outcome and a head for the shaping rewards.
@@ -101,4 +108,5 @@ from clapha-engine and FirstLight's reverse engineering.
 ## Docs
 
 - [docs/TRAINING.md](docs/TRAINING.md): IL and PPO training — design, metrics, results and why each change was made.
+- [docs/THROUGHPUT.md](docs/THROUGHPUT.md): throughput measurements, optimized serving, validation and rollout details.
 - [docs/GAME_INTEGRATION.md](docs/GAME_INTEGRATION.md): how the live client is read and controlled.

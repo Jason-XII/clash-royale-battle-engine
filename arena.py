@@ -163,6 +163,9 @@ class Engine:
         clapha = Path(clapha_dir).expanduser().resolve()
         sys.path.insert(0, str(clapha / 'crx'))
         import loader  # clapha's crx modules import each other as top-level modules
+        if C._native_features is not None:
+            import observe
+            observe._i32, observe._u64 = C._native_features.i32, C._native_features.u64
         _report_cpus(loader)
         from env import CrxEnv
         self.env = CrxEnv(clapha / 'engine', Path(workdir or tempfile.mkdtemp(prefix='clapha-')),
@@ -420,7 +423,8 @@ class Inputs:
 
     def __call__(self, state):
         record, issued = self.engine.record(), self.commands.update(state, self.engine)
-        return {owner: view.step(record, issued) for owner, view in self.views.items()}
+        shared = {}  # owner-independent board features, valid only for this decision
+        return {owner: view.step(record, issued, shared) for owner, view in self.views.items()}
 
 
 def make_match(pair, seed):
