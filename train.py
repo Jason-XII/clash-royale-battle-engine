@@ -598,13 +598,14 @@ class Agent:
     """One player: act(inputs) -> decode()'s action, sampled from the policy. `inputs`: one PlayerView.step()."""
 
     def __init__(self, model, owner, device='cpu'):
-        self.model, self.owner, self.device, self.lstm = model, owner, device, None
+        self.model, self.owner, self.device, self.lstm, self.value = model, owner, device, None, 0.0
 
     @torch.no_grad()
     def act(self, inputs):
         x = tensors({k: v[None, None] for k, v in pack(inputs).items()}, self.device)
         out = self.model(x, self.lstm)
         self.lstm = out['state']
+        self.value = float(out['value'].reshape(-1)[0])  # the IL value head: expected outcome, -1 loss .. +1 win
         action, _ = sample(self.model, out, x)
         return decode(int(action[0]), self.owner)
 

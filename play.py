@@ -8,6 +8,7 @@ hand, or pass --queue to press Battle on the ladder. Logs go to ~/cr-live/runs/l
 """
 import argparse
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -446,10 +447,14 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
     decided, pending, reported = None, None, 0  # pending: {'card', 'tick', 'due', 'x', 'y'} of a card tap not landed
     battle = first['chain']['battle']
     frame, last_tick, moved = first, first['game_tick'], time.monotonic()
+    queue_seen = moved
     while True:
-        if frame['failure'] == 'none' and frame.get('coherent', True):
-            if frame['game_tick'] >= FIRST_DECISION and not frame.get('queue_ok'):
-                raise RuntimeError('command queue unavailable: install the queue-enabled Nulls reader')
+        queue_ok = frame['game_tick'] < FIRST_DECISION or frame.get('queue_ok')
+        if queue_ok:
+            queue_seen = time.monotonic()
+        elif time.monotonic() - queue_seen > 3:  # one frame without it happens (2026-10-16, tick 686 mid-game): skip those
+            raise RuntimeError('command queue unavailable: install the queue-enabled Nulls reader')
+        if frame['failure'] == 'none' and frame.get('coherent', True) and queue_ok:
             landed = plays.update(frame)
             for tick, c in landed[reported:]:
                 log({'event': 'landed' if c['owner'] == owner else 'opponent', 'tick': tick, 'card': c['card_id'],
@@ -467,7 +472,8 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
                 record = records(frame)
                 choice = agent.act(view.step(record, plays.commands(pending, owner)))
                 me = next(p for p in record['lean']['state']['players'] if p['owner'] == owner)
-                log({'event': 'decision', 'tick': tick, 'elixir': me['elixirRaw'], 'choice': choice[0], 'board': board(record),
+                log({'event': 'decision', 'tick': tick, 'elixir': me['elixirRaw'], 'choice': choice[0],
+                     'value': round(agent.value, 3), 'board': board(record),
                      'opponent_commands': [c for _, c in plays.flying if c['owner'] == other]})
                 if choice[0] == 'ability':  # pressed at once: nothing in flight to wait for
                     taps.tap(*ABILITY_BUTTON)
@@ -498,6 +504,7 @@ def main():
     parser.add_argument('--tables', required=True, type=Path, help="clapha-engine export_tables.py's JSON, August build")
     parser.add_argument('--account', type=lambda s: int(s, 0), default=ACCOUNT, help='our account id (finds our seat)')
     parser.add_argument('--games', type=int, default=1)
+    parser.add_argument('--losses', type=int, default=0, help='instead of --games: play until this many losses')
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--out', type=Path, default=Path.home() / 'cr-live/runs/live')
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each ladder game')
@@ -509,7 +516,8 @@ def main():
     taps, stream = Taps(args.serial), frames(args.serial)
     args.out.mkdir(parents=True, exist_ok=True)
     finished = None  # the last battle played: the results screen keeps it readable
-    for game in range(args.games):
+    lost = 0
+    for game in itertools.count() if args.losses else range(args.games):
         print('waiting for a battle...', flush=True)
         checked = time.monotonic()
         frame = next(stream)
@@ -545,7 +553,11 @@ def main():
             alive = {'objects': [o for o in last['objects'] if o['hp'] is None or o['hp'] > 0]}  # the last frame still
             score = (C.crowns(alive, owner), C.crowns(alive, 1 - owner))                     # lists a tower at 0 hp
             log({'event': 'end', 'tick': last['tick'], 'crowns': score})
-            print(f'game {game + 1}: crowns {score[0]}-{score[1]} -> {path}', flush=True)
+            lost += score[0] < score[1]  # ponytail: equal crowns count as no loss (a tiebreak loss would be missed)
+            print(f'game {game + 1}: crowns {score[0]}-{score[1]} -> {path}' + (f' ({lost} lost)' if args.losses else ''),
+                  flush=True)
+            if args.losses and lost >= args.losses:
+                break
 
 
 if __name__ == '__main__':

@@ -61,6 +61,8 @@ It boots the visible `Pixel_9_2` emulator if needed (`-gpu host`), verifies the 
 re-applies the review-crash patch an emulator snapshot may have rolled back, and waits for a battle. Start a friendly
 battle by hand, or add `--queue` to press Battle on the ladder. `--games N` plays several. Logs go to
 `~/cr-live/runs/live` (OneDrive stalls writes). The model sees advance opponent commands from the reader's queue.
+`--losses N` plays ladder games until the N-th loss. `python winbar.py` opens a blue/red bar of the model's predicted
+win chance, (value + 1) / 2 from the policy's value head, following the newest live log.
 
 ## PPO
 
