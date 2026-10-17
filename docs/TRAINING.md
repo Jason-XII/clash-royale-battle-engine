@@ -1,7 +1,9 @@
-# PPO training notes, 15 October 2026
+# Training notes: imitation (IL) and PPO
 
-What we decided, measured and discussed while starting PPO from the imitation (IL) model. Run directory on the
-cluster: `~/cr-ppo/runs/ppo-4`.
+What we decided, measured and discussed while training: IL from human replays, then PPO from the IL model. It's
+written in order. Sections 1–5 cover the small model's PPO runs (`~/cr-ppo/runs/ppo-4`, 15–16 October), section 6
+covers scaling up to the medium IL model, and section 7 covers PPO from it (`~/cr-ppo/runs/ppo-m1`, the current run).
+How to run each script is in `README.md`, and the live client's integration is in `GAME_INTEGRATION.md`.
 
 ## 1. The run
 
@@ -238,3 +240,50 @@ attacks. Final weights: `~/cr-live/models/medium-1016-final/medium-1016-final.pt
 **Lessons**
 - Watch every head separately: the total loss kept falling while placement degraded.
 - When one head goes bad and the others don't, suspect numerics first: dtype and magnitudes.
+
+## 7. PPO from the medium model: ppo-m1 (16–17 October)
+
+**Setup**
+- Init and KL reference: the medium IL model.
+- The elixir mask is reworked: a card the client can't pay for gives its share of PLAY to WAIT.
+- Batch 1024, λ 0.99, KL weight 0.01, a critic-only warm-up of 60 updates, lr 2e-5. lr was raised to 4e-5 at v430
+  with no instability: approx_kl ~0.002, entropy ~0.195.
+- ~24–30k games/h on 87 collectors.
+
+**Arenas** (paired seats, 192 games)
+
+| Match | Win rate |
+|---|---|
+| v100 vs IL | 78.6% |
+| v300 vs IL | 93.8% |
+| v300 vs v100 | 76% |
+| v400 vs v350 | 56.2 ± 7.0% |
+| v500 vs v400 | 44.5 ± 3.6% (191 games) |
+
+**Live (Nulls ladder)**
+- v350: 42–14 over several sessions.
+- v400: 12–12. It stalls in league 4, where games are mostly decided 1–0.
+
+**Diagnosis of the plateau** (17 October)
+- **Tiny updates spread over a huge task.** approx_kl is ~0.002. At ~1k games per update, each of the 31k deck
+  matchups has been played about once.
+- **The KL pull to IL may cap it.** kl_ref has sat flat at ~0.06 for hundreds of updates: the reward pushing away
+  and the KL pulling back balance out. This is the same signature as ppo-4's v100–180 stall, which a lower KL weight
+  broke.
+- **A noisy critic** (win_ev ~0.32) over ~1000 decisions per game: credit assignment is weakest in exactly the
+  close games it now loses.
+- **Self-play blind spots**: the opponents are itself and its last 6 snapshots.
+- **The simulator-to-live gap** is unmeasured.
+
+**Search, re-read from the logs**
+- As a player, the 8-second placement search beat the plain policy 68 ± 7%. So short-sightedness is not shown.
+- Distilling it collapsed because of how it was trained: its loss swamped the shared network, and agreement with the
+  search's choices barely rose (0.29 → 0.32).
+- The planned careful retry never ran: gradients to the tile head only, weight ~0.05, decisive labels only, after an
+  offline check of the labels.
+
+**Order chosen**
+1. Anchor the KL to a recent snapshot (v400) instead of IL, using `ppo.py learn --reference`. Judge it by an arena
+   against v400 after ~100 updates.
+2. Exploiters (AlphaStar-style league) for robustness across decks and opponents.
+3. Bigger batches with more CPUs, and the careful search retry, later.

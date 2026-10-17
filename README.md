@@ -97,3 +97,8 @@ Python 3.10+, NumPy and PyTorch; pyarrow for conversion; pytest for the tests. O
 Measured game behaviour (timing, the client's held taps, the reader) is in
 [docs/GAME_INTEGRATION.md](docs/GAME_INTEGRATION.md). Model and features came from ClashAlpha/clapha-il; native execution
 from clapha-engine and FirstLight's reverse engineering.
+
+## Docs
+
+- [docs/TRAINING.md](docs/TRAINING.md): IL and PPO training — design, metrics, results and why each change was made.
+- [docs/GAME_INTEGRATION.md](docs/GAME_INTEGRATION.md): how the live client is read and controlled.
