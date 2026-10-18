@@ -165,7 +165,7 @@ def test_archive_round_trip(tmp_path, monkeypatch):
 def test_training_runs_resumes_and_loads_for_play(tmp_path, monkeypatch):
     root = dataset(tmp_path / 'data', monkeypatch)
     settings = dict(train.DEFAULTS, epochs=2, batch=2, chunk=3, workers=0, card_dim=4, object_dim=4, conv_channels=4,
-                    conv_layers=1, core=8, attention_layers=0, log_every=1, checkpoint_every=2, device='cpu')
+                    conv_layers=1, core=8, attention_layers=0, board=2, log_every=1, checkpoint_every=2, device='cpu')
     out = tmp_path / 'run'
     out.mkdir()
     train.train(root, out, settings)

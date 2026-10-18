@@ -27,6 +27,8 @@ import common as C
 
 W, H, CELLS = C.W, C.H, C.CELLS
 WAIT, PLAY, ABILITY1, ABILITY2 = C.WAIT, C.PLAY, C.ABILITY1, C.ABILITY2
+BOARD = (8, 4)  # the coarse board map's rows and columns (~4 x 4.5 tiles each)
+BOARD_CELLS = BOARD[0] * BOARD[1]
 
 
 # ---- the network --------------------------------------------------------------------------------------------------------
@@ -40,6 +42,7 @@ class Config:
     conv_channels: int = 48
     conv_layers: int = 4
     core: int = 256
+    board: int = 0  # channels of a coarse 8 x 4 board map fed to the core (0 = off: the core sees only the mean and max)
     effect_fields: int = C.EFFECT_FIELDS
     next_play: bool = True
 
@@ -74,7 +77,8 @@ class Policy(nn.Module):
         self.register_buffer('coords', torch.stack([xs, ys])[None], persistent=False)
         hand_in = 4 * (2 * d + C.HAND_FLOATS)
         rest_in = (4 * d) + 8 + (d + 4) + 2 * (d + 4) + 8 * (d + 3) + 2 * d + C.SCALARS
-        summary_in = 2 * ch + 2 * c.object_dim + hand_in + rest_in
+        summary_in = 2 * ch + 2 * c.object_dim + hand_in + rest_in + c.board * BOARD_CELLS
+        self.board = nn.Sequential(nn.Conv2d(ch, c.board, 1), nn.ReLU(), nn.AdaptiveAvgPool2d(BOARD)) if c.board else None
         self.summary_norm = nn.LayerNorm(summary_in)
         self.summary = mlp(summary_in, c.core, c.core)
         self.core_norm = nn.LayerNorm(c.core)
@@ -129,7 +133,10 @@ class Policy(nn.Module):
             torch.cat([self.card(flat['opp_flight_card']), flat['opp_flight_float']], -1).flatten(1),
             torch.cat([self.card(flat['opp_seen_card']), flat['opp_seen_float']], -1).flatten(1),
             self.card(flat['opp_hero_card']).flatten(1), flat['scalars']], -1)
-        summary = torch.cat([grid.mean((2, 3)), grid.amax((2, 3)), pooled_objects, hand.flatten(1), rest], -1)
+        summary = [grid.mean((2, 3)), grid.amax((2, 3)), pooled_objects, hand.flatten(1), rest]
+        if self.board is not None:
+            summary.append(self.board(grid).flatten(1))
+        summary = torch.cat(summary, -1)
         summary = self.core_norm(F.relu(self.summary(self.summary_norm(summary)))).reshape(B, T, -1)
         core, state = self.lstm(summary, state)
         flat_core = core.reshape(N, -1)
@@ -313,12 +320,14 @@ def collate(items):
 
 
 # ---- training -----------------------------------------------------------------------------------------------------------
-DEFAULTS = dict(epochs=4, batch=32, chunk=128, workers=4, lr=3e-4, final_lr=1.0, weight_decay=0.01, warmup=500, value_coef=0.5,
-                next_play=0.5, card_dim=32, object_dim=32, attention_layers=1, conv_channels=48, conv_layers=4, core=256,
+DEFAULTS = dict(epochs=4.0, batch=32, chunk=128, workers=4, lr=3e-4, final_lr=1.0, weight_decay=0.01, warmup=500, value_coef=0.5,
+                next_play=0.5, card_dim=32, object_dim=32, attention_layers=1, conv_channels=48, conv_layers=4, core=256, board=0,
                 seed=0, log_every=50, checkpoint_every=1000, device='cuda')
 # final_lr: the learning rate falls linearly to lr x final_lr by the last step (1.0 = constant)
 # medium model (3.4M, 2026-10-16): --card_dim 64 --object_dim 96 --attention_layers 3 --conv_channels 96 --conv_layers 6
 # --core 384
+# large model (8.0M, 2026-10-18): --card_dim 64 --object_dim 160 --attention_layers 6 --conv_channels 160 --conv_layers 12
+# --core 448 --board 32
 
 
 def train(data, out, settings):
@@ -338,11 +347,12 @@ def train(data, out, settings):
     val_entries = [e for e in manifest['entries'] if e['validation']]
     batch = max(1, settings['batch'] // world)
     # ponytail: an epoch is an estimate (random chunk offsets vary the count a little); exact epoch ends are not kept
-    total = settings['epochs'] * sum(math.ceil(e['decisions'] / settings['chunk']) for e in train_entries) // settings['batch']
+    total = int(settings['epochs'] * sum(math.ceil(e['decisions'] / settings['chunk']) for e in train_entries) // settings['batch'])
 
     torch.manual_seed(settings['seed'])
     config = Config(vocab_size=len(vocab), next_play=settings['next_play'] > 0, **{k: settings[k] for k in
-                    ('card_dim', 'object_dim', 'attention_layers', 'conv_channels', 'conv_layers', 'core')})
+                    ('card_dim', 'object_dim', 'attention_layers', 'conv_channels', 'conv_layers', 'core')},
+                    board=settings.get('board', 0))
     policy = Policy(config, C.effect_matrix(vocab)).to(device)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=settings['lr'], weight_decay=settings['weight_decay'], fused=cuda)
     step = 0
