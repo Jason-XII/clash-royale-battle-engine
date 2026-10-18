@@ -288,6 +288,8 @@ def test_actor_learner_link_and_shaping(tmp_path):
     assert ppo.potential(full, start, 0) == 0
     assert ppo.potential(hit, start, 0) == pytest.approx(1 + 1 + 1.5 - 0.5)
     assert ppo.potential(hit, start, 1) == pytest.approx(-3.0)
+    assert ppo.margin(hit, start, 0) == pytest.approx(0.5 - 0.0) and ppo.margin(hit, start, 1) == pytest.approx(-0.5)
+    assert ppo.margin(full, start, 0) == 0
 
 
 def test_wire_rows_stage_like_padded_rows():

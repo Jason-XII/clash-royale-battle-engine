@@ -15,7 +15,11 @@ Opponents: self-play (--self-play of the games, both seats learn) or a frozen on
 over the IL model and the --pool-size latest snapshots. Reward: +1 win / -1 loss, -OVERFLOW_PENALTY per decision at full
 elixir, -REFUSED_PENALTY per play the engine refuses, and FirstLight's tower shaping, shaping * (gamma * potential' -
 potential), the potential being crowns plus lost tower hp fractions (king x3), theirs minus ours, and 0 once the game ends
-(no bonus for a fast or a big win).
+(no bonus for a fast win). At the end, + margin x (our lowest tower's hp fraction - theirs; a destroyed tower is 0):
+a close loss is worth more than a 3-crown one, and a draw is no longer flat.
+
+The critic is its own network, from --critic-init (default --init): it is never needed to play, so it can be bigger than
+the policy. --reanchor N replaces the KL reference by the current policy every N updates (R-NaD style; 0 = fixed).
 
 A specialist: put "deck" (a deck as in the pool) and "self_play": 0 in RUN/settings.json before the first start; a
 learning seat then always plays that deck, against the pool's decks.
@@ -331,6 +335,14 @@ def tower_hp(state):
             if e.card == -1 and e.entity_type == 'building'}
 
 
+def margin(state, start, owner):
+    """Our lowest tower's hp fraction minus theirs (a destroyed tower is 0); `start` is tower_hp at the start."""
+    towers = tower_hp(state)
+    low = [min(towers[tid][1] / max(full, 1) if tid in towers else 0.0 for tid, (o, full, _) in start.items() if o == side)
+           for side in (owner, 1 - owner)]
+    return low[0] - low[1]
+
+
 def potential(state, start, owner):
     """Crowns plus each tower's lost hp fraction (king x KING_WEIGHT), theirs minus ours; `start` is tower_hp at the
     start."""
@@ -354,10 +366,9 @@ def rollout_score(engine, play, owner, start, princess, horizon, material):
     """In a forked copy of the game: drop the opponent's plays `owner` cannot see yet, make `play`, run `horizon` ticks
     with no further plays -> tower damage (the shaping potential) + material x (our units' hp - theirs, in princess
     towers)."""
-    from arena import PLAY_DELAY
     now = engine.state.tick
     engine.pending[:] = [p for p in engine.pending if p['owner'] == owner or p['due'] - now <= C.OPP_VISIBLE]
-    state = engine.step([play], 5, delay=sum(PLAY_DELAY) // 2).state
+    state = engine.step([play], 5, delay=C.DEPLOY_DELAY).state
     while state.tick - now < horizon and not state.finalized:
         state = engine.step((), 5).state
     units = sum((e.hp if e.owner == owner else -e.hp) for e in state.entities if e.card != -1 and e.hp)
@@ -606,7 +617,7 @@ def collector(index, run, addresses, key, affinity=False):
         out = []
         for o, seat in seats.items():
             outcome = 0.0 if state.result not in (0, 1) else 1.0 if state.result == o else -1.0
-            seat.reward[-1] += outcome
+            seat.reward[-1] += outcome + s.get('margin', 0.0) * margin(state, start, o)  # to the critic's short head
             out.append(seat.trajectory(version=version, opponent=models[1 - o][0], outcome=outcome))
         learner = min(seats)
         result = dict(opponent=models[1 - learner][0] if len(seats) == 1 else 'self', tick=state.tick,
@@ -1059,7 +1070,7 @@ def reachable_ip():
 
 DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibatch=8, clip=0.2, gamma=0.999, lam=0.95,
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
-                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0,
+                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0, margin=0.2, reanchor=0,
                 search_frac=0.0, search_horizon=160, search_material=0.3, search_tau=0.02, search_coef=1.0,
                 channels_last=True)
 
@@ -1086,7 +1097,9 @@ def learn(args, settings):
     s = argparse.Namespace(**settings)
     model, vocab, saved = policy.load(init, device)
     reference = policy.load(str(args.reference.expanduser().resolve()) if args.reference else init, device)[0].requires_grad_(False)
-    critic = Critic(policy.load(init, device)[0]).to(device).train()
+    trunk, critic_vocab, _ = policy.load(str(args.critic_init.expanduser().resolve()) if args.critic_init else init, device)
+    assert critic_vocab.index == vocab.index, 'the critic reads the same inputs: same vocabulary'
+    critic = Critic(trunk).to(device).train()
     optimizer = torch.optim.Adam(model.parameters(), lr=s.lr)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=s.critic_lr)
     version = fresh = 0
@@ -1096,6 +1109,8 @@ def learn(args, settings):
         optimizer.load_state_dict(latest['optimizer'])
         critic.load_state_dict(latest['critic'])
         critic_optimizer.load_state_dict(latest['critic_optimizer'])
+        if 'reference' in latest:  # the anchor it had (--reanchor)
+            reference.load_state_dict(latest['reference'])
         version = latest['version']
         fresh = version - ADAM_WARMUP  # its Adam moments are back: no warm-up
     model.train()
@@ -1173,6 +1188,9 @@ def learn(args, settings):
                      critic_s=time.monotonic() - t_critic)
         del batches
         version += 1
+        if s.get('reanchor') and version % s.reanchor == 0:
+            reference.load_state_dict(model.state_dict())
+            stats['reanchored'] = 1.0
         t2 = time.monotonic()
         mine = dict(stats=stats, results=done, timing=timing, stale=stale, lag=lag, games=len(games),
                     decisions=sum(len(g['action']) for g in games), actors=len(inbox.conns))
@@ -1192,7 +1210,8 @@ def learn(args, settings):
         if rank == 0 and version % s.checkpoint_every == 0:
             torch.save(dict(config=saved['config'], model=model.state_dict(), optimizer=optimizer.state_dict(),
                             critic=critic.state_dict(), critic_optimizer=critic_optimizer.state_dict(),
-                            vocab=saved['vocab'], version=version, step=version), out / 'latest.tmp')
+                            reference=reference.state_dict(), vocab=saved['vocab'], version=version, step=version),
+                       out / 'latest.tmp')
             (out / 'latest.tmp').replace(out / 'latest.pt')
         if world > 1:
             dist.barrier()  # the new snapshot is on disk before any rank offers it
@@ -1235,6 +1254,7 @@ def main():
     p = sub.add_parser('learn')
     p.add_argument('--init', type=Path, required=True, help='the IL checkpoint: start, KL reference, frozen opponent')
     p.add_argument('--reference', type=Path, help='the KL reference instead of --init (e.g. a recent snapshot)')
+    p.add_argument('--critic-init', type=Path, help="the critic's network instead of --init's (e.g. a bigger IL model)")
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--engine', type=Path, required=True, help='the clapha-engine checkout')
     p.add_argument('--pool', type=Path, required=True, help='deck pairs as played (arena.py --pool)')

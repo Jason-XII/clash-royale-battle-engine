@@ -20,7 +20,9 @@ import torch
 import common as C
 import train
 
-PLAY_DELAY = (23, 27)  # decision -> landing ticks, drawn per play: a replay's play is labelled 23-27 ticks before it lands
+# decision -> landing ticks, one drawn per play: as live (136 v350/v400 games, taps it could pay for, 2026-10-18:
+# 21 16%, 22 58%, 23 16%, 24 5%, 25-26 5%); was uniform 23-27, as replays are labelled, 1-3 ticks late
+PLAY_DELAY = (21,) * 16 + (22,) * 58 + (23,) * 16 + (24,) * 5 + (25,) * 3 + (26,) * 2
 # the engine is asked the cost of variable-cost cards (Mirror, ...) and cards outside the original table
 FIXED_COSTS = {k: v for k, v in C.COSTS.items() if k not in (28000006, 28000025, 26000107)}
 
@@ -188,8 +190,7 @@ class Engine:
 
     def step(self, actions=(), ticks=5, delay=0):
         """Plays decided on the current state land `delay` ticks later (live: common.DEPLOY_DELAY), or on the
-        next tick with delay=0; `delay` = (low, high): each play draws its own (PLAY_DELAY, as human replays
-        are labelled). As the live client does (C.HOLD_TICKS), a play the elixir cannot pay for yet is held
+        next tick with delay=0; `delay` = a tuple of choices: each play draws its own (PLAY_DELAY, as live). As the live client does (C.HOLD_TICKS), a play the elixir cannot pay for yet is held
         until it can, for at most C.HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
         for within that is refused. As live does, a player with a play in flight cannot start another.
         `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
@@ -198,7 +199,7 @@ class Engine:
         executed = []
         for a in actions:
             free = all(p['owner'] != a.owner for p in self.pending)
-            lag = max(delay if isinstance(delay, int) else random.randint(*delay), 1)
+            lag = max(delay if isinstance(delay, int) else random.choice(delay), 1)
             due = before.tick + lag
             if a.slot == ABILITY:  # a tap on the ability button: lands like a card, if a carrier is still ready then
                 ok = free and any(x.ready for x in before.players[a.owner].abilities)
