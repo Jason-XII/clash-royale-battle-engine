@@ -19,7 +19,13 @@ potential), the potential being crowns plus lost tower hp fractions (king x3), t
 a close loss is worth more than a 3-crown one, and a draw is no longer flat.
 
 The critic is its own network, from --critic-init (default --init): it is never needed to play, so it can be bigger than
-the policy. --reanchor N replaces the KL reference by the current policy every N updates (R-NaD style; 0 = fixed).
+the policy.
+
+loop.py drives a run through small files in RUN: champion.json (the KL reference: the champion, replaced when a
+challenger is promoted), eval.json (evaluation matches between frozen models: --eval-frac of the collectors' games
+while it lists any; results in evals.jsonl) and rollback.json (back to a champion's full checkpoint, ckpt/vN.pt, saved
+with every snapshot). Promoted champions in RUN/league stay PFSP opponents for good. A minibatch whose gradient is not
+finite is skipped (metrics skipped / critic_skipped: the fraction of steps).
 
 A specialist: put "deck" (a deck as in the pool) and "self_play": 0 in RUN/settings.json before the first start; a
 learning seat then always plays that deck, against the pool's decks.
@@ -31,13 +37,10 @@ import json
 import multiprocessing as mp
 from multiprocessing.connection import Client, Listener, wait
 import os
-import pickle
 from pathlib import Path
 import queue
 import random
-import select
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -135,11 +138,10 @@ def _kl(logp, ref):
     return (logp.exp() * (logp.masked_fill(torch.isinf(logp), 0) - ref.masked_fill(torch.isinf(ref), 0))).sum(-1)
 
 
-def evaluate(model, x, action, valid, search=None):
+def evaluate(model, x, action, valid):
     """A forward pass on a padded batch -> per real decision ([n], in the mask's order): log p(action), the what and
     card heads' log-probs [n, 4], the log-prob of the tile taken and its head's entropy (0 where no card was played),
-    whether a card was played, and the value. search: (flat rows b * T + t, hand slots) -> also 'search', the tile
-    log-probs [S, CELLS] of those decisions for those cards."""
+    whether a card was played, and the value."""
     full = model(x)
     out, x = policy.flat(full, x)
     v = valid.reshape(-1)
@@ -153,11 +155,8 @@ def evaluate(model, x, action, valid, search=None):
     tile_entropy[play] = _entropy(tiles)
     pick = lambda lp, i: lp.gather(1, i.unsqueeze(1)).squeeze(1)  # noqa: E731
     logp = pick(what_lp, what) + torch.where(play, pick(which_lp, slot) + tile, torch.zeros_like(tile))
-    result = dict(logp=logp, what=what_lp, which=which_lp, tile=tile, tile_entropy=tile_entropy, play=play,
-                  value=full['value'].reshape(-1)[v])
-    if search is not None:
-        result['search'] = policy.tile_logp(model, out, x, search[1], search[0])
-    return result
+    return dict(logp=logp, what=what_lp, which=which_lp, tile=tile, tile_entropy=tile_entropy, play=play,
+                value=full['value'].reshape(-1)[v])
 
 
 class Evaluate(nn.Module):
@@ -167,8 +166,8 @@ class Evaluate(nn.Module):
         super().__init__()
         self.policy = model
 
-    def forward(self, x, action, valid, search=None):
-        return evaluate(self.policy, x, action, valid, search)
+    def forward(self, x, action, valid):
+        return evaluate(self.policy, x, action, valid)
 
 
 class Critic(nn.Module):
@@ -234,6 +233,18 @@ def critic_targets(batches, critic, args, device):
         'short_ev_td': explained(o['ret_short'], o['v_short'])}
 
 
+def finite_step(parameters, optimizer, max_norm, stats, key):
+    """Clip the gradient and step only if it is finite -> whether it stepped. After DDP's all-reduce every rank sees the
+    same norm, so all skip together: one bad minibatch is dropped instead of turning every weight into NaN (the fork
+    test of 19 October lost its policy that way). stats[key]: the fraction of steps skipped."""
+    norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    ok = bool(torch.isfinite(norm))
+    if ok:
+        optimizer.step()
+    stats[key].append(float(not ok))
+    return ok
+
+
 def train_critic(critic, optimizer, batches, args, device, objective=None):
     """--critic-epochs passes over the batch: P(win) by cross-entropy, the short-term returns by squared error."""
     objective = objective or critic
@@ -251,8 +262,7 @@ def train_critic(critic, optimizer, batches, args, device, objective=None):
                 short_loss = F.mse_loss(short.float()[valid], y['ret_short'][valid])
                 optimizer.zero_grad(set_to_none=True)
                 (win_loss + short_loss).backward()
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-                optimizer.step()
+                finite_step(critic.parameters(), optimizer, 1.0, stats, 'critic_skipped')
                 stats['win_loss'].append(win_loss.item())
                 stats['short_loss'].append(short_loss.item())
     return {k: float(np.mean(v)) for k, v in stats.items()}
@@ -283,17 +293,8 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
         for _ in range(args.epochs):
             for chunk, x, _, valid in random.sample(batches, len(batches)):
                 y = targets(chunk, ('action', 'logp', 'adv'), device)
-                T = x['scalars'].shape[1]
-                searched = sum(len(t.get('search_t', ())) for t in chunk)
-                search = None
-                if searched:  # the search's targets for this chunk's searched decisions
-                    rows = np.concatenate([b * T + t['search_t'] for b, t in enumerate(chunk)])
-                    search = (torch.from_numpy(rows).to(device), torch.from_numpy(np.concatenate(
-                        [t['search_slot'] for t in chunk])).to(device))
-                    cells = torch.from_numpy(np.concatenate([t['search_cells'] for t in chunk])).to(device)
-                    target = torch.from_numpy(np.concatenate([t['search_target'] for t in chunk])).to(device)
                 with torch.autocast(**autocast):
-                    new = objective(x, y['action'], valid, search)
+                    new = objective(x, y['action'], valid)
                 ref_what, ref_which, ref_tile = (torch.cat(parts) for parts in zip(*(t['ref'] for t in chunk)))
                 ratio = (new['logp'] - y['logp'][valid]).exp()
                 adv = (y['adv'][valid] - mean) / std
@@ -305,18 +306,9 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
                           + torch.where(new['play'], log_r.exp() - 1 - log_r, torch.zeros_like(log_r))).mean()
                 # the policy's own value head is left alone (0 x keeps a gradient on every parameter DDP expects)
                 loss = policy_loss - args.entropy * ent + args.kl_coef * kl_ref + 0 * new['value'].sum()
-                if search is not None:  # cross-entropy of the tile head to the search's distribution over its candidates
-                    lp = new['search'].float().gather(1, cells.clamp(min=0))
-                    ok = (cells >= 0) & torch.isfinite(lp)
-                    search_loss = -(target * lp.masked_fill(~ok, 0)).sum(1).mean()
-                    loss = loss + getattr(args, 'search_coef', 0.0) * search_loss
-                    stats['search_loss'].append(search_loss.item())
-                    stats['search_agree'].append((lp.masked_fill(~ok, float('-inf')).argmax(1)
-                                                  == target.argmax(1)).float().mean().item())
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                optimizer.step()
+                finite_step(model.parameters(), optimizer, 0.5, stats, 'skipped')
                 with torch.no_grad():
                     stats['policy_loss'].append(policy_loss.item())
                     stats['entropy'].append(ent.item())
@@ -355,68 +347,6 @@ def potential(state, start, owner):
         else:
             dealt += lost
     return dealt - taken
-
-
-# ---- search ------------------------------------------------------------------------------------------------------------
-SEARCH_K = 8  # the policy's top tiles a search compares (plus the one it sampled)
-SEARCH_TIMEOUT = 30  # s for one search's rollouts; a copy that hangs is killed and the search dropped
-
-
-def rollout_score(engine, play, owner, start, princess, horizon, material):
-    """In a forked copy of the game: drop the opponent's plays `owner` cannot see yet, make `play`, run `horizon` ticks
-    with no further plays -> tower damage (the shaping potential) + material x (our units' hp - theirs, in princess
-    towers)."""
-    now = engine.state.tick
-    engine.pending[:] = [p for p in engine.pending if p['owner'] == owner or p['due'] - now <= C.OPP_VISIBLE]
-    state = engine.step([play], 5, delay=C.DEPLOY_DELAY).state
-    while state.tick - now < horizon and not state.finalized:
-        state = engine.step((), 5).state
-    units = sum((e.hp if e.owner == owner else -e.hp) for e in state.entities if e.card != -1 and e.hp)
-    return potential(state, start, owner) + material * units / princess
-
-
-def search_tiles(engine, owner, slot, cells, start, princess, horizon, material):
-    """Score playing hand slot `slot` on each of `cells`, each in its own forked copy of the game (all at once; os.fork
-    copies the native engine exactly: ~12 ms) -> [score], or None if any copy failed."""
-    from arena import Play
-    kids = []
-    for cell in cells:
-        row, col = divmod(cell, C.W)
-        play = Play(owner, slot, *C.rotate(col * 1000 + 500, row * 1000 + 500, owner))
-        rd, wr = os.pipe()
-        pid = os.fork()
-        if pid == 0:  # the copy: never touches the sockets it inherited, and exits without native destructors
-            try:
-                os.close(rd)
-                os.write(wr, pickle.dumps(rollout_score(engine, play, owner, start, princess, horizon, material)))
-            finally:
-                os._exit(0)
-        os.close(wr)
-        kids.append((pid, rd))
-    scores, deadline = [], time.time() + SEARCH_TIMEOUT
-    for pid, rd in kids:
-        buf = b''
-        while time.time() < deadline:
-            ready, _, _ = select.select([rd], [], [], max(0.0, deadline - time.time()))
-            chunk = os.read(rd, 1 << 16) if ready else b''
-            if not chunk:
-                break
-            buf += chunk
-        if time.time() >= deadline:
-            os.kill(pid, signal.SIGKILL)
-        os.close(rd)
-        os.waitpid(pid, 0)
-        scores.append(pickle.loads(buf) if buf else None)
-    return None if any(not isinstance(x, float) for x in scores) else scores
-
-
-def search_target(scores, tau):
-    """Scores -> a distribution over the candidates (softmax at temperature tau), or None when they do not differ."""
-    scores = np.asarray(scores, np.float64)
-    if scores.max() - scores.min() < 1e-3:
-        return None
-    w = np.exp((scores - scores.max()) / tau)
-    return (w / w.sum()).astype(np.float32)
 
 
 # ---- actors -------------------------------------------------------------------------------------------------------------
@@ -467,21 +397,21 @@ class Seat:
 
     def __init__(self):
         self.rows, self.opp, self.action, self.logp, self.value, self.reward = [], [], [], [], [], []
-        self.search = []  # (decision index, hand slot, candidate cells, target distribution)
 
     def trajectory(self, **extra):
-        n = SEARCH_K + 1
-        cells = np.full((len(self.search), n), -1, np.int64)
-        target = np.zeros((len(self.search), n), np.float32)
-        for i, (_, _, c, p) in enumerate(self.search):
-            cells[i, :len(c)], target[i, :len(p)] = c, p
         return dict(inputs={k: policy.pad_stack([r[k] for r in self.rows]) for k in self.rows[0]},
                     opp={k: np.stack([r[k] for r in self.opp]) for k in PRIVATE},
                     action=np.array(self.action, np.int64), logp=np.array(self.logp, np.float32),
-                    value=np.array(self.value, np.float32), reward=np.array(self.reward, np.float32),
-                    search_t=np.array([x[0] for x in self.search], np.int64),
-                    search_slot=np.array([x[1] for x in self.search], np.int64), search_cells=cells,
-                    search_target=target, **extra)
+                    value=np.array(self.value, np.float32), reward=np.array(self.reward, np.float32), **extra)
+
+
+def evaluation(run):
+    """The loop's evaluation matches (RUN/eval.json, written by loop.py): [{'id', 'a': [name, path], 'b': [name,
+    path], 'games'}], or [] (none, or caught mid-write)."""
+    try:
+        return json.loads((run / 'eval.json').read_text()).get('matches', [])
+    except (OSError, ValueError):
+        return []
 
 
 def redirect(run, name):
@@ -529,7 +459,14 @@ def collector(index, run, addresses, key, affinity=False):
         # learner can read the previous endpoint.json)
         s = endpoint(run)['settings']
         names = list(opponents)
-        if names and rng.random() >= s['self_play']:
+        matches = evaluation(run) if s.get('eval_frac') else []
+        judged = rng.choices(matches, [m['games'] for m in matches])[0] \
+            if matches and rng.random() < s['eval_frac'] else None  # an evaluation game: two frozen models, no learning
+        if judged:
+            models = [tuple(judged['a']), tuple(judged['b'])]
+            if rng.random() < 0.5:
+                models.reverse()
+        elif names and rng.random() >= s['self_play']:
             name = rng.choices(names, [opponents[n][1] for n in names])[0]
             models = [('current', None), (name, opponents[name][0])]
             if rng.random() < 0.5:
@@ -537,7 +474,8 @@ def collector(index, run, addresses, key, affinity=False):
         else:
             models = [('current', None)] * 2
         opponent = next((name for name, _ in models if name != 'current'), 'current')
-        sid = route_collector(opponent, opponents, rng, len(addresses)) if affinity else index % len(addresses)
+        sid = rng.randrange(len(addresses)) if judged else \
+            route_collector(opponent, opponents, rng, len(addresses)) if affinity else index % len(addresses)
         if address != addresses[sid]:
             if server is not None:
                 server.close()
@@ -553,7 +491,6 @@ def collector(index, run, addresses, key, affinity=False):
         inputs = Inputs(engine, match, {0: vocab, 1: vocab}, legal)
         seats = {o: Seat() for o in (0, 1) if models[o][0] == 'current'}
         start = tower_hp(state)
-        princess = max(hp for _, hp, king in start.values() if not king)
         phi = [potential(state, start, o) for o in (0, 1)]
         version, shape = None, None
         while True:
@@ -567,22 +504,8 @@ def collector(index, run, addresses, key, affinity=False):
             replies, used = receive(server)
             version = used if version is None else version  # the game counts as played by its first weights
             t2 = time.perf_counter()
-            plays, searched = [], 0.0
-            for o, (a, lp, v, top) in enumerate(replies):
-                if o in seats and a >= policy.CARD and rng.random() < s.get('search_frac', 0.0):
-                    t3 = time.perf_counter()
-                    slot, sampled = divmod(a - policy.CARD, policy.CELLS)
-                    cells = list(dict.fromkeys([sampled] + [c for c in top if c >= 0]))
-                    scores = search_tiles(engine, o, slot, cells, start, princess, s['search_horizon'],
-                                          s['search_material'])
-                    target = search_target(scores, s['search_tau']) if scores else None
-                    if target is not None:
-                        seats[o].search.append((len(seats[o].action), slot, cells, target))
-                    timing['searches'] += 1
-                    timing['search_failed'] += scores is None
-                    timing['search_labels'] += target is not None
-                    timing['search_changed'] += target is not None and int(np.argmax(target)) != 0
-                    searched += time.perf_counter() - t3
+            plays = []
+            for o, (a, lp, v) in enumerate(replies):
                 if o in seats:
                     seat = seats[o]
                     seat.rows.append(rows[o])
@@ -609,11 +532,17 @@ def collector(index, run, addresses, key, affinity=False):
                 phi[o] = new
             timing['features'] += t1 - t0
             timing['wait'] += t2 - t1
-            timing['engine'] += time.perf_counter() - t2 - searched
-            timing['search'] += searched
+            timing['engine'] += time.perf_counter() - t2
             timing['steps'] += 1
             if ended:
                 break
+        if judged:  # A's score: 1 win, 0.5 draw, 0 loss
+            a = 0 if models[0][0] == judged['a'][0] else 1
+            score = 0.5 if state.result not in (0, 1) else float(state.result == a)
+            _, opponents = link.exchange([], [dict(eval=judged['id'], score=score, tick=state.tick)],
+                                         dict(timing, games=1))
+            timing = defaultdict(float)
+            continue
         out = []
         for o, seat in seats.items():
             outcome = 0.0 if state.result not in (0, 1) else 1.0 if state.result == o else -1.0
@@ -690,16 +619,19 @@ def stage(wires, shape, B, O, out=None):
 
 
 class Decider:
-    """Batched decisions for many games: each seat's LSTM state is one row of a GPU tensor; one call per model. On a GPU
+    """Batched decisions for many games: each seat's LSTM state is one row of a GPU tensor (one tensor per LSTM size, so
+    a server can hold models of several sizes, e.g. medium benchmarks for a large run); one call per model. On a GPU
     each call replays a CUDA graph of the whole decision (forward pass and sampling) for its bucket of rows and objects:
     run op by op, a call launched ~280 kernels, 9 ms of CPU for 0.7 ms of GPU work, whatever the batch."""
 
-    def __init__(self, models, device, core, capacity=1024, top=True, fast=True, channels_last=False):
+    def __init__(self, models, device, core, capacity=1024, fast=True, channels_last=False):
         torch.backends.mha.set_fastpath_enabled(False)  # the learner's attention path: same numerics, and capturable
-        self.models, self.device, self.capacity, self.top = models, device, capacity, top
-        self.rows = {}  # (collector, owner) -> row of self.h / self.c; row `capacity` is scratch (padding rows)
-        self.h = torch.zeros(1, capacity + 1, core, device=device)
-        self.c = torch.zeros_like(self.h)
+        self.models, self.device, self.capacity = models, device, capacity
+        self.rows = {}  # (collector, owner) -> row of the LSTM states; row `capacity` is scratch (padding rows)
+        self.states = {}  # LSTM size -> (h, c), each [1, capacity + 1, size]
+        self.h, self.c = self.state(core)
+        for model in models.values():
+            self.state(model.config.core)
         self.graphs = {}  # (model name, rows, objects) -> graph and its owned I/O buffers
         self.pool = torch.cuda.graph_pool_handle() if device.type == 'cuda' else None
         self.fast = fast and device.type == 'cuda'
@@ -717,10 +649,18 @@ class Decider:
                 self.rows[seat] = len(self.rows)
         return [self.rows[seat] for seat in seats]
 
+    def state(self, core):
+        """The LSTM states for models of size `core`, made on first use (outside any CUDA graph capture)."""
+        if core not in self.states:
+            h = torch.zeros(1, self.capacity + 1, core, device=self.device)
+            self.states[core] = (h, torch.zeros_like(h))
+        return self.states[core]
+
     def reset(self, collector):
         index = torch.tensor(self._rows([(collector, 0), (collector, 1)]), device=self.device)
-        self.h[:, index] = 0
-        self.c[:, index] = 0
+        for h, c in self.states.values():
+            h[:, index] = 0
+            c[:, index] = 0
 
     def drop(self, name):
         del self.models[name]
@@ -731,18 +671,12 @@ class Decider:
         # bf16 on the GPU, as in the PPO update, so old and new log-probs come from the same arithmetic
         with torch.no_grad(), torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == 'cuda',
                                              cache_enabled=False):
-            out = model(x, (self.h.index_select(1, index), self.c.index_select(1, index)))
+            h, c = self.states[model.config.core]
+            out = model(x, (h.index_select(1, index), c.index_select(1, index)))
             action, logp = policy.sample(model, out, x, policy.ABILITY_EXPLORE)
-            self.h.index_copy_(1, index, out['state'][0].float())
-            self.c.index_copy_(1, index, out['state'][1].float())
-            if not self.top:  # no search: -1s, at no cost
-                return action, logp.float(), out['value'][:, 0].float(), action.new_full((len(action), SEARCH_K), -1)
-            # the sampled card's most likely tiles (what a collector's search compares); -1 for illegal ones
-            f, fx = policy.flat(out, x)
-            tiles = policy.tile_logp(model, f, fx, ((action - policy.CARD).clamp(min=0) // policy.CELLS))
-            best, top = tiles.topk(SEARCH_K, -1)
-            top = torch.where(torch.isfinite(best), top, torch.full_like(top, -1))
-        return action, logp.float(), out['value'][:, 0].float(), top
+            h.index_copy_(1, index, out['state'][0].float())
+            c.index_copy_(1, index, out['state'][1].float())
+        return action, logp.float(), out['value'][:, 0].float()
 
     def _graph(self, name, staged):
         B, O = staged['obj_side'].shape[0], staged['obj_side'].shape[2]
@@ -793,10 +727,8 @@ class Decider:
             # Groups remain live until the aggregate readback. A shared capture pool can reuse a prior
             # group's storage when a new shape is first captured, corrupting its queued output.
             with torch.cuda.graph(graph):
-                action, logp, value, top = self._decide(model, x, index)
+                action, logp, value = self._decide(model, x, index)
                 outputs = torch.stack((action.float(), logp, value), 1)
-                if self.top:
-                    outputs = torch.cat((outputs, top.float()), 1)
             self.graphs[key] = (host, device, arrays, outputs, graph)
         return self.graphs[key]
 
@@ -806,18 +738,18 @@ class Decider:
             return
         values = torch.cat([out for _, out in pending]).cpu().tolist()
         order = [i for part, _ in pending for i in part]
-        for i, (action, logp, value, *top) in zip(order, values):
-            results[i] = (int(action), logp, value, [int(t) for t in top] if self.top else [-1] * SEARCH_K)
+        for i, (action, logp, value) in zip(order, values):
+            results[i] = (int(action), logp, value)
         pending.clear()
 
     def act(self, requests):
-        """requests: [(seat, model name, its checkpoint, wire() row)] -> [(action, logp, value, the sampled card's top
-        tiles)], same order."""
+        """requests: [(seat, model name, its checkpoint, wire() row)] -> [(action, logp, value)], same order."""
         by_model = defaultdict(list)
         for i, (_, name, path, _) in enumerate(requests):
             by_model[name].append(i)
             if name not in self.models:
                 self.models[name] = policy.load(path, self.device)[0]
+                self.state(self.models[name].config.core)
                 if self.channels_last:
                     convolution_layout(self.models[name])
         results = [None] * len(requests)
@@ -858,9 +790,9 @@ class Decider:
                         x[k].copy_(torch.from_numpy(v), non_blocking=True)
                     static_index.copy_(torch.tensor(index), non_blocking=True)
                     graph.replay()
-                action, logp, value, top = (o[:len(rows)].tolist() for o in outputs)
-                for i, a, lp, v, t in zip(part, action, logp, value, top):
-                    results[i] = (a, lp, v, t)
+                action, logp, value = (o[:len(rows)].tolist() for o in outputs)
+                for i, a, lp, v in zip(part, action, logp, value):
+                    results[i] = (a, lp, v)
         self._readback(pending, results)
         return results
 
@@ -881,9 +813,7 @@ def server(sid, run, listener, gpu, mps, fast=True):
     current = policy.load(endpoint(run)['init'], device)[0]
     link = Link(run)
     weights, opponents = link.exchange([], [], {})
-    # the top tiles cost ~2 ms a step; a server started while search is off skips them
-    decider = Decider({'current': current}, device, current.config.core,
-                      top=endpoint(run)['settings'].get('search_frac', 0.0) > 0, fast=fast,
+    decider = Decider({'current': current}, device, current.config.core, fast=fast,
                       channels_last=endpoint(run)['settings'].get('channels_last', False))
     conns, arrivals, polled, stats = [], queue.Queue(), time.monotonic(), defaultdict(float)
 
@@ -897,7 +827,8 @@ def server(sid, run, listener, gpu, mps, fast=True):
     while True:
         if weights is not None:
             current.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
-            for name in set(decider.models) - {'current'} - set(opponents):
+            judged = {m[k][0] for m in evaluation(run) for k in ('a', 'b')}
+            for name in set(decider.models) - {'current'} - set(opponents) - judged:
                 decider.drop(name)  # an opponent the learner no longer offers
             weights = None
         if time.monotonic() - polled > WEIGHTS_POLL:
@@ -1070,8 +1001,7 @@ def reachable_ip():
 
 DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibatch=8, clip=0.2, gamma=0.999, lam=0.95,
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
-                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0, margin=0.2, reanchor=0,
-                search_frac=0.0, search_horizon=160, search_material=0.3, search_tau=0.02, search_coef=1.0,
+                pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0, margin=0.2, eval_frac=0.25,
                 channels_last=True)
 
 
@@ -1103,15 +1033,16 @@ def learn(args, settings):
     optimizer = torch.optim.Adam(model.parameters(), lr=s.lr)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=s.critic_lr)
     version = fresh = 0
+    rolled = None  # the last rollback applied (RUN/rollback.json's id)
     if (out / 'latest.pt').exists():
         latest = torch.load(out / 'latest.pt', map_location='cpu', weights_only=False)
         model.load_state_dict(latest['model'])
         optimizer.load_state_dict(latest['optimizer'])
         critic.load_state_dict(latest['critic'])
         critic_optimizer.load_state_dict(latest['critic_optimizer'])
-        if 'reference' in latest:  # the anchor it had (--reanchor)
+        if 'reference' in latest:  # the anchor it had
             reference.load_state_dict(latest['reference'])
-        version = latest['version']
+        version, rolled = latest['version'], latest.get('rollback')
         fresh = version - ADAM_WARMUP  # its Adam moments are back: no warm-up
     model.train()
     if cuda and s.channels_last:
@@ -1126,11 +1057,41 @@ def learn(args, settings):
     def weights():
         return {k: v.detach().float().cpu().numpy() for k, v in model.state_dict().items()}
 
+    def control(name):
+        """RUN/<name>.json, written by loop.py: rank 0 reads it, every rank gets the same dict (or None)."""
+        found = [None]
+        if rank == 0:
+            try:
+                found = [json.loads((out / f'{name}.json').read_text())]
+            except (OSError, ValueError):  # absent, or caught mid-write: the next update sees it
+                pass
+        if world > 1:
+            dist.broadcast_object_list(found)
+        return found[0]
+
+    def follow_champion(current):
+        """The KL reference is loop.py's champion (RUN/champion.json, replaced on promotion) -> its name."""
+        spec = control('champion')
+        if spec and spec['name'] != current:
+            reference.load_state_dict(policy.load(spec['path'], device)[0].state_dict())
+            return spec['name']
+        return current
+
+    def full():
+        return dict(config=saved['config'], model=model.state_dict(), optimizer=optimizer.state_dict(),
+                    critic=critic.state_dict(), critic_optimizer=critic_optimizer.state_dict(),
+                    reference=reference.state_dict(), vocab=saved['vocab'], version=version, step=version,
+                    rollback=rolled)
+
+    champion = follow_champion(None)
+    floor = 0  # after a rollback, games played before it are not learned from
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> the learning seat's recent outcomes
 
     def opponents():
-        """{name: (checkpoint, PFSP weight)}: the IL model and the latest snapshots."""
-        names = {'il': init, **{p.stem: str(p) for p in sorted((out / 'pool').glob('v*.pt'))[-s.pool_size:]}}
+        """{name: (checkpoint, PFSP weight)}: the IL model, the latest snapshots and the league (RUN/league: every
+        champion loop.py promoted, kept for good)."""
+        names = {'il': init, **{p.stem: str(p) for p in sorted((out / 'pool').glob('v*.pt'))[-s.pool_size:]},
+                 **{p.stem: str(p) for p in sorted((out / 'league').glob('*.pt'))}}
         win = {n: (np.mean(results[n]) + 1) / 2 if results[n] else 0.5 for n in names}
         return {n: (path, (1 - win[n]) ** 2 + 0.05) for n, path in names.items()}
 
@@ -1162,7 +1123,7 @@ def learn(args, settings):
             if int(n) >= s.batch:
                 break
             time.sleep(1)
-        games, done, timing, stale = inbox.take(version - s.max_lag)
+        games, done, timing, stale = inbox.take(max(version - s.max_lag, floor))
         # ponytail: a learner slower than its actors would take ever bigger batches; the newest 2 x --batch are kept
         cap = 2 * s.batch // world
         stale, games = stale + max(0, len(games) - cap), games[-cap:]
@@ -1188,12 +1149,21 @@ def learn(args, settings):
                      critic_s=time.monotonic() - t_critic)
         del batches
         version += 1
-        if s.get('reanchor') and version % s.reanchor == 0:
-            reference.load_state_dict(model.state_dict())
-            stats['reanchored'] = 1.0
+        champion = follow_champion(champion)
+        spec = control('rollback')
+        if spec and spec['id'] != rolled:  # loop.py: back to a champion's full checkpoint, keeping the version count
+            back = torch.load(out / spec['path'], map_location='cpu', weights_only=False)
+            model.load_state_dict(back['model'])
+            optimizer.load_state_dict(back['optimizer'])
+            critic.load_state_dict(back['critic'])
+            critic_optimizer.load_state_dict(back['critic_optimizer'])
+            rolled, floor = spec['id'], version
+            stats['rolled_back'] = 1.0
         t2 = time.monotonic()
-        mine = dict(stats=stats, results=done, timing=timing, stale=stale, lag=lag, games=len(games),
-                    decisions=sum(len(g['action']) for g in games), actors=len(inbox.conns))
+        judged = [row for row in done if 'eval' in row]
+        mine = dict(stats=stats, results=[row for row in done if 'eval' not in row], judged=judged, timing=timing,
+                    stale=stale, lag=lag, games=len(games), decisions=sum(len(g['action']) for g in games),
+                    trained=sum(0.5 if g['opponent'] == 'current' else 1.0 for g in games), actors=len(inbox.conns))
         everyone = [None] * world
         if world > 1:
             dist.all_gather_object(everyone, mine)
@@ -1203,16 +1173,19 @@ def learn(args, settings):
             for row in r['results']:
                 if row['opponent'] != 'self':
                     results[row['opponent']].append(row['outcome'])
-        if rank == 0 and version % s.snapshot_every == 0:
+        if rank == 0 and version % s.snapshot_every == 0:  # a policy snapshot (opponent, gate candidate) and its full
             torch.save(dict(config=saved['config'], model=model.state_dict(), vocab=saved['vocab'], version=version),
-                       out / 'pool' / 'snapshot.tmp')
+                       out / 'pool' / 'snapshot.tmp')  # checkpoint (what a rollback returns to)
             (out / 'pool' / 'snapshot.tmp').replace(out / 'pool' / f'v{version:06d}.pt')
+            torch.save(full(), out / 'ckpt' / 'ckpt.tmp')
+            (out / 'ckpt' / 'ckpt.tmp').replace(out / 'ckpt' / f'v{version:06d}.pt')
         if rank == 0 and version % s.checkpoint_every == 0:
-            torch.save(dict(config=saved['config'], model=model.state_dict(), optimizer=optimizer.state_dict(),
-                            critic=critic.state_dict(), critic_optimizer=critic_optimizer.state_dict(),
-                            reference=reference.state_dict(), vocab=saved['vocab'], version=version, step=version),
-                       out / 'latest.tmp')
+            torch.save(full(), out / 'latest.tmp')
             (out / 'latest.tmp').replace(out / 'latest.pt')
+        if rank == 0:
+            with (out / 'evals.jsonl').open('a') as f:  # evaluation games, for loop.py
+                for row in (row for r in everyone for row in r['judged']):
+                    f.write(json.dumps(dict(row, version=version)) + '\n')
         if world > 1:
             dist.barrier()  # the new snapshot is on disk before any rank offers it
         with inbox.lock:
@@ -1220,22 +1193,23 @@ def learn(args, settings):
         if rank == 0:
             now = time.monotonic()
             finished = [row for r in everyone for row in r['results']]
-            total_games += len(finished)
+            judged = sum(len(r['judged']) for r in everyone)
+            total_games += len(finished) + judged
             times = [t for r in everyone for t in r['timing']]
             steps = max(1.0, sum(t.get('steps', 0) for t in times))
             keys = everyone[0]['stats'].keys() | set().union(*(r['stats'].keys() for r in everyone))
             row = dict(
                 version=version, hours=round((now - started) / 3600, 4), games=total_games,
-                games_per_hour=round(len(finished) / max(now - last, 1e-6) * 3600),
+                games_per_hour=round((len(finished) + judged) / max(now - last, 1e-6) * 3600),
+                trained_games_per_hour=round(sum(r['trained'] for r in everyone) / max(now - last, 1e-6) * 3600),
+                eval_games=judged, champion=champion,
                 trajectories=sum(r['games'] for r in everyone), decisions=sum(r['decisions'] for r in everyone),
                 learning_decisions_per_second=round(sum(r['decisions'] for r in everyone) / max(now - last, 1e-6), 1),
                 stale=sum(r['stale'] for r in everyone), lag=float(np.mean([x for r in everyone for x in r['lag']] or [0])),
                 actors=sum(r['actors'] for r in everyone), wait_s=round(t1 - t0, 1), update_s=round(t2 - t1, 1), lr=lr,
                 value_only=version - 1 < s.value_warmup,
                 actor_ms={k: round(1000 * sum(t.get(k, 0) for t in times) / steps, 2)
-                          for k in ('features', 'wait', 'engine', 'search')},
-                search={k: round(sum(t.get(k, 0) for t in times) / max(1, sum(t.get('games', 0) for t in times)), 2)
-                        for k in ('searches', 'search_labels', 'search_changed', 'search_failed')},
+                          for k in ('features', 'wait', 'engine')},
                 refused_per_game=round(sum(t.get('refused', 0) for t in times) / max(1, sum(t.get('games', 0) for t in times)), 2),
                 score={n: round(float(np.mean(results[n])), 3) for n in sorted(results) if results[n]},
                 ticks=float(np.mean([row['tick'] for row in finished] or [0])),
@@ -1274,7 +1248,8 @@ def main():
     if args.command == 'act':
         return act(args)
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / 'pool').mkdir(exist_ok=True)
+    for d in ('pool', 'ckpt', 'league'):
+        (args.out / d).mkdir(exist_ok=True)
     saved = args.out / 'settings.json'
     settings = {k: getattr(args, k) for k in DEFAULTS}
     if saved.exists():

@@ -372,16 +372,15 @@ def test_opponent_routing_groups_games_without_changing_their_opponents():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA graph serving requires a GPU')
-@pytest.mark.parametrize('top', [False, True])
-def test_cuda_serving_preserves_recurrence_reload_and_reused_buffers(monkeypatch, top):
+def test_cuda_serving_preserves_recurrence_reload_and_reused_buffers(monkeypatch):
     torch.set_num_threads(1)
     torch.manual_seed(7)
     config = train.Config(vocab_size=4, card_dim=4, object_dim=8, conv_channels=8, conv_layers=2,
                           core=16, attention_layers=1)
     models = {name: train.Policy(config).cuda().eval() for name in ('current', 'opponent')}
-    baseline = ppo.Decider(models, torch.device('cuda'), config.core, capacity=128, top=top, fast=False)
+    baseline = ppo.Decider(models, torch.device('cuda'), config.core, capacity=128, fast=False)
     fast = ppo.Decider({k: copy.deepcopy(v) for k, v in models.items()}, torch.device('cuda'), config.core,
-                       capacity=128, top=top, fast=True)
+                       capacity=128, fast=True)
     x, _ = arrays(40, 1)
     rows = [train.pack({k: v[t] for k, v in x.items()}) for t in range(40)]
     baseline.shape = fast.shape = ppo.layout(rows[0])
@@ -418,54 +417,7 @@ def test_cuda_serving_preserves_recurrence_reload_and_reused_buffers(monkeypatch
     assert all(key[0] != 'opponent' for key in fast.graphs)
 
 
-def test_search_targets_and_distillation(tmp_path, monkeypatch):
-    """Search scores -> targets; trajectories carry them; the PPO update pulls the tile head to the search's choice."""
-    assert ppo.search_target([0.5, 0.5, 0.5], 0.02) is None, 'scores that do not differ give no label'
-    target = ppo.search_target([0.0, 0.04, 0.02], 0.02)
-    assert target.argmax() == 1 and abs(target.sum() - 1) < 1e-6
-    root = dataset(tmp_path / 'data', monkeypatch)
-    torch.manual_seed(0)
-    model = train.Policy(train.Config(vocab_size=len(C.Vocab([26000000])), card_dim=4, object_dim=4, conv_channels=4,
-                                      conv_layers=1, core=8, attention_layers=0))
-    entry = json.loads((root / 'manifest.json').read_text())['entries'][0]
-    x, _ = next(train.chunks(train.read(root / entry['file'], entry['owner']), 300, True, None))
-    T = len(x['scalars'])
-    rows = [train.pack({k: v[t] for k, v in x.items()}) for t in range(T)]
-    seat = ppo.Seat()
-    for t, r in enumerate(rows):
-        seat.rows.append(r)
-        seat.opp.append(r)
-        seat.action.append(0)
-        seat.logp.append(0.0)
-        seat.value.append(0.0)
-        seat.reward.append(0.0)
-        legal = x['legal'][t].reshape(4, -1)
-        slot = int(legal.any(1).argmax())
-        cells = [int(c) for c in np.flatnonzero(legal[slot])[:3]]
-        if t % 3 == 0 and len(cells) == 3:
-            seat.search.append((t, slot, cells, np.array([0.1, 0.8, 0.1], np.float32)))
-    trajectory = seat.trajectory(version=0, opponent='il', outcome=1.0)
-    S = len(seat.search)
-    assert S and trajectory['search_cells'].shape == (S, ppo.SEARCH_K + 1)
-    assert (trajectory['search_cells'][:, 3:] == -1).all() and trajectory['search_t'].tolist() == [e[0] for e in seat.search]
-    trajectory['adv'] = np.zeros(T, np.float32)
-    reference = copy.deepcopy(model).requires_grad_(False)
-    args = argparse.Namespace(minibatch=1, epochs=1, clip=0.2, entropy=0.0, kl_coef=0.0, search_coef=1.0)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-2)
-    device = torch.device('cpu')
-    batches = ppo.minibatches([trajectory], args, device)
-    first = ppo.update(model.train(), reference, optimizer, batches, args, device)
-    for _ in range(15):
-        last = ppo.update(model, reference, optimizer, batches, args, device)
-    assert np.isfinite(first['search_loss']) and last['search_loss'] < first['search_loss']
-    assert last['search_agree'] == 1.0, 'the tile head now prefers the cell the search chose'
-    xt = train.tensors({k: np.stack([r[k] for r in rows])[None] for k in rows[0]}, 'cpu')
-    with torch.no_grad(), torch.autocast('cpu', torch.bfloat16):
-        f, fx = train.flat(model(xt), xt)
-        assert model.tiles(f, fx, torch.zeros(T, dtype=torch.long)).dtype == torch.float32, 'tile scores stay fp32'
-
-
-def test_decision_server_returns_the_sampled_cards_legal_top_tiles(tmp_path, monkeypatch):
+def test_decision_server_plays_only_legal_tiles_and_tile_scores_stay_fp32(tmp_path, monkeypatch):
     root = dataset(tmp_path / 'data', monkeypatch)
     torch.manual_seed(0)
     model = train.Policy(train.Config(vocab_size=len(C.Vocab([26000000])), card_dim=4, object_dim=4, conv_channels=4,
@@ -478,14 +430,16 @@ def test_decision_server_returns_the_sampled_cards_legal_top_tiles(tmp_path, mon
     decider.reset(0)
     played = 0
     for t, row in enumerate(rows):
-        (a, lp, v, top), = decider.act([((0, 0), 'current', None, ppo.wire(row, decider.shape))])
-        assert len(top) == ppo.SEARCH_K
+        (a, lp, v), = decider.act([((0, 0), 'current', None, ppo.wire(row, decider.shape))])
         if a >= train.CARD:
             slot, cell = divmod(a - train.CARD, train.CELLS)
-            legal = x['legal'][t].reshape(4, -1)[slot]
-            assert all(legal[c] for c in top if c >= 0) and any(c >= 0 for c in top)
+            assert x['legal'][t].reshape(4, -1)[slot][cell]
             played += 1
     assert played, 'the untrained policy played at least one card'
+    xt = train.tensors({k: np.stack(rows_k)[None] for k, rows_k in ((k, [r[k] for r in rows]) for k in rows[0])}, 'cpu')
+    with torch.no_grad(), torch.autocast('cpu', torch.bfloat16):
+        f, fx = train.flat(model(xt), xt)
+        assert model.tiles(f, fx, torch.zeros(len(rows), dtype=torch.long)).dtype == torch.float32, 'tile scores stay fp32'
 
 
 def test_unaffordable_cards_are_not_offered_and_held_taps_are_in_flight():
@@ -516,3 +470,73 @@ def test_unaffordable_cards_are_not_offered_and_held_taps_are_in_flight():
     landed = [(200, {'owner': 0, 'card_id': 26000021, 'x': 3500, 'y': 10500, 'tap': 150})]
     assert [tt for tt, c in landed if c.get('tap', tt - C.DEPLOY_DELAY) <= 160 < tt] == [200]
     assert not [tt for tt, c in landed if tt - C.DEPLOY_DELAY <= 160 < tt]
+
+
+def test_a_non_finite_gradient_skips_the_step():
+    w = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.SGD([w], lr=1.0)
+    stats = {'skipped': []}
+    (w * float('nan')).sum().backward()
+    assert not ppo.finite_step([w], optimizer, 1.0, stats, 'skipped') and torch.equal(w.data, torch.ones(2))
+    w.grad = None
+    w.sum().backward()
+    assert ppo.finite_step([w], optimizer, 1.0, stats, 'skipped') and stats['skipped'] == [1.0, 0.0]
+
+
+def test_loop_promotes_rolls_back_and_stops(tmp_path, monkeypatch):
+    import loop
+    monkeypatch.setattr(loop.Loop, 'jobs', lambda self: {})
+    for d in ('pool', 'ckpt', 'league'):
+        (tmp_path / d).mkdir()
+    (tmp_path / 'loop.json').write_text(json.dumps(dict(
+        jobs={}, champion=dict(name='il', path='/il.pt'), benchmark={'b1': '/b1.pt'}, champion_games=4, bench_games=2,
+        stall_after=3)))
+    run = loop.Loop(tmp_path)
+    assert json.loads((tmp_path / 'champion.json').read_text())['name'] == 'il'
+
+    def gate(name, h2h, bench, champion_bench=None):
+        (tmp_path / 'pool' / f'{name}.pt').write_bytes(b'x')
+        (tmp_path / 'ckpt' / f'{name}.pt').write_bytes(b'x')
+        run.step()
+        ids = [m['id'] for m in json.loads((tmp_path / 'eval.json').read_text())['matches']]
+        rows = [dict(eval=f'{name}:{run.state["champion"]["name"]}', score=x) for x in h2h]
+        rows += [dict(eval=f'{name}:b1', score=x) for x in bench]
+        rows += [dict(eval=f'il:b1', score=x) for x in (champion_bench or [])]
+        with (tmp_path / 'evals.jsonl').open('a') as f:
+            f.write(''.join(json.dumps(r) + '\n' for r in rows))
+        run.step()
+        assert not json.loads((tmp_path / 'eval.json').read_text())['matches'], 'evaluation over: back to training'
+        return ids, run.state['gates'][-1]['result']
+
+    ids, result = gate('v000020', [1, 1, 1, 0], [1, 0], champion_bench=[0.5, 0.5])
+    assert set(ids) == {'v000020:il', 'v000020:b1', 'il:b1'} and result == 'promoted'
+    assert json.loads((tmp_path / 'champion.json').read_text())['name'] == 'v000020'
+    assert (tmp_path / 'league' / 'v000020.pt').exists() and run.state['champion_ckpt'] == 'ckpt/v000020.pt'
+    assert gate('v000040', [1, 1, 1, 1], [0, 0])[1] == 'kept champion', 'a benchmark regression blocks promotion'
+    assert gate('v000060', [0, 0, 0, 1], [1, 1])[1] == 'kept champion' and not (tmp_path / 'rollback.json').exists()
+    assert gate('v000080', [0, 0, 0, 0], [1, 1])[1] == 'kept champion'
+    assert json.loads((tmp_path / 'rollback.json').read_text()) == dict(id='r1', path='ckpt/v000020.pt')
+    assert run.state['stopped'], 'three gates without a promotion: stalled'
+    assert 'v000080' in (tmp_path / 'report.md').read_text()
+
+
+def test_a_decision_server_holds_models_of_different_sizes(tmp_path):
+    """A large run's servers also play its medium benchmarks: each LSTM size keeps its own states."""
+    torch.manual_seed(0)
+    config = lambda core: train.Config(vocab_size=4, card_dim=4, object_dim=8, conv_channels=8, conv_layers=1,  # noqa: E731
+                                       core=core, attention_layers=0)
+    small = train.Policy(config(8)).eval()
+    torch.save(dict(config=config(8).__dict__, model=small.state_dict(), vocab=[26000000]), tmp_path / 'small.pt')
+    decider = ppo.Decider({'current': train.Policy(config(16)).eval()}, torch.device('cpu'), 16)
+    x, _ = arrays(6, 1)
+    rows = [train.pack({k: v[t] for k, v in x.items()}) for t in range(6)]
+    decider.shape = ppo.layout(rows[0])
+    decider.reset(0)
+    for row in rows:
+        decider.act([((0, 0), 'current', None, ppo.wire(row, decider.shape)),
+                     ((0, 1), 'small', tmp_path / 'small.pt', ppo.wire(row, decider.shape))])
+    assert set(decider.states) == {8, 16}
+    seat = decider.rows[(0, 1)]
+    assert decider.states[8][0][0, seat].abs().sum() > 0 and decider.states[16][0][0, seat].abs().sum() == 0
+    decider.reset(0)
+    assert all(h[0, seat].abs().sum() == 0 for h, _ in decider.states.values())

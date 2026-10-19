@@ -287,3 +287,35 @@ attacks. Final weights: `~/cr-live/models/medium-1016-final/medium-1016-final.pt
    against v400 after ~100 updates.
 2. Exploiters (AlphaStar-style league) for robustness across decks and opponents.
 3. Bigger batches with more CPUs, and the careful search retry, later.
+
+## 8. The improvement loop: gen-large (from 19 October)
+
+**Why.** Every earlier run needed someone watching it: a plateau or a drift was only seen by reading metrics. The
+paired-fork test (19 October) also showed that full-game fork labels are about as noisy as the critic (mean
+|G(a) - G(a')| ~0.55, against ~1 for unrelated games), so forks and search were set aside (kept outside git in
+`attic/`) and plain PPO runs inside a loop that only keeps a model once it has proved better.
+
+**How it works** (`loop.py`, on the login node; the heavy work stays in the jobs)
+- A frozen **champion** (at first the large IL model) is also the KL reference; the learner is the **challenger**.
+- Every 20 updates the snapshot goes through a **gate**: evaluation games played by the collectors themselves,
+  frozen against frozen (400 against the champion; 200 against each held-out benchmark: medium IL, ppo-m1 v400 and
+  the E-Barbs specialist v1100). Promotion needs >= 55% against the champion and a benchmark mean no more than
+  3 points below the champion's.
+- A promoted champion becomes the new KL reference and a permanent league opponent.
+- **Rollback** to the champion's full checkpoint after two gates below 45% or a collapsed policy (entropy < 0.05);
+  **stop** after 10 gates without a promotion, or 72 h. A minibatch whose gradient is not finite is skipped.
+- Jobs that end or hang are resubmitted; `RUN/report.md` is rewritten every minute.
+
+**Setup.** Large IL policy (8.0M) and critic (its own copy); batch 1024, lr 3e-5, one epoch, minibatch 4, critic
+2 epochs, KL weight 0.01, λ 0.99, margin 0.2, critic warm-up 10 updates. Learner 4 A100, actors 50 collectors and 4
+decision servers on 4 RTX 5090 (the QoS allows 16 CPUs per partition).
+
+**Throughput.** ~17k trained games/h once the policy learns (critic warm-up: ~19-20k). Both sides are near their
+limits: the actors are CPU-bound at 16 CPUs, the learner takes ~240 s per 2048 trajectories.
+
+**First results (19 October).**
+- The first gate found a serving bug: the decision servers kept one LSTM-state tensor sized for the large model, so
+  the medium benchmarks crashed them. Fixed (one state tensor per LSTM size) and covered by a test.
+- **v20 promoted** after 10 policy updates: 66.2% against the large IL model over 447 games; benchmark mean 51.8%
+  against IL's 36.3% (medium IL 79.9%, ppo-m1 v400 34.4%, E-Barbs specialist v1100 41.2%).
+- Large IL itself scores only ~20% against ppo-m1 v400, so beating v400 is the next milestone.

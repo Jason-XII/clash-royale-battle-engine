@@ -10,6 +10,7 @@ Replays → native engine → compact games → imitation learning → live play
 | `common.py` | What all three share: the observation of one decision, legal placement, the clock and elixir timing | — |
 | `arena.py` | Paired-seat native battles between two models | Linux, Slurm |
 | `ppo.py` | Self-play PPO from the IL model: a DDP learner with a separate critic, and actor jobs (native games, batched GPU decisions) | GPU, Slurm |
+| `loop.py` | The improvement loop around a PPO run: frozen champion vs learning challenger, gates with evaluation games, promotion, rollback, job recovery, `RUN/report.md` | Slurm login node (light) |
 
 `assets/` holds the game-build tables (card costs and rarities, effects, placement masks, replay card names, the
 881-token vocabulary, the supported client's hashes). The device reader binary `assets/clapha-reader-nulls` is not in

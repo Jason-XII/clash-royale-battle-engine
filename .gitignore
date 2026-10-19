@@ -8,3 +8,6 @@ __pycache__/
 docs/agent-memory/
 assets/clapha-reader-nulls
 _native_features*.so
+
+# Retired experiments kept locally, never committed (paired forks, search)
+attic/
