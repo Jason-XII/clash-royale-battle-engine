@@ -572,13 +572,30 @@ def _gumbel_argmax(logp):
     return (logp - torch.empty_like(logp).exponential_().log()).argmax(-1)
 
 
+def sharpen(logp, t, mix=0.0):
+    """Log-probs at temperature t, renormalised; a row with nothing legal stays all -inf. mix > 0: that share of the
+    untempered distribution mixed in (the learner explores around the sharpened policy it is deployed as)."""
+    if t == 1.0:
+        return logp
+    sharp = logp / t
+    sharp = sharp - sharp.logsumexp(-1, keepdim=True)
+    sharp = torch.where(sharp.isnan(), torch.full_like(sharp, float('-inf')), sharp)
+    if not mix:
+        return sharp
+    legal = sharp > float('-inf')  # masked (-inf or the dtype's min); finite inputs only, or the backward gives NaN
+    a, b = (torch.where(legal, v, torch.zeros_like(v)) for v in (sharp + math.log1p(-mix), logp + math.log(mix)))
+    return torch.where(legal, torch.logaddexp(a, b), torch.full_like(logp, float('-inf')))
+
+
 def sample(model, out, x, explore=0.0):
     """One action per decision of a forward pass on [N, 1] inputs -> (action [N], its log-prob [N])."""
     out, x = flat(out, x)
     mx = x if getattr(model, 'elixir_mask', True) else {k: x[k] for k in ('legal', 'own_flight_card')}  # off: as before PR 11
     what_lp, which_lp = what_logp(out['what'], mx, explore, out['which']), which_logp(out['which'], mx)
+    t, mix = getattr(model, 'temperature', 1.0), getattr(model, 'mix', 0.0)  # < 1: card and tile sharper; when to play stays
+    which_lp = sharpen(which_lp, t, mix)
     what, slot = _gumbel_argmax(what_lp), _gumbel_argmax(which_lp)
-    tile_lp = tile_logp(model, out, x, slot)
+    tile_lp = sharpen(tile_logp(model, out, x, slot), t, mix)
     cell_ = _gumbel_argmax(tile_lp)
     play = what == PLAY
     pick = lambda lp, i: lp.gather(1, i.unsqueeze(1)).squeeze(1)  # noqa: E731

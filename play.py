@@ -542,9 +542,12 @@ def main():
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--out', type=Path, default=Path.home() / 'cr-live/runs/live')
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each ladder game')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='card and tile temperature (< 1: sharper); when to play stays sampled as trained')
     args = parser.parse_args()
     torch.set_num_threads(2)
     model, vocab, _ = train.load(args.checkpoint)
+    model.temperature = args.temperature
     records = LiveRecords(args.tables)
     prepare(args.serial)
     taps, stream = Taps(args.serial), frames(args.serial)
@@ -569,7 +572,7 @@ def main():
             def log(row):
                 f.write(json.dumps(row) + '\n')
                 f.flush()
-            log({'event': 'checkpoint', 'path': str(args.checkpoint)})
+            log({'event': 'checkpoint', 'path': str(args.checkpoint), 'temperature': args.temperature})
             finished = frame['chain']['battle']
             account = None if args.account == 'auto' else int(args.account, 0)
             for _ in range(20):  # the roster is not linked yet at the battle's first frames

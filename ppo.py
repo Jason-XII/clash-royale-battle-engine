@@ -27,6 +27,14 @@ while it lists any; results in evals.jsonl) and rollback.json (back to a champio
 with every snapshot). Promoted champions in RUN/league stay PFSP opponents for good. A minibatch whose gradient is not
 finite is skipped (metrics skipped / critic_skipped: the fraction of steps).
 
+Frozen models (opponents, evaluation and benchmark games) choose cards and tiles at --frozen-temperature: models are
+deployed sharpened (a lower temperature), so they are judged and met that way. The learner plays at
+--learner-temperature, and its PPO update uses log-probs at that temperature, so the policy trained is the one played;
+--learner-mix of the untempered distribution mixed in lets it explore around that deployed policy (deploy without it).
+
+An exploiter: "against": the main run's directory and "self_play": 0 in its own RUN/settings.json; it then plays only
+the main run's champion (RUN/champion.json there), to find what beats it.
+
 A specialist: put "deck" (a deck as in the pool) and "self_play": 0 in RUN/settings.json before the first start; a
 learning seat then always plays that deck, against the pool's decks.
 """
@@ -148,8 +156,9 @@ def evaluate(model, x, action, valid):
     xv = {k: x[k][v] for k in ('own_flight_card', 'legal', 'hand_float', 'scalars')}
     what, slot, cell, play = policy.split(action.reshape(-1)[v])
     what_lp = policy.what_logp(out['what'][v], xv, policy.ABILITY_EXPLORE, out['which'][v])
-    which_lp = policy.which_logp(out['which'][v], xv)
-    tiles = policy.tile_logp(model, out, x, slot[play], v.nonzero().squeeze(1)[play])
+    t, mix = getattr(model, 'temperature', 1.0), getattr(model, 'mix', 0.0)  # as it plays: the distribution it sampled
+    which_lp = policy.sharpen(policy.which_logp(out['which'][v], xv), t, mix)
+    tiles = policy.sharpen(policy.tile_logp(model, out, x, slot[play], v.nonzero().squeeze(1)[play]), t, mix)
     tile, tile_entropy = what_lp.new_zeros(len(what)), what_lp.new_zeros(len(what))
     tile[play] = tiles.gather(1, cell[play].unsqueeze(1)).squeeze(1)
     tile_entropy[play] = _entropy(tiles)
@@ -624,9 +633,10 @@ class Decider:
     each call replays a CUDA graph of the whole decision (forward pass and sampling) for its bucket of rows and objects:
     run op by op, a call launched ~280 kernels, 9 ms of CPU for 0.7 ms of GPU work, whatever the batch."""
 
-    def __init__(self, models, device, core, capacity=1024, fast=True, channels_last=False):
+    def __init__(self, models, device, core, capacity=1024, fast=True, channels_last=False, frozen_temperature=1.0):
         torch.backends.mha.set_fastpath_enabled(False)  # the learner's attention path: same numerics, and capturable
         self.models, self.device, self.capacity = models, device, capacity
+        self.frozen_temperature = frozen_temperature  # card/tile temperature of every model but 'current' (as played)
         self.rows = {}  # (collector, owner) -> row of the LSTM states; row `capacity` is scratch (padding rows)
         self.states = {}  # LSTM size -> (h, c), each [1, capacity + 1, size]
         self.h, self.c = self.state(core)
@@ -749,6 +759,7 @@ class Decider:
             by_model[name].append(i)
             if name not in self.models:
                 self.models[name] = policy.load(path, self.device)[0]
+                self.models[name].temperature = self.frozen_temperature  # before its graphs are captured
                 self.state(self.models[name].config.core)
                 if self.channels_last:
                     convolution_layout(self.models[name])
@@ -798,6 +809,13 @@ class Decider:
 
 
 WEIGHTS_POLL = 5  # s between a decision server's asks for newer weights
+SERVED = ('learner_temperature', 'learner_mix', 'frozen_temperature', 'channels_last')  # a server applies them once
+
+
+def served(run):
+    """The settings a decision server fixes at startup, as the learner in endpoint.json has them now."""
+    settings = endpoint(run)['settings']
+    return {k: settings.get(k) for k in SERVED}
 
 
 def server(sid, run, listener, gpu, mps, fast=True):
@@ -813,8 +831,13 @@ def server(sid, run, listener, gpu, mps, fast=True):
     current = policy.load(endpoint(run)['init'], device)[0]
     link = Link(run)
     weights, opponents = link.exchange([], [], {})
+    settings = endpoint(run)['settings']
+    applied = {k: settings.get(k) for k in SERVED}
+    current.temperature = settings.get('learner_temperature', 1.0)
+    current.mix = settings.get('learner_mix', 0.0)
     decider = Decider({'current': current}, device, current.config.core, fast=fast,
-                      channels_last=endpoint(run)['settings'].get('channels_last', False))
+                      channels_last=settings.get('channels_last', False),
+                      frozen_temperature=settings.get('frozen_temperature', 1.0))
     conns, arrivals, polled, stats = [], queue.Queue(), time.monotonic(), defaultdict(float)
 
     def accept():
@@ -834,6 +857,9 @@ def server(sid, run, listener, gpu, mps, fast=True):
         if time.monotonic() - polled > WEIGHTS_POLL:
             weights, opponents = link.exchange([], [], {})
             polled = time.monotonic()
+            if served(run) != applied:  # a learner restarted with new ones: the actor job restarts this server with them
+                print(f'settings changed ({applied} -> {served(run)}); exiting to restart', flush=True)
+                os._exit(0)
             if stats['batches']:
                 print(json.dumps({k: round(v, 3) for k, v in stats.items()}), flush=True)
             stats = defaultdict(float)
@@ -1002,7 +1028,19 @@ def reachable_ip():
 DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibatch=8, clip=0.2, gamma=0.999, lam=0.95,
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
                 pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0, margin=0.2, eval_frac=0.25,
-                channels_last=True)
+                channels_last=True, against='', frozen_temperature=1.0, learner_temperature=1.0,
+                learner_mix=0.0)
+
+
+def opponent_paths(out, init, s):
+    """{name: checkpoint}: the IL model, the latest snapshots and the league (RUN/league: every champion loop.py
+    promoted, kept for good). An exploiter (s.against, another run's directory) plays only that run's champion and
+    follows its promotions."""
+    if s.against:
+        spec = json.loads((Path(s.against) / 'champion.json').read_text())
+        return {spec['name']: spec['path']}
+    return {'il': init, **{p.stem: str(p) for p in sorted((out / 'pool').glob('v*.pt'))[-s.pool_size:]},
+            **{p.stem: str(p) for p in sorted((out / 'league').glob('*.pt'))}}
 
 
 def convolution_layout(model):
@@ -1030,6 +1068,8 @@ def learn(args, settings):
     trunk, critic_vocab, _ = policy.load(str(args.critic_init.expanduser().resolve()) if args.critic_init else init, device)
     assert critic_vocab.index == vocab.index, 'the critic reads the same inputs: same vocabulary'
     critic = Critic(trunk).to(device).train()
+    model.temperature = reference.temperature = s.learner_temperature  # trains (and is anchored) as it plays
+    model.mix = reference.mix = s.learner_mix
     optimizer = torch.optim.Adam(model.parameters(), lr=s.lr)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=s.critic_lr)
     version = fresh = 0
@@ -1084,14 +1124,12 @@ def learn(args, settings):
                     rollback=rolled)
 
     champion = follow_champion(None)
-    floor = 0  # after a rollback, games played before it are not learned from
+    floor = version  # games played before this start (old settings) or a rollback are not learned from
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> the learning seat's recent outcomes
 
     def opponents():
-        """{name: (checkpoint, PFSP weight)}: the IL model, the latest snapshots and the league (RUN/league: every
-        champion loop.py promoted, kept for good)."""
-        names = {'il': init, **{p.stem: str(p) for p in sorted((out / 'pool').glob('v*.pt'))[-s.pool_size:]},
-                 **{p.stem: str(p) for p in sorted((out / 'league').glob('*.pt'))}}
+        """{name: (checkpoint, PFSP weight)} over opponent_paths."""
+        names = opponent_paths(out, init, s)
         win = {n: (np.mean(results[n]) + 1) / 2 if results[n] else 0.5 for n in names}
         return {n: (path, (1 - win[n]) ** 2 + 0.05) for n, path in names.items()}
 

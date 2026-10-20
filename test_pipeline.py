@@ -7,6 +7,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -202,7 +203,12 @@ def test_packed_inputs_and_ppo_update(tmp_path, monkeypatch):
                 assert torch.allclose(a[k], b[k], atol=1e-4, equal_nan=True), k
             action, logp = train.sample(model, b, packed, train.ABILITY_EXPLORE)
             again = ppo.evaluate(model, packed, action[None], torch.ones(1, T, dtype=torch.bool))
+            model.temperature, model.mix = 0.1, 0.1
+            sharp, sharp_logp = train.sample(model, b, packed, train.ABILITY_EXPLORE)
+            sharp_again = ppo.evaluate(model, packed, sharp[None], torch.ones(1, T, dtype=torch.bool))
+            del model.temperature, model.mix
         assert torch.allclose(again['logp'], logp, atol=1e-4)
+        assert torch.allclose(sharp_again['logp'], sharp_logp, atol=1e-4), 'the update scores what was sampled'
         reward = np.zeros(T, np.float32)
         reward[-1] = 1.0
         trajectories.append(dict(inputs=inputs, opp={k: inputs[k][:, ::-1].copy() for k in ppo.PRIVATE},
@@ -472,6 +478,21 @@ def test_unaffordable_cards_are_not_offered_and_held_taps_are_in_flight():
     assert not [tt for tt, c in landed if tt - C.DEPLOY_DELAY <= 160 < tt]
 
 
+def test_sharpened_log_probs_stay_normalised_and_masked():
+    inf = float('-inf')
+    lp = torch.tensor([[0.0, -1.0, inf], [inf, inf, inf]]).log_softmax(-1).nan_to_num(nan=inf)
+    assert torch.equal(train.sharpen(lp, 1.0), lp)
+    cold = train.sharpen(lp, 0.05)
+    assert torch.allclose(cold[0].exp().sum(), torch.tensor(1.0)) and cold[0, 0].exp() > 0.99 and cold[0, 2] == inf
+    assert torch.isinf(cold[1]).all(), 'nothing legal stays nothing legal'
+    raw = lp.clone().requires_grad_()
+    mixed = train.sharpen(raw, 0.1, 0.1)
+    assert torch.allclose(mixed[0].exp().sum(), torch.tensor(1.0)) and mixed[0, 2] == inf and torch.isinf(mixed[1]).all()
+    assert mixed[0, 1] >= lp[0, 1] + math.log(0.1) - 1e-6, 'every legal action keeps at least mix x its own probability'
+    mixed[0, :2].sum().backward()
+    assert torch.isfinite(raw.grad[0]).all(), 'masked entries must not turn the gradient into NaN'
+
+
 def test_a_non_finite_gradient_skips_the_step():
     w = torch.nn.Parameter(torch.ones(2))
     optimizer = torch.optim.SGD([w], lr=1.0)
@@ -520,6 +541,40 @@ def test_loop_promotes_rolls_back_and_stops(tmp_path, monkeypatch):
     assert 'v000080' in (tmp_path / 'report.md').read_text()
 
 
+def test_a_job_counts_as_ended_only_when_accounting_says_so(monkeypatch):
+    import loop
+    answers = [('JobId=1 JobState=CANCELLED Reason=None', '', True), ('JobId=1 JobState=RUNNING', '', False),
+               ('', 'slurm_load_jobs error: Invalid job id specified', True),
+               ('', 'sbatch: fatal: Unable to process configuration file', False), ('', '', False)]
+    for out, err, want in answers:
+        monkeypatch.setattr(loop.subprocess, 'run', lambda *a, **k: argparse.Namespace(stdout=out, stderr=err))
+        assert loop.ended(1) is want, (out, err)
+
+
+def test_an_exploiter_plays_only_the_main_runs_champion(tmp_path):
+    main, run = tmp_path / 'main', tmp_path / 'exploiter'
+    for d in (main, run / 'pool', run / 'league'):
+        d.mkdir(parents=True)
+    (run / 'pool' / 'v000140.pt').touch()
+    (main / 'champion.json').write_text(json.dumps(dict(name='v000120', path='/main/league/v000120.pt')))
+    s = argparse.Namespace(**ppo.DEFAULTS)
+    assert ppo.opponent_paths(run, 'il.pt', s) == {'il': 'il.pt', 'v000140': str(run / 'pool' / 'v000140.pt')}
+    s.against = str(main)
+    assert ppo.opponent_paths(run, 'il.pt', s) == {'v000120': '/main/league/v000120.pt'}
+    (main / 'champion.json').write_text(json.dumps(dict(name='v000140', path='/main/league/v000140.pt')))
+    assert ppo.opponent_paths(run, 'il.pt', s) == {'v000140': '/main/league/v000140.pt'}, 'it follows promotions'
+
+
+def test_a_server_sees_when_a_restarted_learner_changed_its_sampling_settings(tmp_path):
+    write = lambda **kw: (tmp_path / 'endpoint.json').write_text(json.dumps({'settings': kw}))  # noqa: E731
+    write(learner_temperature=0.5, lr=1e-5)
+    before = ppo.served(tmp_path)
+    write(learner_temperature=0.5, lr=2e-5)
+    assert ppo.served(tmp_path) == before, 'other settings do not restart servers'
+    write(learner_temperature=0.1, lr=2e-5)
+    assert ppo.served(tmp_path) != before
+
+
 def test_a_decision_server_holds_models_of_different_sizes(tmp_path):
     """A large run's servers also play its medium benchmarks: each LSTM size keeps its own states."""
     torch.manual_seed(0)
@@ -527,7 +582,7 @@ def test_a_decision_server_holds_models_of_different_sizes(tmp_path):
                                        core=core, attention_layers=0)
     small = train.Policy(config(8)).eval()
     torch.save(dict(config=config(8).__dict__, model=small.state_dict(), vocab=[26000000]), tmp_path / 'small.pt')
-    decider = ppo.Decider({'current': train.Policy(config(16)).eval()}, torch.device('cpu'), 16)
+    decider = ppo.Decider({'current': train.Policy(config(16)).eval()}, torch.device('cpu'), 16, frozen_temperature=0.1)
     x, _ = arrays(6, 1)
     rows = [train.pack({k: v[t] for k, v in x.items()}) for t in range(6)]
     decider.shape = ppo.layout(rows[0])
@@ -540,3 +595,5 @@ def test_a_decision_server_holds_models_of_different_sizes(tmp_path):
     assert decider.states[8][0][0, seat].abs().sum() > 0 and decider.states[16][0][0, seat].abs().sum() == 0
     decider.reset(0)
     assert all(h[0, seat].abs().sum() == 0 for h, _ in decider.states.values())
+    assert decider.models['small'].temperature == 0.1 and getattr(decider.models['current'], 'temperature', 1.0) == 1.0, \
+        'frozen models play sharpened, the learner as trained'

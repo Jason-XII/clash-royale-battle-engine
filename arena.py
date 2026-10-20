@@ -475,6 +475,9 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--unmasked_b', action='store_true', help="B samples as before PR 11 (no elixir mask)")
+    parser.add_argument('--a-temperature', type=float, default=1.0, help="A's card and tile temperature")
+    parser.add_argument('--b-temperature', type=float, default=1.0,
+                        help="B's card and tile temperature (< 1: sharper; when to play stays sampled as trained)")
     parser.add_argument('--deck', type=Path, help="A always plays this deck (JSON, as in the pool), B the pair's second deck")
     parser.add_argument('--device', default='cpu', help='where both models run (cuda: big models; processes can share a GPU)')
     args = parser.parse_args()
@@ -489,6 +492,7 @@ def main():
     deck = args.deck and json.loads(args.deck.read_text())
     models = [train.load(path, args.device)[:2] for path in (args.a, args.b)]
     models[1][0].elixir_mask = not args.unmasked_b
+    models[0][0].temperature, models[1][0].temperature = args.a_temperature, args.b_temperature
     engine = Engine(args.engine)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     results = []

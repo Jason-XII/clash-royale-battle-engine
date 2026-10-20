@@ -55,15 +55,21 @@ Don't change the code under a running job: copy the checkout for long runs.
 ## Play
 
 ```bash
-python play.py ~/cr-live/models/full-compact-20261014/latest.pt --tables ~/cr-live/models/unit_state_tables_150535029.json
+python play.py ~/cr-live/models/gen-large-v200/gen-large-v200.pt --tables ~/cr-live/models/unit_state_tables_150535029.json \
+  --temperature 0.25
 ```
+
+`--temperature` sets the card and tile temperature; when to play stays sampled as trained. Below 1 the model picks
+its preferred cards and tiles more consistently, and 0.1–0.25 has been far stronger than the default 1.0 for every
+model tested (see `docs/TRAINING.md`, section 9).
 
 It boots the visible `Pixel_9_2` emulator if needed (`-gpu host`), verifies the game library, installs the reader,
 re-applies the review-crash patch an emulator snapshot may have rolled back, and waits for a battle. Start a friendly
 battle by hand, or add `--queue` to press Battle on the ladder. `--games N` plays several. Logs go to
 `~/cr-live/runs/live` (OneDrive stalls writes). The model sees advance opponent commands from the reader's queue.
 `--losses N` plays ladder games until the N-th loss. `python winbar.py` opens a blue/red bar of the model's predicted
-win chance, (value + 1) / 2 from the policy's value head, following the newest live log.
+win chance, (value + 1) / 2 from the policy's value head, following the newest live log. That head is IL's (PPO
+doesn't train it), so the bar is a rough display: it starts near 60% for most decks.
 
 ## PPO
 
@@ -84,18 +90,42 @@ convolution layout as IL on CUDA; `learn --no-channels-last` disables it (a save
 `python build_features.py` builds optional CPython helpers for memory reads and unit features with the system C compiler;
 build once per Python/platform. They preserve the existing observation arrays. `CR_NATIVE_FEATURES=0` selects Python
 helpers at process startup. Without the extension, the Python path is used automatically.
-Half the games are self-play, the rest against the IL model or recent snapshots (`RUN/pool/`), chosen by how often
-they still beat the policy. Reward: the result (±1), a small penalty per decision at full elixir, and tower-damage
-shaping. The critic is a separate network used only in training: the policy's network (from the IL weights) plus the
+Half the games are self-play, the rest against the IL model, recent snapshots (`RUN/pool/`) or promoted champions
+(`RUN/league/`), chosen by how often they still beat the policy. Reward: the result (±1), a small penalty per decision
+at full elixir, tower-damage shaping, and an end-of-game margin term. The critic is a separate network used only in training: the policy's network (from the IL weights) plus the
 opponent's hand, next cards and ability, with a P(win) head trained on the outcome and a head for the shaping rewards.
 The first 20 updates train the critic alone. Progress goes to `RUN/metrics.jsonl` (`score`, `win_ev`, `kl_ref`,
 `games_per_hour`, ...). Rerunning the learner resumes from `RUN/latest.pt`; actors reconnect by themselves.
-`scancel --name=cr-ppo` stops everything.
+`scancel --name=cr-ppo` stops a run started as above.
+
+Settings live in `RUN/settings.json`; every default in `ppo.py`'s `DEFAULTS` is also a `learn` flag. Besides the
+reward ones (`shaping`, `margin`: the end-of-game difference in lowest tower HP):
+- `frozen_temperature`: the card/tile temperature of every frozen model (opponents, evaluation and benchmark
+  games), so they play as deployed.
+- `learner_temperature` and `learner_mix`: the temperature the learner plays at, with that share of its untempered
+  policy mixed in to keep exploring. PPO scores the log-probabilities of exactly that distribution.
+- `against`: another run's directory. The run then plays only that run's current champion: an exploiter that looks
+  for what beats it (use with `self_play` 0).
+
+### The improvement loop
+
+```bash
+cd SNAPSHOT && nohup python loop.py RUN >> RUN/logs/loop.out 2>&1 &   # on the login node: it only submits and reads
+```
+
+`RUN/loop.json` holds the jobs' sbatch commands (with `--parsable`), the benchmark models and the loop's settings
+(`LOOP_DEFAULTS` in `loop.py`). It keeps a frozen champion, which is also the KL reference. Every snapshot goes through
+a gate of evaluation games played by the collectors: promoted at ≥ 55% against the champion if its benchmark mean
+isn't more than 3 points below the champion's. Promoted champions stay in `RUN/league/` as opponents. The loop also
+resubmits jobs that ended or hung, rolls back after repeated bad gates, stops after `stall_after` gates without a
+promotion, and writes `RUN/report.md` and `RUN/loop-events.log`. To stop a loop run, kill `loop.py` first (it
+resubmits cancelled jobs), then `scancel` the job ids in `RUN/loop-state.json`.
 
 ## Arena and tests
 
 ```bash
-python arena.py A.pt B.pt --engine ~/clapha-engine --pool ~/cr-engine/data/deck_pool.json --games 20 --out runs/arena.jsonl
+python arena.py A.pt B.pt --engine ~/clapha-engine --pool ~/cr-engine/data/deck_pool.json --games 20 --out runs/arena.jsonl \
+  --a-temperature 0.1 --b-temperature 0.1   # compare models as they are deployed
 OMP_NUM_THREADS=2 python -m pytest test_pipeline.py
 ```
 

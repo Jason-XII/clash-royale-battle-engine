@@ -18,6 +18,7 @@ i.e. use --parsable). Every minute:
 """
 import getpass
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,18 @@ LOOP_DEFAULTS = dict(promote=0.55, worse=0.45, bench_drop=0.03, champion_games=4
 
 def now():
     return datetime.now().strftime('%Y-%m-%d %H:%M')
+
+
+ENDED = ('BOOT_FAIL', 'CANCELLED', 'COMPLETED', 'DEADLINE', 'FAILED', 'NODE_FAIL', 'OUT_OF_MEMORY', 'PREEMPTED',
+         'TIMEOUT')
+
+
+def ended(job):
+    """Slurm confirms the job finished: an end state, or 'Invalid job id' once it is purged (this cluster keeps no
+    accounting, so sacct is empty). Any other answer, e.g. Slurm unreachable: not ended."""
+    result = subprocess.run(['scontrol', 'show', 'job', str(job)], capture_output=True, text=True)
+    state = re.search(r'JobState=(\w+)', result.stdout)
+    return bool(state and state.group(1) in ENDED) or 'Invalid job id specified' in result.stderr + result.stdout
 
 
 class Loop:
@@ -105,6 +118,8 @@ class Loop:
         for name, command in self.cfg['jobs'].items():
             job = self.state['jobs'].get(name)
             status = queued.get(str(job), []) if job else []
+            if not status and job and not ended(job):  # missing from squeue but not ended (squeue can come back
+                continue                               # empty while Slurm's user lookup fails): never a duplicate
             if not status:
                 result = subprocess.run(command, shell=True, capture_output=True, text=True)
                 new = result.stdout.strip().split(';')[0]

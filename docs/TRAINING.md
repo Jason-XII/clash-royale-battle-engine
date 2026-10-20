@@ -2,7 +2,8 @@
 
 What we decided, measured and discussed while training: IL from human replays, then PPO from the IL model. It's
 written in order. Sections 1–5 cover the small model's PPO runs (`~/cr-ppo/runs/ppo-4`, 15–16 October), section 6
-covers scaling up to the medium IL model, and section 7 covers PPO from it (`~/cr-ppo/runs/ppo-m1`, the current run).
+covers scaling up to the medium IL model, and section 7 covers PPO from it (`~/cr-ppo/runs/ppo-m1`). Sections 8 and
+9 cover the current run, gen-large, under the improvement loop, and the deployment-temperature finding.
 How to run each script is in `README.md`, and the live client's integration is in `GAME_INTEGRATION.md`.
 
 ## 1. The run
@@ -46,7 +47,7 @@ ssh cluster 'tail -f ~/cr-ppo/runs/ppo-4/metrics.jsonl' | jq -c '{v:.version, gp
 - `win_ev_late`: the same over the last quarter of each game. ~0.6 now. A sudden drop means the critic broke.
 
 **Policy update**
-- `kl_ref`: distance from the IL model.
+- `kl_ref`: distance from the KL reference: the IL model in the early runs, the current champion in gen-large.
 - `approx_kl` / `clip_frac`: step size per update; ~0.002–0.01 / 0.01–0.1 is normal.
 - `entropy`: falling fast = becoming too deterministic.
 
@@ -171,6 +172,9 @@ important item:
 
 - **Result: search wins 68% ± 7%** (108–50 over 158 games) against the plain policy, with about twice the crowns
   (1.11 vs 0.51 per game). It changed the policy's tile in ~52% of its card plays. No failures.
+- Read again on 20 October: the plain policy here sampled at temperature 1. Sharpening alone (temperature 0.1, no
+  search) wins ~68% against the same policy at temperature 1 (section 9), so this result doesn't show that search
+  adds anything beyond picking the policy's preferred tiles. Search vs the sharpened policy is the test that would.
 
 **Step 3 attempt (16 October): distilling search into the network — collapsed, rolled back**
 - Collectors searched 20% of the learning seats' card plays (~8 searches and ~6.4 labels per game). The tile head
@@ -303,15 +307,21 @@ paired-fork test (19 October) also showed that full-game fork labels are about a
   3 points below the champion's.
 - A promoted champion becomes the new KL reference and a permanent league opponent.
 - **Rollback** to the champion's full checkpoint after two gates below 45% or a collapsed policy (entropy < 0.05);
-  **stop** after 10 gates without a promotion, or 72 h. A minibatch whose gradient is not finite is skipped.
+  **stop** after `stall_after` gates without a promotion (10 at first; raised to 14, then 17, to give each
+  setting change a fair trial), or 72 h. A minibatch whose gradient is not finite is skipped.
 - Jobs that end or hang are resubmitted; `RUN/report.md` is rewritten every minute.
 
 **Setup.** Large IL policy (8.0M) and critic (its own copy); batch 1024, lr 3e-5, one epoch, minibatch 4, critic
 2 epochs, KL weight 0.01, λ 0.99, margin 0.2, critic warm-up 10 updates. Learner 4 A100, actors 50 collectors and 4
 decision servers on 4 RTX 5090 (the QoS allows 16 CPUs per partition).
 
-**Throughput.** ~17k trained games/h once the policy learns (critic warm-up: ~19-20k). Both sides are near their
-limits: the actors are CPU-bound at 16 CPUs, the learner takes ~240 s per 2048 trajectories.
+**Throughput.** ~17k trained games/h at first (critic warm-up: ~19–20k), ~14k by 20 October (games got longer:
+~760 → ~890 decisions per seat). The learner and actors are balanced outside gates; during a gate the evaluation
+games take actor time and the learner waits.
+
+**Promotions (19 October).** v20 (66.2% vs IL), v40 (67.4%), v60 (62.9%), v120 (58.0%) and v200 (57.2%, 22:57).
+Benchmark mean: IL 36.3% → v60 71.3% → v200 72.4%. v80, v100 and v140–v180 were kept (v100 beat v60 58.6% but fell
+3.6 points on the benchmarks).
 
 **First results (19 October).**
 - The first gate found a serving bug: the decision servers kept one LSTM-state tensor sized for the large model, so
@@ -319,3 +329,53 @@ limits: the actors are CPU-bound at 16 CPUs, the learner takes ~240 s per 2048 t
 - **v20 promoted** after 10 policy updates: 66.2% against the large IL model over 447 games; benchmark mean 51.8%
   against IL's 36.3% (medium IL 79.9%, ppo-m1 v400 34.4%, E-Barbs specialist v1100 41.2%).
 - Large IL itself scores only ~20% against ppo-m1 v400, so beating v400 is the next milestone.
+
+## 9. Deployment temperature, and the plateau after v200 (19–20 October)
+
+**The finding.** The policy picks a card and then a tile from softmax distributions. Played at a lower temperature
+for those two choices (0.1–0.25: almost always its preferred card and tile), every model is far stronger. When to
+play stays sampled as trained. The user found this live:
+
+| Model | Temperature | Live result |
+|---|---|---|
+| v120 | 1 | 2–3 (league 5) |
+| v120 | 0.25 | 14–4–1, reaching league 6 |
+| v200 | 0.25 | 20–0 on Trophy Road; 9–4–1 in league 6 |
+| v200 | 0.1 | 4–2 in league 6 (6 games) |
+
+The simulator agrees (paired arenas, 60–200 games each):
+- v120 against the large IL model: 87–88% with IL at temperature 1, 62–69% with IL at 0.1. Sharpening alone makes
+  IL much stronger, so much of PPO's apparent gain over IL was sharpening.
+- v120 at 0.5 / 0.25 / 0.1 against itself at 1: 66.3% / 55.7% / 68.5%.
+- The user's bar, ≥ 75% against ppo-m1 v400: v120 at 0.1 scores 69.0 ± 3.3% against v400 at 1, and 55.0 ± 3.5%
+  against v400 also at 0.1.
+
+Why: the IL policy imitates many players, and its preferred choice is better than a random draw from its spread.
+PPO's small steps (approx_kl ~0.002 per update) barely narrow that spread, and an entropy bonus keeps it. Systems
+like AlphaZero likewise play their best move at test time, not a sample.
+
+**What changed in training.**
+- 19 October 23:32: `frozen_temperature` 0.1. Opponents, gates and benchmarks play sharpened, so a gate measures
+  deployed strength. The earlier gates (at temperature 1) are kept in `evals-T1.jsonl`.
+- 20 October 07:30: `learner_temperature` 0.5. The learner samples at 0.5 and PPO scores log-probabilities at 0.5.
+  Three gates, all ~50% against v200: no effect.
+- 20 October 13:49: `learner_temperature` 0.1 with `learner_mix` 0.1. The learner plays as deployed, except that
+  10% of its untempered policy is mixed in so it still tries alternatives, and PPO scores that mixture exactly. The
+  critic then also values the policy that is deployed.
+
+**The plateau.** From v220 to v380, nine gates were all within 47–53% of v200, with benchmark means of 67–74%
+(v200: 70.3%). PPO kept changing the sampled policy (kl_ref to v200 grew to 0.035), but not the top choices that a
+sharpened policy plays. Training the deployed policy directly (13:49) is the response; the next gates decide it.
+
+**Exploiter.** `gen-exploit` trains only against gen-large's current champion (`against`). Over ~400 updates its
+score against v200 rose from −0.47 to about −0.22, while it samples at 0.5 against a champion at 0.1. It has found
+no holes yet. Its snapshots would join gen-large's league only if it did.
+
+**Hero ability.** The model presses its ability ~0.04% of the times one is ready, while humans press ~1%. The press
+works in the simulator and live, but neither pressing as soon as ready (36% against the plain model) nor at the IL
+model's timing (48.7%) did better, so this was set aside. Open: the 1% exploration floor on presses
+(`ABILITY_EXPLORE`) adds random presses to training and gate games.
+
+**Next, if the gates stay flat.** Test whether search beats the sharpened policy, before building search
+distillation (section 5); a stronger critic (`win_ev` has stayed ~0.3); exploiter snapshots in the league once the
+exploiter finds holes.
