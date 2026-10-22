@@ -174,6 +174,9 @@ class Engine:
                           str(clapha / 'data' / 'assets'))
         self.state, self.generation, self.sequence, self.pending = None, 0, 0, []
         self.expired = 0  # accepted plays that never landed (held too long, or the card gone): should stay ~0
+        # per owner (22 Oct): may tap another card while one is in flight, as humans do (5.7% of their plays come
+        # <= 20 ticks after the previous one); its cost is reserved from the elixir the pending plays haven't paid yet
+        self.overlap = [False, False]
 
     def reset(self, seed=1, match=None):
         if match is None:
@@ -192,13 +195,17 @@ class Engine:
         """Plays decided on the current state land `delay` ticks later (live: common.DEPLOY_DELAY), or on the
         next tick with delay=0; `delay` = a tuple of choices: each play draws its own (PLAY_DELAY, as live). As the live client does (C.HOLD_TICKS), a play the elixir cannot pay for yet is held
         until it can, for at most C.HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
-        for within that is refused. As live does, a player with a play in flight cannot start another.
+        for within that is refused. As live does, a player with a play in flight cannot start another (unless
+        self.overlap[owner]: 22 Oct).
         `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
         before = self.state
         self.played = []  # confirmed card consumption this step, with exact tick and commanded position
         executed = []
         for a in actions:
-            free = all(p['owner'] != a.owner for p in self.pending)
+            mine = [p for p in self.pending if p['owner'] == a.owner]
+            free = not mine or (self.overlap[a.owner] and a.slot != ABILITY and
+                                all(p['slot'] != a.slot and not p['held'] for p in mine))
+            reserved = sum(p['cost'] for p in mine) * 10000
             lag = max(delay if isinstance(delay, int) else random.choice(delay), 1)
             due = before.tick + lag
             if a.slot == ABILITY:  # a tap on the ability button: lands like a card, if a carrier is still ready then
@@ -209,9 +216,9 @@ class Engine:
                 continue
             me = before.players[a.owner]
             card = next((h for h in me.hand if h.slot == a.slot), None)
-            ok = card is not None and free and card.cost * 10000 <= me.elixir + C.hold_slack(before.tick)
+            ok = card is not None and free and card.cost * 10000 <= me.elixir - reserved + C.hold_slack(before.tick)
             if ok:
-                self.pending.append(dict(due=due, tap=before.tick, delay=lag, held=card.cost * 10000 > me.elixir,
+                self.pending.append(dict(due=due, tap=before.tick, delay=lag, held=card.cost * 10000 > me.elixir - reserved,
                                          hold_until=before.tick + C.HOLD_TICKS, owner=a.owner, slot=a.slot,
                                          card=card.card, cost=card.cost, x=a.x, y=a.y))
             executed.append(ok)
@@ -439,9 +446,10 @@ def make_match(pair, seed):
     return match
 
 
-def evaluate(engine, models, pair, seed, a_owner, device='cpu'):
+def evaluate(engine, models, pair, seed, a_owner, device='cpu', a_overlap=False):
     match = make_match(pair, seed)
     state = engine.reset(match=match)
+    engine.overlap = [a_overlap and owner == a_owner for owner in (0, 1)]
     seats = [0 if owner == a_owner else 1 for owner in (0, 1)]
     agents = [train.Agent(models[index][0], owner, device) for owner, index in enumerate(seats)]
     inputs = Inputs(engine, match, {owner: models[index][1] for owner, index in enumerate(seats)}, C.cached_legal())
@@ -480,6 +488,7 @@ def main():
                         help="B's card and tile temperature (< 1: sharper; when to play stays sampled as trained)")
     parser.add_argument('--deck', type=Path, help="A always plays this deck (JSON, as in the pool), B the pair's second deck")
     parser.add_argument('--device', default='cpu', help='where both models run (cuda: big models; processes can share a GPU)')
+    parser.add_argument('--a-overlap', action='store_true', help='A may tap a card while another is still in flight')
     args = parser.parse_args()
     if args.games < 2 or args.games % 2:
         parser.error('games must be positive and even for paired seats')
@@ -502,7 +511,8 @@ def main():
                 pair = pool[index]
                 if deck:
                     pair = dict(pair, decks=[deck, pair['decks'][1]][::1 if seat == 0 else -1])
-                result = dict(game=len(results), **evaluate(engine, models, pair, args.seed + pair_index, seat, args.device))
+                result = dict(game=len(results), **evaluate(engine, models, pair, args.seed + pair_index, seat, args.device,
+                                                               args.a_overlap))
                 results.append(result)
                 stream.write(json.dumps(result) + '\n')
                 stream.flush()

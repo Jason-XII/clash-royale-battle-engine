@@ -184,12 +184,50 @@ def test_training_runs_resumes_and_loads_for_play(tmp_path, monkeypatch):
     assert action[0] in ('wait', 'card', 'ability')
 
 
-def test_packed_inputs_and_ppo_update(tmp_path, monkeypatch):
+@pytest.mark.parametrize('option', [{}, dict(res_blocks=1), dict(flight_grid=1), dict(tile_blocks=2),
+                                    dict(board=2, board_rows=4, board_cols=3), dict(res_blocks=1, tile_blocks=1, res_norm=0),
+                                    dict(attention_layers=2, dist_bias=1), dict(card_stats=3)])
+def test_architecture_options_train_and_the_default_is_unchanged(tmp_path, monkeypatch, option):
+    root = dataset(tmp_path / 'data', monkeypatch)
+    entries = json.loads((root / 'manifest.json').read_text())['entries']
+    xs, ts = train.collate(list(train.Games(root, entries, 6, 0, validation=True))[:3])
+    torch.manual_seed(0)
+    config = dict(vocab_size=len(C.Vocab([26000000])), card_dim=4, object_dim=8, conv_channels=8, conv_layers=4, core=8, attention_layers=0)
+    stats = torch.rand(config['vocab_size'], option['card_stats']) if option.get('card_stats') else None
+    model = train.Policy(train.Config(**{**config, **option}), card_table=stats)
+    if option.get('card_stats'):  # starts as the plain embedding; a checkpoint carries its table
+        assert torch.equal(model.card(torch.tensor([0, 2])), model.card.weight[[0, 2]])
+        fresh = train.Policy(train.Config(**{**config, **option}))  # as train.load builds it
+        fresh.load_state_dict(model.state_dict())
+        assert torch.equal(fresh.card.table, stats)
+    if not option:  # the parameters every saved checkpoint has: no new keys, same shapes
+        old = {'convs.0.weight', 'convs.3.weight', 'tile.weight', 'film.weight', 'lstm.weight_ih_l0'}
+        assert old <= set(model.state_dict()) and not any(k.split('.')[0] in ('blocks', 'tower_out', 'flight', 'tile_blocks')
+                                                         for k in model.state_dict())
+    xs['own_flight_card'][:, :2], xs['own_flight_float'][:, :2, :2] = 1, 0.5  # something in flight
+    for k in C.OBJECT_KEYS:  # a second object 9 tiles away (the toy games have one), so attention has a choice
+        xs[k] = torch.cat([xs[k], xs[k]], 2)
+    xs['obj_float'][:, :, 1, 0] += 0.5
+    loss, m = train.loss_and_metrics(model, xs, ts, 0.5, 0.5)
+    loss.backward()
+    assert math.isfinite(loss.item()) and all(torch.isfinite(q.grad).all() for q in model.parameters() if q.grad is not None)
+    if option.get('flight_grid'):
+        assert model.flight[0].weight.grad.abs().sum() > 0, 'plays in flight reach the board'
+    if option.get('res_norm') == 0:
+        assert all(b.gate.grad.abs() > 0 for b in [*model.blocks, *model.tile_blocks]), 'the gates learn'
+    if option.get('dist_bias'):
+        assert model.dist_bias.weight.grad.abs().sum() > 0, 'the distance bias learns'
+    if option.get('card_stats'):
+        assert model.card.stat.weight.grad.abs().sum() > 0, 'the stats reach the network'
+
+
+@pytest.mark.parametrize('option', [dict(conv_channels=4, conv_layers=1),
+                                    dict(conv_channels=8, conv_layers=2, res_blocks=1, tile_blocks=1)])  # 21 Oct network
+def test_packed_inputs_and_ppo_update(tmp_path, monkeypatch, option):
     root = dataset(tmp_path / 'data', monkeypatch)
     vocab = C.Vocab([26000000])
     torch.manual_seed(0)
-    model = train.Policy(train.Config(vocab_size=len(vocab), card_dim=4, object_dim=4, conv_channels=4, conv_layers=1,
-                                      core=8, attention_layers=0))
+    model = train.Policy(train.Config(vocab_size=len(vocab), card_dim=4, object_dim=4, core=8, attention_layers=0, **option))
     trajectories = []
     for entry in json.loads((root / 'manifest.json').read_text())['entries']:
         x, _ = next(train.chunks(train.read(root / entry['file'], entry['owner']), 300, True, None))
@@ -292,8 +330,8 @@ def test_actor_learner_link_and_shaping(tmp_path):
     start = ppo.tower_hp(full)
     hit = SimpleNamespace(crowns=(1, 0), entities=(tower(1, 0, 50), tower(3, 1, 100, 9000)))  # theirs gone, king half
     assert ppo.potential(full, start, 0) == 0
-    assert ppo.potential(hit, start, 0) == pytest.approx(1 + 1 + 1.5 - 0.5)
-    assert ppo.potential(hit, start, 1) == pytest.approx(-3.0)
+    assert ppo.potential(hit, start, 0) == pytest.approx(1 + 1 + ppo.KING_WEIGHT * 0.5 - 0.5)
+    assert ppo.potential(hit, start, 1) == pytest.approx(-(1 + 1 + ppo.KING_WEIGHT * 0.5 - 0.5))
     assert ppo.margin(hit, start, 0) == pytest.approx(0.5 - 0.0) and ppo.margin(hit, start, 1) == pytest.approx(-0.5)
     assert ppo.margin(full, start, 0) == 0
 
@@ -485,6 +523,8 @@ def test_sharpened_log_probs_stay_normalised_and_masked():
     cold = train.sharpen(lp, 0.05)
     assert torch.allclose(cold[0].exp().sum(), torch.tensor(1.0)) and cold[0, 0].exp() > 0.99 and cold[0, 2] == inf
     assert torch.isinf(cold[1]).all(), 'nothing legal stays nothing legal'
+    greedy = train.sharpen(lp, 0)
+    assert greedy[0, 0] == 0 and torch.isinf(greedy[0, 1:]).all() and torch.isinf(greedy[1]).all(), 'T 0 = the best legal choice'
     raw = lp.clone().requires_grad_()
     mixed = train.sharpen(raw, 0.1, 0.1)
     assert torch.allclose(mixed[0].exp().sum(), torch.tensor(1.0)) and mixed[0, 2] == inf and torch.isinf(mixed[1]).all()

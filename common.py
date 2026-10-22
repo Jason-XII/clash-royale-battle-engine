@@ -136,6 +136,17 @@ def effect_matrix(vocab):
     return m
 
 
+def card_matrix(vocab):
+    """[len(vocab), fields]: each card's and unit's fixed stats (assets/card_stats.json, from the build's logic tables
+    by card_stats.py; zeros for ids without stats), for the model's --card_stats input."""
+    table = json.loads((ASSETS / 'card_stats.json').read_text())
+    m = np.zeros((len(vocab), len(table['fields'])), np.float32)
+    for gid, v in table['stats'].items():
+        if vocab(int(gid)) > 1:
+            m[vocab(int(gid))] = v
+    return m
+
+
 # ---- one decision's inputs ---------------------------------------------------------------------------------------------
 def _clip(v, lo, hi):
     return min(max(v, lo), hi)  # np.clip on one Python float costs ~10 us; this is the same double

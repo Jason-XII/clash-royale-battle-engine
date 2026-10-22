@@ -13,8 +13,9 @@ RUN/latest.pt with RUN/settings.json; actors reconnect by themselves.
 
 Opponents: self-play (--self-play of the games, both seats learn) or a frozen one by PFSP, weight (1 - win rate)^2 + 0.05,
 over the IL model and the --pool-size latest snapshots. Reward: +1 win / -1 loss, -OVERFLOW_PENALTY per decision at full
-elixir, -REFUSED_PENALTY per play the engine refuses, and FirstLight's tower shaping, shaping * (gamma * potential' -
-potential), the potential being crowns plus lost tower hp fractions (king x3), theirs minus ours, and 0 once the game ends
+elixir when enemy troops are on the board (no penalty on a quiet board: avoids panic deploys), -REFUSED_PENALTY per play
+the engine refuses, and tower shaping, shaping * (gamma * potential' - potential), the potential being crowns plus lost
+tower hp fractions (all towers weighted equally), theirs minus ours, and 0 once the game ends
 (no bonus for a fast win). At the end, + margin x (our lowest tower's hp fraction - theirs; a destroyed tower is 0):
 a close loss is worth more than a 3-crown one, and a draw is no longer flat.
 
@@ -65,7 +66,7 @@ import torch.nn.functional as F
 import common as C
 import train as policy  # the inference helpers live in train.py
 
-KING_WEIGHT = 3.0  # the king tower's share of the shaping potential (FirstLight)
+KING_WEIGHT = 1.0  # ponytail: was 3.0 (FirstLight); 1x because king tower activation is a real tactic
 OVERFLOW_PENALTY = 0.002
 # Per play the engine refuses. 0 since refused plays are masked out (train.playable: unaffordable within the hold) and a
 # held tap counts as in flight from the tap (PlayerView): what is left are rare mismatches, counted in refused_per_game.
@@ -522,7 +523,9 @@ def collector(index, run, addresses, key, affinity=False):
                     seat.action.append(a)
                     seat.logp.append(lp)
                     seat.value.append(v)
-                    seat.reward.append(-OVERFLOW_PENALTY * (state.players[o].elixir >= 100000))
+                    # ponytail: no overflow penalty when the board is quiet (no enemy troops) — avoids panic deploys like Golem at the back
+                    enemy_on_board = any(e.owner != o and e.card != -1 for e in state.entities)
+                    seat.reward.append(-OVERFLOW_PENALTY * (state.players[o].elixir >= 100000) * enemy_on_board)
                 choice = policy.decode(a, o)
                 if choice[0] == 'ability':
                     plays.append(Play(o, ABILITY, 0, 0))
@@ -1045,7 +1048,7 @@ def opponent_paths(out, init, s):
 
 def convolution_layout(model):
     """Match IL's convolution layout on CUDA; keep the fp32 tile head unchanged."""
-    for conv in model.convs:
+    for conv in [*model.convs, *(c for b in getattr(model, 'blocks', ()) for c in (b.c1, b.c2))]:  # + residual blocks
         conv.to(memory_format=torch.channels_last)
     model.convs[0].register_forward_pre_hook(
         lambda m, a: (a[0].contiguous(memory_format=torch.channels_last),))
@@ -1084,6 +1087,8 @@ def learn(args, settings):
             reference.load_state_dict(latest['reference'])
         version, rolled = latest['version'], latest.get('rollback')
         fresh = version - ADAM_WARMUP  # its Adam moments are back: no warm-up
+    elif args.critic_weights:  # a new run with a trained critic (critic_offline.py's latest.pt: same network as the trunk)
+        critic.load_state_dict(torch.load(args.critic_weights, map_location='cpu', weights_only=False)['critic'])
     model.train()
     if cuda and s.channels_last:
         for trunk in (model, reference, critic.trunk):
@@ -1267,6 +1272,7 @@ def main():
     p.add_argument('--init', type=Path, required=True, help='the IL checkpoint: start, KL reference, frozen opponent')
     p.add_argument('--reference', type=Path, help='the KL reference instead of --init (e.g. a recent snapshot)')
     p.add_argument('--critic-init', type=Path, help="the critic's network instead of --init's (e.g. a bigger IL model)")
+    p.add_argument('--critic-weights', type=Path, help="a new run's critic weights ({'critic': ...}, e.g. critic_offline.py's)")
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--engine', type=Path, required=True, help='the clapha-engine checkout')
     p.add_argument('--pool', type=Path, required=True, help='deck pairs as played (arena.py --pool)')

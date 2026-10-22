@@ -46,6 +46,25 @@ checks. The tile scores are computed in fp32 even under bf16: they drift togethe
 rounds neighbouring tiles to the same score. `--final_lr 0.1` decays the learning rate linearly to a tenth by the last
 step (default: constant). The medium model (3.4M parameters, ~12 steps/s on 3 A100s; ahead of the default 1.26M model
 at every step): `--card_dim 64 --object_dim 96 --attention_layers 3 --conv_channels 96 --conv_layers 6 --core 384`.
+The large model (8.0M, v200's network): `--card_dim 64 --object_dim 160 --attention_layers 6 --conv_channels 160
+--conv_layers 12 --core 448 --board 32 --epochs 4.5 --final_lr 0.1 --warmup 2000`.
+
+Architecture options, all off by default so every saved checkpoint loads unchanged (results in
+[docs/TRAINING.md](docs/TRAINING.md), section 11):
+- `--res_blocks 1`: the board network becomes a stem conv plus `conv_layers / 2` pre-activation residual blocks.
+- `--tile_blocks N`: residual blocks in the tile head, after the card conditioning.
+- `--res_norm 0`: residual blocks without GroupNorm. It trains faster, but the loss is worse.
+- `--dist_bias 1`: object attention biased by the distance between objects. It helps a little but trains ~25% slower.
+- `--flight_grid 1` (plays in flight drawn on the board) and `--board_rows / --board_cols` (the coarse map): no gain.
+- `--card_stats 1`: every card and unit id also gets its fixed stats from the game data (range, targets, hitpoints,
+  damage, speed, splash, ...: `assets/card_stats.json`, 28 fields), through a learned map added to its embedding.
+  -0.037 held-out loss in the 30k-game ablation (section 12). Rebuild the table for a new game build with
+  `python card_stats.py CSV_LOGIC assets/vocab.json assets/replay_cards.json UNIT_STATE_TABLES.json assets/card_stats.json`
+  (`CSV_LOGIC`: the build's `data/assets/csv_logic`; the unit-state tables name the units' data ids).
+- `--max_train N --max_val N`: random subsets of the games, for ablations.
+
+The candidate to replace the large model has about 3x less compute per decision and a lower held-out loss: the large
+flags with `--conv_channels 96 --conv_layers 8 --res_blocks 1 --tile_blocks 1`.
 
 `latest.pt` is saved every 1,000 steps. Running the same command again resumes it with the settings in
 `settings.json`, so a job killed at its time limit loses at most 1,000 steps. A resumed run shuffles the data afresh
@@ -115,7 +134,7 @@ cd SNAPSHOT && nohup python loop.py RUN >> RUN/logs/loop.out 2>&1 &   # on the l
 
 `RUN/loop.json` holds the jobs' sbatch commands (with `--parsable`), the benchmark models and the loop's settings
 (`LOOP_DEFAULTS` in `loop.py`). It keeps a frozen champion, which is also the KL reference. Every snapshot goes through
-a gate of evaluation games played by the collectors: promoted at ≥ 55% against the champion if its benchmark mean
+a gate of evaluation games played by the collectors: promoted at ≥ `promote` (default 55%) against the champion if its benchmark mean
 isn't more than 3 points below the champion's. Promoted champions stay in `RUN/league/` as opponents. The loop also
 resubmits jobs that ended or hung, rolls back after repeated bad gates, stops after `stall_after` gates without a
 promotion, and writes `RUN/report.md` and `RUN/loop-events.log`. To stop a loop run, kill `loop.py` first (it
@@ -126,6 +145,7 @@ resubmits cancelled jobs), then `scancel` the job ids in `RUN/loop-state.json`.
 ```bash
 python arena.py A.pt B.pt --engine ~/clapha-engine --pool ~/cr-engine/data/deck_pool.json --games 20 --out runs/arena.jsonl \
   --a-temperature 0.1 --b-temperature 0.1   # compare models as they are deployed
+# --a-overlap: A may tap a card while another of its plays is still in flight (humans do; off everywhere by default)
 OMP_NUM_THREADS=2 python -m pytest test_pipeline.py
 ```
 
