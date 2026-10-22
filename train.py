@@ -358,12 +358,32 @@ def chunks(data, chunk, validation, rng):
         yield x, t
 
 
+ABILITY_SHIFT = 4  # decisions (20 ticks)
+
+
+def ability_labels(data):
+    """--ability_labels 1 (22 Oct): each human ability press moves to the decision ~22 ticks before it executes, where
+    card plays are labelled too (convert.py put presses at their execution tick: ~1.1 s late, while the arena and live
+    delay a press like a card), and to the controller that is ready there when only the other one is (convert.py
+    labelled every press controller 1: 42% of the presses in two-hero decks were dropped as not ready). A press whose
+    button lit up only after that decision (7.8%: pressed the moment it was ready) goes to the first decision it is ready."""
+    what, ready = data['t_what'].copy(), data['x_ability'][:, :, 1] > 0
+    for i in np.flatnonzero(what >= ABILITY1):
+        k = what[i] - ABILITY1
+        what[i] = WAIT
+        j = next((j for j in range(max(0, i - ABILITY_SHIFT), i + 1) if what[j] == WAIT and ready[j].any()), None)
+        if j is not None:  # else no ready decision without a card play since the tap: dropped, as the loss would
+            what[j] = ABILITY1 + (k if ready[j, k] else 1 - k)
+    data['t_what'] = what
+    return data
+
+
 class Games(torch.utils.data.IterableDataset):
     """The player views of a dataset in a seeded random order (validation: in order), split over ranks and workers."""
 
-    def __init__(self, root, entries, chunk, seed, validation=False, rank=0, world=1):
+    def __init__(self, root, entries, chunk, seed, validation=False, rank=0, world=1, fix_abilities=False):
         self.root, self.entries, self.chunk, self.seed = Path(root), entries, chunk, seed
-        self.validation, self.rank, self.world = validation, rank, world
+        self.validation, self.rank, self.world, self.fix_abilities = validation, rank, world, fix_abilities
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
@@ -374,7 +394,8 @@ class Games(torch.utils.data.IterableDataset):
             rng.shuffle(entries)
         rng = random.Random(self.seed * 1000 + self.rank * nw + wid)
         for e in entries[self.rank * nw + wid::self.world * nw]:
-            yield from chunks(read(self.root / e['file'], e['owner']), self.chunk, self.validation, rng)
+            data = read(self.root / e['file'], e['owner'])
+            yield from chunks(ability_labels(data) if self.fix_abilities else data, self.chunk, self.validation, rng)
 
 
 def collate(items):
@@ -399,13 +420,28 @@ def collate(items):
 DEFAULTS = dict(epochs=4.0, batch=32, chunk=128, workers=4, lr=3e-4, final_lr=1.0, weight_decay=0.01, warmup=500, value_coef=0.5,
                 next_play=0.5, card_dim=32, object_dim=32, attention_layers=1, conv_channels=48, conv_layers=4, core=256, board=0,
                 res_blocks=0, flight_grid=0, tile_blocks=0, board_rows=8, board_cols=4, res_norm=1, dist_bias=0,
-                card_stats=0, max_train=0, max_val=0,
+                card_stats=0, ability_labels=0, max_train=0, max_val=0,
                 seed=0, log_every=50, checkpoint_every=1000, device='cuda')
 # final_lr: the learning rate falls linearly to lr x final_lr by the last step (1.0 = constant)
 # medium model (3.4M, 2026-10-16): --card_dim 64 --object_dim 96 --attention_layers 3 --conv_channels 96 --conv_layers 6
 # --core 384
 # large model (8.0M, 2026-10-18): --card_dim 64 --object_dim 160 --attention_layers 6 --conv_channels 160 --conv_layers 12
 # --core 448 --board 32
+
+
+def lockstep(batches, device, world):
+    """`batches` while every rank still has one: the ranks step together, and a pass ends for all when one rank's share
+    runs out (the rest of the others' shares is skipped this pass). One tiny all-reduce a step. (DDP's Join let a rank
+    that ran out skip optimizer steps: only the weights are re-synced when Join ends, its Adam moments stayed behind.)"""
+    for item in batches:
+        if world > 1:
+            more = torch.ones((), device=device)
+            dist.all_reduce(more, op=dist.ReduceOp.MIN)
+            if not more:
+                return
+        yield item
+    if world > 1:  # out of batches: tell the others, at the same step
+        dist.all_reduce(torch.zeros((), device=device), op=dist.ReduceOp.MIN)
 
 
 def train(data, out, settings):
@@ -471,7 +507,8 @@ def train(data, out, settings):
             tmp.replace(out / 'latest.pt')
 
     def loader(entries, seed, validation=False, rank=0, world=1):
-        return torch.utils.data.DataLoader(Games(data, entries, settings['chunk'], seed, validation, rank, world),
+        return torch.utils.data.DataLoader(Games(data, entries, settings['chunk'], seed, validation, rank, world,
+                                                 bool(settings.get('ability_labels'))),
                                            batch_size=batch, num_workers=settings['workers'], collate_fn=collate,
                                            pin_memory=cuda)
 
@@ -490,33 +527,32 @@ def train(data, out, settings):
     started, window = time.monotonic(), []
     while step < total:
         # a pass over the data; a resumed run starts a fresh order (seeded by the step it resumes at)
-        with nn.parallel.distributed.Join([objective]) if world > 1 else nullcontext():
-            for xs, ts in loader(train_entries, settings['seed'] * 1_000_003 + step, rank=rank, world=world):
-                xs, ts = ({k: v.to(device, non_blocking=True) for k, v in g.items()} for g in (xs, ts))
-                for group in optimizer.param_groups:
-                    group['lr'] = settings['lr'] * min(1.0, (step + 1) / max(1, settings['warmup'])) * \
-                        (1 - (1 - settings.get('final_lr', 1.0)) * step / total)
-                optimizer.zero_grad(set_to_none=True)
-                with autocast():
-                    loss, metrics = objective(xs, ts)
-                if not math.isfinite(metrics['loss']):
-                    raise FloatingPointError(f'nonfinite loss at step {step}; latest.pt is unchanged')
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                optimizer.step()
-                step += 1
-                window.append(metrics)
-                if rank == 0 and step % settings['log_every'] == 0:
-                    write(dict(step=step, split='train', seconds=round(time.monotonic() - started), **summarize(window)))
-                    window = []
-                if step % settings['checkpoint_every'] == 0:
-                    checkpoint()
-                if step >= total:
-                    break
-        if world > 1:  # a rank whose share ran out first joined early (Join kept its model in sync, not its count)
-            count = torch.tensor(step, device=device)
-            dist.all_reduce(count, op=dist.ReduceOp.MAX)
-            step = int(count)
+        begun = step
+        for xs, ts in lockstep(loader(train_entries, settings['seed'] * 1_000_003 + step, rank=rank, world=world),
+                               device, world):
+            xs, ts = ({k: v.to(device, non_blocking=True) for k, v in g.items()} for g in (xs, ts))
+            for group in optimizer.param_groups:
+                group['lr'] = settings['lr'] * min(1.0, (step + 1) / max(1, settings['warmup'])) * \
+                    (1 - (1 - settings.get('final_lr', 1.0)) * step / total)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast():
+                loss, metrics = objective(xs, ts)
+            if not math.isfinite(metrics['loss']):
+                raise FloatingPointError(f'nonfinite loss at step {step}; latest.pt is unchanged')
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            step += 1
+            window.append(metrics)
+            if rank == 0 and step % settings['log_every'] == 0:
+                write(dict(step=step, split='train', seconds=round(time.monotonic() - started), **summarize(window)))
+                window = []
+            if step % settings['checkpoint_every'] == 0:
+                checkpoint()
+            if step >= total:
+                break
+        if step == begun:  # else this loop would never end
+            raise RuntimeError('a pass made no step: some rank has no training data')
         checkpoint()
         validate()
     if world > 1:
@@ -593,15 +629,16 @@ def _log_softmax(logits):
     return safe.masked_fill(~torch.isfinite(logits), float('-inf'))
 
 
-def what_logp(what, x, explore=0.0, which=None):
-    """log p(what) [N, 4]: only waiting while a play of ours is in flight, and P(ability) >= explore while one is ready.
+def what_logp(what, x, explore=0.0, which=None, overlap=False):
+    """log p(what) [N, 4]: only waiting while a play of ours is in flight (overlap: only no ability press, as
+    arena.Engine.overlap allows another card), and P(ability) >= explore while one is ready.
     With `which` (the card head's logits): a play of a card the client would refuse (not playable()) becomes a wait, as it
     does live, instead of moving to the cards it can pay for; p(play, card) of every playable card is unchanged."""
-    busy = (x['own_flight_card'] > 0).unsqueeze(-1) & (torch.arange(4, device=what.device) != WAIT)
+    busy = (x['own_flight_card'] > 0).unsqueeze(-1) & (torch.arange(4, device=what.device) >= (ABILITY1 if overlap else PLAY))
     logp = _log_softmax(what.float().masked_fill(busy, float('-inf')))
     if which is not None and 'scalars' in x:
         base = _log_softmax(which.float().masked_fill(~x['legal'].flatten(2).any(-1), float('-inf')))
-        ok = playable(x)  # log P(a playable card | play); -1e9, not -inf, inside: logsumexp's gradient over all -inf is NaN
+        ok = playable(x, overlap)  # log P(a playable card | play); -1e9, not -inf, inside: logsumexp's gradient over all -inf is NaN
         keep = torch.where(ok.any(-1), base.masked_fill(~ok, -1e9).logsumexp(-1), float('-inf'))
         lost = logp[:, PLAY] + (-torch.expm1(keep)).clamp(min=1e-30).log()  # log P(play, then a refused card)
         logp = torch.cat([torch.logaddexp(logp[:, WAIT], lost)[:, None], (logp[:, PLAY] + keep)[:, None],
@@ -619,24 +656,29 @@ def what_logp(what, x, explore=0.0, which=None):
 HOLD_ELIXIR = C.HOLD_TICKS / 56  # elixir regenerated during the client's hold at 1x (C.REGEN: 1 per 56 ticks)
 
 
-def playable(x):
+def playable(x, overlap=False):
     """[N, 4]: hand slots the client would play now: a legal tile, and the cost paid within the client's hold
     (C.HOLD_TICKS; a tap still short after it is refused, as arena.Engine.step and the live client do). From inputs every
-    model already has: hand_float cost (Mirror's +1 included), scalars elixir_own and the elixir-rate one-hot."""
+    model already has: hand_float cost (Mirror's +1 included), scalars elixir_own and the elixir-rate one-hot. overlap:
+    with a card in flight, not its slot (it leaves the hand when it lands) and its cost reserved, as Engine.step does."""
     legal = x['legal'].flatten(2).any(-1)
     if 'hand_float' not in x or 'scalars' not in x:
         return legal
     s = x['scalars'].float()
     elixir = 10 * s[:, 0]
+    if overlap:
+        flying = x['own_flight_card'].reshape(-1)
+        legal = legal & ~((x['hand_card'].reshape(-1, 4) == flying[:, None]) & (flying[:, None] > 0))
+        elixir = elixir - 10 * x['own_flight_float'].reshape(-1, 4)[:, 3].float() * (flying > 0)
     rate = s[:, 2] + 2 * s[:, 3] + 3 * s[:, 4]
     cost = 10 * x['hand_float'][..., 0].float()
     return legal & (cost <= (elixir + HOLD_ELIXIR * rate + 1e-3).unsqueeze(-1))
 
 
-def which_logp(which, x):
+def which_logp(which, x, overlap=False):
     """log p(hand slot | play) [N, 4]: only playable() cards (no legal tile now, e.g. Mirror before any play, or not paid
     for within the client's hold: the engine and the live client refuse those taps)."""
-    return _log_softmax(which.float().masked_fill(~playable(x), float('-inf')))
+    return _log_softmax(which.float().masked_fill(~playable(x, overlap), float('-inf')))
 
 
 def tile_logp(model, out, x, slot, rows=None):
@@ -679,7 +721,8 @@ def sample(model, out, x, explore=0.0):
     """One action per decision of a forward pass on [N, 1] inputs -> (action [N], its log-prob [N])."""
     out, x = flat(out, x)
     mx = x if getattr(model, 'elixir_mask', True) else {k: x[k] for k in ('legal', 'own_flight_card')}  # off: as before PR 11
-    what_lp, which_lp = what_logp(out['what'], mx, explore, out['which']), which_logp(out['which'], mx)
+    overlap = getattr(model, 'overlap', False)  # arena.py --a-overlap: may tap a card while another is in flight
+    what_lp, which_lp = what_logp(out['what'], mx, explore, out['which'], overlap), which_logp(out['which'], mx, overlap)
     t, mix = getattr(model, 'temperature', 1.0), getattr(model, 'mix', 0.0)  # < 1: card and tile sharper; when to play stays
     which_lp = sharpen(which_lp, t, mix)
     what, slot = _gumbel_argmax(what_lp), _gumbel_argmax(which_lp)

@@ -195,14 +195,16 @@ class Engine:
         """Plays decided on the current state land `delay` ticks later (live: common.DEPLOY_DELAY), or on the
         next tick with delay=0; `delay` = a tuple of choices: each play draws its own (PLAY_DELAY, as live). As the live client does (C.HOLD_TICKS), a play the elixir cannot pay for yet is held
         until it can, for at most C.HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
-        for within that is refused. As live does, a player with a play in flight cannot start another (unless
-        self.overlap[owner]: 22 Oct).
+        for within that is refused. As live does, a player with a card in flight cannot start another (unless
+        self.overlap[owner]: 22 Oct), and a pending ability press blocks only another press, not a card.
         `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
         before = self.state
         self.played = []  # confirmed card consumption this step, with exact tick and commanded position
         executed = []
         for a in actions:
-            mine = [p for p in self.pending if p['owner'] == a.owner]
+            # a card waits only for this player's cards, a press only for its presses: the live client takes a card tap
+            # while a press is on its way (22 Oct: blocking it refused ~0.4 card taps a game the model could not see)
+            mine = [p for p in self.pending if p['owner'] == a.owner and (p['slot'] == ABILITY) == (a.slot == ABILITY)]
             free = not mine or (self.overlap[a.owner] and a.slot != ABILITY and
                                 all(p['slot'] != a.slot and not p['held'] for p in mine))
             reserved = sum(p['cost'] for p in mine) * 10000
@@ -502,6 +504,7 @@ def main():
     models = [train.load(path, args.device)[:2] for path in (args.a, args.b)]
     models[1][0].elixir_mask = not args.unmasked_b
     models[0][0].temperature, models[1][0].temperature = args.a_temperature, args.b_temperature
+    models[0][0].overlap = args.a_overlap  # the sampler too: it would wait while A's card is in flight
     engine = Engine(args.engine)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     results = []

@@ -748,9 +748,48 @@ r3's recipe) started on 22 October 14:48 on 2 A100 (`~/il-runs/r4-1022`, ~17.5 h
 but humans play their next card ≤ 20 ticks after the previous in 5.7% of plays (~1.8 per game; 3,000 player-games),
 so the real game allows it; it was most of PPO's ~2 refused plays per game. `arena.py` can allow it per player
 (`Engine.overlap`, `--a-overlap`; the pending plays' cost is reserved). v60 with it vs v60 without: 50.5 ± 4.8% over
-418 games (refused 0.18 vs 0.58 per game, 36.2 plays each). No gain for a model trained without it; left off.
+418 games (refused 0.18 vs 0.58 per game, 36.2 plays each). Correction (22 October, code review): this test never
+overlapped two cards. The sampler (`train.what_logp`) only lets a model wait while one of its cards is in flight,
+so the engine option freed nothing but card taps during a pending ability press; that was the drop in refusals.
+Overlapping card plays remain untested; since 22 October `--a-overlap` also lifts the sampler's wait
+(`model.overlap`: a card yes, an ability press no, not the slot in flight, its cost reserved).
+
+**Ability presses (22 October).** The user saw the model almost never press some heroes' abilities live. Findings
+(`~/cr-ppo/diag/ability-1022/`):
+- The simulator refused every card tap while an ability press was on its way (about 22 ticks), which the model could
+  not see; live, the client takes them. 96% of pool decks have a hero or champion. In v140 vs v140, 0.42 card taps per
+  game were refused this way. PPO learned from these taps as if they had been played, and saw presses cost more than they do.
+- Humans press on 0.96% of the decisions with a ready ability (176,732 games; from 0.34% for Knight to 2.4% for
+  Golden Knight). Live, models press 3 to 20 times less. Large IL pressed 0.45% (4 games), its PPO descendants
+  v60–v200 0.16–0.22%, and ppo-m1 0.08%: most of the loss comes in PPO.
+- In the simulator, a press works for all 24 hero and champion forms in the pool (the charge is spent). Abilities cost 1 to
+  5 elixir, which no input shows.
+- IL labels were late: `convert.py` labels a press at its execution tick, a card 22 ticks before it lands, and a press
+  takes the same 20–26 ticks live. In two-hero decks (8% of player-games) every press was labelled controller 1,
+  and 42% of those were dropped as not ready.
+
+Fixes, in `~/cr-ppo/src-abilityfix-1022` (the running jobs keep their code): `Engine.step` blocks a card only for
+another card and a press only for another press (refused taps in v140 vs v140: 0.65 to 0.22 per game; the rest
+are repeated presses, harmless). `train.py --ability_labels 1` moves each press 4 decisions earlier (to the first
+ready decision if the button lit up later) and onto the ready controller: all labels usable (94.3% before), 0.16%
+dropped. Not tested yet: how much more pressing is worth in the fixed simulator.
+
+**Review fixes (22 October, four bugs the user reported; same snapshot).** (1) Multi-GPU training kept the ranks'
+Adam states apart: under DDP's Join a rank that ran out of minibatches skipped optimizer steps, and only the weights
+are re-synced when Join ends (reproduced with two gloo ranks: equal weights, different Adam moments). PPO now gives
+every rank the same number of steps (`ppo.schedule`: the most any rank has, the others repeating some of their own);
+IL steps the ranks together and ends a pass for all when one runs out (`train.lockstep`). (2) A specialist (`deck`)
+collector crashed on evaluation games (no learning seat); the candidate now plays the deck there. (3) loop.py could
+promote a gate that timed out before any benchmark game, and cached a champion baseline with gaps; such a gate is now
+inconclusive, and a baseline is kept only when complete. (4) `--a-overlap`, above.
 
 **Gates.** v140 was promoted (55.9% vs v60, benchmark mean 70.4% vs 66.4%) after v80–v120 missed the 55% bar by
-fractions of a point; the user then lowered the bar to 53% with 800 games against the champion (loop.json, read when
-loop.py starts).
+fractions of a point; v160 then scored 48.3% against v140. The user lowered the bar to 53% with 800 games against the
+champion: at 400 games a no-better model would pass 53% about 12% of the time, at 800 about 4.5%. loop.py reads
+loop.json only when it starts, so it was restarted between gates (15:00); the jobs kept running and the loop's state
+(champion, gates, jobs) carried over.
+
+**Left running on 22 October, 15:10.** gen-r3 under the loop (champion v140; it stops after 10 gates without a
+promotion or at 72 hours); the full-data r4 IL (N + card stats, ~17.5 h on 2 A100), with a watcher that resubmits it
+if it dies and then starts r4's arena against r3 IL and v200 (both T 0.1).
 

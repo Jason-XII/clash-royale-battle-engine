@@ -41,7 +41,6 @@ learning seat then always plays that deck, against the pool's decks.
 """
 import argparse
 from collections import defaultdict, deque
-from contextlib import nullcontext
 import json
 import multiprocessing as mp
 from multiprocessing.connection import Client, Listener, wait
@@ -255,32 +254,42 @@ def finite_step(parameters, optimizer, max_norm, stats, key):
     return ok
 
 
+def schedule(batches, passes):
+    """`passes` shuffled passes over this rank's minibatches, as many steps on every rank: the most any rank has, a rank
+    with fewer repeating some of its own. (DDP's Join let a rank that ran out skip optimizer steps: only the weights are
+    re-synced when Join ends, so its Adam moments and step count then differed from the others' for good.)"""
+    counts = [len(batches)]
+    if dist.is_initialized():
+        counts = [None] * dist.get_world_size()
+        dist.all_gather_object(counts, len(batches))
+    if min(counts) == 0:  # ponytail: a rank no actor sent games to cannot take part; nobody steps this update
+        return []
+    return [b for _ in range(passes)
+            for b in random.sample(batches, len(batches)) + random.choices(batches, k=max(counts) - len(batches))]
+
+
 def train_critic(critic, optimizer, batches, args, device, objective=None):
     """--critic-epochs passes over the batch: P(win) by cross-entropy, the short-term returns by squared error."""
     objective = objective or critic
     autocast = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda')
     stats = defaultdict(list)
-    joined = nn.parallel.distributed.Join([objective]) if isinstance(objective, nn.parallel.DistributedDataParallel) \
-        else nullcontext()
-    with joined:
-        for _ in range(args.critic_epochs):
-            for chunk, x, opp, valid in random.sample(batches, len(batches)):
-                y = targets(chunk, ('p_win', 'ret_short'), device)
-                with torch.autocast(**autocast):
-                    win, short = objective(x, opp)
-                win_loss = F.binary_cross_entropy_with_logits(win.float()[valid], y['p_win'][valid])
-                short_loss = F.mse_loss(short.float()[valid], y['ret_short'][valid])
-                optimizer.zero_grad(set_to_none=True)
-                (win_loss + short_loss).backward()
-                finite_step(critic.parameters(), optimizer, 1.0, stats, 'critic_skipped')
-                stats['win_loss'].append(win_loss.item())
-                stats['short_loss'].append(short_loss.item())
+    for chunk, x, opp, valid in schedule(batches, args.critic_epochs):
+        y = targets(chunk, ('p_win', 'ret_short'), device)
+        with torch.autocast(**autocast):
+            win, short = objective(x, opp)
+        win_loss = F.binary_cross_entropy_with_logits(win.float()[valid], y['p_win'][valid])
+        short_loss = F.mse_loss(short.float()[valid], y['ret_short'][valid])
+        optimizer.zero_grad(set_to_none=True)
+        (win_loss + short_loss).backward()
+        finite_step(critic.parameters(), optimizer, 1.0, stats, 'critic_skipped')
+        stats['win_loss'].append(win_loss.item())
+        stats['short_loss'].append(short_loss.item())
     return {k: float(np.mean(v)) for k, v in stats.items()}
 
 
 def update(model, reference, optimizer, batches, args, device, objective=None):
     """One PPO update on `trajectories` (this rank's share, with critic_targets' advantages). `objective`:
-    Evaluate(model), DDP-wrapped on several ranks; ranks with fewer minibatches join early."""
+    Evaluate(model), DDP-wrapped on several ranks, every rank taking the same number of steps (schedule)."""
     objective = objective or Evaluate(model)
     trajectories = [t for chunk, *_ in batches for t in chunk]
     if trajectories:
@@ -297,34 +306,30 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
             lengths = [len(t['action']) for t in chunk]
             for t, *parts in zip(chunk, *(ref[k].float().split(lengths) for k in ('what', 'which', 'tile'))):
                 t['ref'] = parts
-    joined = nn.parallel.distributed.Join([objective]) if isinstance(objective, nn.parallel.DistributedDataParallel) \
-        else nullcontext()
-    with joined:
-        for _ in range(args.epochs):
-            for chunk, x, _, valid in random.sample(batches, len(batches)):
-                y = targets(chunk, ('action', 'logp', 'adv'), device)
-                with torch.autocast(**autocast):
-                    new = objective(x, y['action'], valid)
-                ref_what, ref_which, ref_tile = (torch.cat(parts) for parts in zip(*(t['ref'] for t in chunk)))
-                ratio = (new['logp'] - y['logp'][valid]).exp()
-                adv = (y['adv'][valid] - mean) / std
-                policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv).mean()
-                p_play = new['what'][:, policy.PLAY].exp()
-                ent = (_entropy(new['what']) + p_play * _entropy(new['which']) + new['tile_entropy']).mean()
-                log_r = ref_tile - new['tile']  # the tile taken: KL's k3 estimate (r - 1 - log r), 0 where no card played
-                kl_ref = (_kl(new['what'], ref_what) + p_play * _kl(new['which'], ref_which)
-                          + torch.where(new['play'], log_r.exp() - 1 - log_r, torch.zeros_like(log_r))).mean()
-                # the policy's own value head is left alone (0 x keeps a gradient on every parameter DDP expects)
-                loss = policy_loss - args.entropy * ent + args.kl_coef * kl_ref + 0 * new['value'].sum()
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                finite_step(model.parameters(), optimizer, 0.5, stats, 'skipped')
-                with torch.no_grad():
-                    stats['policy_loss'].append(policy_loss.item())
-                    stats['entropy'].append(ent.item())
-                    stats['kl_ref'].append(kl_ref.item())
-                    stats['approx_kl'].append(((ratio - 1) - ratio.log()).mean().item())
-                    stats['clip_frac'].append(((ratio - 1).abs() > args.clip).float().mean().item())
+    for chunk, x, _, valid in schedule(batches, args.epochs):
+        y = targets(chunk, ('action', 'logp', 'adv'), device)
+        with torch.autocast(**autocast):
+            new = objective(x, y['action'], valid)
+        ref_what, ref_which, ref_tile = (torch.cat(parts) for parts in zip(*(t['ref'] for t in chunk)))
+        ratio = (new['logp'] - y['logp'][valid]).exp()
+        adv = (y['adv'][valid] - mean) / std
+        policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv).mean()
+        p_play = new['what'][:, policy.PLAY].exp()
+        ent = (_entropy(new['what']) + p_play * _entropy(new['which']) + new['tile_entropy']).mean()
+        log_r = ref_tile - new['tile']  # the tile taken: KL's k3 estimate (r - 1 - log r), 0 where no card played
+        kl_ref = (_kl(new['what'], ref_what) + p_play * _kl(new['which'], ref_which)
+                  + torch.where(new['play'], log_r.exp() - 1 - log_r, torch.zeros_like(log_r))).mean()
+        # the policy's own value head is left alone (0 x keeps a gradient on every parameter DDP expects)
+        loss = policy_loss - args.entropy * ent + args.kl_coef * kl_ref + 0 * new['value'].sum()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        finite_step(model.parameters(), optimizer, 0.5, stats, 'skipped')
+        with torch.no_grad():
+            stats['policy_loss'].append(policy_loss.item())
+            stats['entropy'].append(ent.item())
+            stats['kl_ref'].append(kl_ref.item())
+            stats['approx_kl'].append(((ratio - 1) - ratio.log()).mean().item())
+            stats['clip_frac'].append(((ratio - 1).abs() > args.clip).float().mean().item())
     for t in trajectories:
         del t['ref']
     return {k: float(np.mean(v)) for k, v in stats.items()}
@@ -446,6 +451,14 @@ def route_collector(opponent, opponents, rng, servers):
     return min(servers - 1, int(point / total * servers))
 
 
+def deck_seat(models, judged, rng):
+    """The seat that plays a specialist's deck: a learning seat, or in an evaluation game (two frozen seats) the
+    candidate, A, so a gate judges it with its deck."""
+    if judged:
+        return next(o for o in (0, 1) if models[o][0] == judged['a'][0])
+    return rng.choice([o for o in (0, 1) if models[o][0] == 'current'])
+
+
 def collector(index, run, addresses, key, affinity=False):
     """One native game at a time (the engine allows one per process), decided by its job's decision server at
     `address`; finished games go to the learner."""
@@ -493,7 +506,7 @@ def collector(index, run, addresses, key, affinity=False):
             server = Client(address, authkey=key)
         pair = rng.choice(pool)
         if s.get('deck'):  # a specialist (settings.json "deck", as in the pool): one learning seat always plays it
-            seat = rng.choice([o for o in (0, 1) if models[o][0] == 'current'])
+            seat = deck_seat(models, judged, rng)
             deck = rng.sample(s['deck'], len(s['deck']))  # in a random order, as humans' decks come
             pair = dict(pair, decks=[deck if o == seat else d for o, d in enumerate(pair['decks'])])
         match = make_match(pair, rng.randrange(1 << 30))

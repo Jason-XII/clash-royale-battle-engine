@@ -186,17 +186,20 @@ class Loop:
         cfg, c = self.cfg, self.state['champion']
         mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
         bench = {b: mean(scores.get(f"{gate['name']}:{b}", [])) for b in cfg['benchmark']}
-        if c['name'] not in self.state['bench']:
-            self.state['bench'][c['name']] = {b: mean(scores.get(f"{c['name']}:{b}", [])) for b in cfg['benchmark']}
+        if c['name'] not in self.state['bench']:  # kept only once complete (a timed-out gate leaves gaps; measured again)
+            theirs_now = {b: mean(scores.get(f"{c['name']}:{b}", [])) for b in cfg['benchmark']}
+            if None not in theirs_now.values():
+                self.state['bench'][c['name']] = theirs_now
         vs = scores.get(f"{gate['name']}:{c['name']}", [])
         h2h = mean(vs)
         mine = mean([v for v in bench.values() if v is not None])
-        theirs = mean([v for v in self.state['bench'][c['name']].values() if v is not None])
+        theirs = mean([v for v in self.state['bench'].get(c['name'], {}).values() if v is not None])
+        complete = None not in bench.values() and (theirs is not None or not cfg['benchmark'])
         row = dict(name=gate['name'], champion=c['name'], h2h=h2h, games=len(vs), bench=bench, bench_mean=mine,
                    champion_bench_mean=theirs, at=now(), minutes=round((time.time() - gate['started']) / 60))
-        if h2h is None or len(vs) < cfg['champion_games'] // 2:
-            row['result'] = 'inconclusive'
-        elif h2h >= cfg['promote'] and (mine is None or theirs is None or mine >= theirs - cfg['bench_drop']):
+        if h2h is None or len(vs) < cfg['champion_games'] // 2 or (h2h >= cfg['promote'] and not complete):
+            row['result'] = 'inconclusive'  # too few games, or a winner whose benchmarks are missing: never promoted blind
+        elif h2h >= cfg['promote'] and (not cfg['benchmark'] or mine >= theirs - cfg['bench_drop']):
             row['result'] = 'promoted'
         else:
             row['result'] = 'kept champion'

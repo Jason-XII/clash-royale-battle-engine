@@ -8,8 +8,11 @@ import copy
 import hashlib
 import json
 import math
+import random
 import subprocess
 import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -516,6 +519,36 @@ def test_unaffordable_cards_are_not_offered_and_held_taps_are_in_flight():
     assert not [tt for tt, c in landed if tt - C.DEPLOY_DELAY <= 160 < tt]
 
 
+def test_a_pending_ability_press_blocks_only_another_press():
+    import arena
+    hand = tuple(arena.HandCard(i, 26000000 + i, 3, 0, 26000000 + i) for i in range(4))
+    ready = arena.Ability(2, 0, 0, 1, 1, (5000010,))
+    state = arena.State(1, 500, False, None, (0, 0), (arena.Player(0, 100000, hand, (), (ready,)),
+                                                      arena.Player(1, 100000, hand, ())), (), (), 1)
+    engine = arena.Engine.__new__(arena.Engine)  # no native engine: plays are only accepted or refused here
+    engine.state, engine.pending, engine.overlap = state, [], [False, False]
+    engine._release, engine._capture, engine.env = (lambda: []), (lambda: state), SimpleNamespace(step=lambda n: None)
+    press, card, other = arena.Play(0, arena.ABILITY, 0, 0), arena.Play(0, 1, 9500, 5500), arena.Play(0, 2, 9500, 5500)
+    assert engine.step([press], 5, delay=22).executed == (True,)
+    assert engine.step([press, card], 5, delay=22).executed == (False, True), 'a card goes while the press is on its way'
+    assert engine.step([other], 5, delay=22).executed == (False,), 'but not while another card is'
+
+
+def test_ability_labels_move_to_the_tap_and_the_ready_controller():
+    what = np.zeros(25, np.int64)
+    what[[2, 10, 15, 24]] = train.ABILITY1  # convert.py labels every press controller 1, at its execution tick
+    what[11] = train.PLAY
+    ability = np.zeros((25, 2, 4), np.float32)
+    ability[:, 0, 1] = 1
+    ability[6, 0, 1], ability[6, 1, 1] = 0, 1  # at decision 6 only the second controller is ready
+    ability[20:23, 0, 1] = 0                    # the button lights up at 23
+    out = train.ability_labels({'t_what': what.copy(), 'x_ability': ability})['t_what']
+    assert out[6] == train.ABILITY2 and out[10] == train.WAIT, '4 decisions earlier, on the ready controller'
+    assert out[0] == out[12] == out[23] == train.ABILITY1 and out[11] == train.PLAY, \
+        'else the first ready decision after: the first decision, past a card play, once the button lit up'
+    assert (out >= train.ABILITY1).sum() == 4
+
+
 def test_sharpened_log_probs_stay_normalised_and_masked():
     inf = float('-inf')
     lp = torch.tensor([[0.0, -1.0, inf], [inf, inf, inf]]).log_softmax(-1).nan_to_num(nan=inf)
@@ -579,6 +612,82 @@ def test_loop_promotes_rolls_back_and_stops(tmp_path, monkeypatch):
     assert json.loads((tmp_path / 'rollback.json').read_text()) == dict(id='r1', path='ckpt/v000020.pt')
     assert run.state['stopped'], 'three gates without a promotion: stalled'
     assert 'v000080' in (tmp_path / 'report.md').read_text()
+
+
+def test_a_timed_out_gate_without_benchmarks_promotes_nothing(tmp_path, monkeypatch):
+    import loop
+    monkeypatch.setattr(loop.Loop, 'jobs', lambda self: {})
+    for d in ('pool', 'ckpt', 'league'):
+        (tmp_path / d).mkdir()
+    (tmp_path / 'loop.json').write_text(json.dumps(dict(
+        jobs={}, champion=dict(name='il', path='/il.pt'), benchmark={'b1': '/b1.pt'}, champion_games=4, bench_games=2)))
+    run = loop.Loop(tmp_path)
+    (tmp_path / 'pool' / 'v000020.pt').write_bytes(b'x')
+    run.step()
+    with (tmp_path / 'evals.jsonl').open('a') as f:  # the head-to-head is won, no benchmark game ever finishes
+        f.write(''.join(json.dumps(dict(eval='v000020:il', score=1)) + '\n' for _ in range(4)))
+    run.state['pending']['started'] -= 10 ** 6
+    run.step()
+    assert run.state['gates'][-1]['result'] == 'inconclusive' and run.state['champion']['name'] == 'il'
+    assert 'il' not in run.state['bench'], 'a missing baseline is not cached: the next gate measures it again'
+
+
+def test_a_specialist_deck_goes_to_a_learning_seat_or_the_judged_candidate():
+    rng = random.Random(0)
+    assert ppo.deck_seat([('v000160', '/a'), ('v000140', '/b')], dict(a=['v000140', '/b'], b=['v000160', '/a']), rng) == 1
+    assert ppo.deck_seat([('il', '/il'), ('current', None)], None, rng) == 1
+
+
+def test_overlap_lets_the_sampler_tap_a_second_card():
+    legal = torch.ones(1, 4, C.H, C.W, dtype=torch.bool)
+    hf = torch.zeros(1, 4, C.HAND_FLOATS)
+    hf[0, :, 0] = 0.3                                        # every card costs 3
+    sc = torch.zeros(1, C.SCALARS)
+    sc[0, 0], sc[0, 2] = 0.65, 1.0                           # 6.5 elixir at 1x
+    x = {'legal': legal, 'hand_float': hf, 'scalars': sc, 'hand_card': torch.tensor([[5, 6, 7, 8]]),
+         'own_flight_card': torch.tensor([6]), 'own_flight_float': torch.tensor([[0.5, 0.2, 0.5, 0.3]])}
+    what = torch.zeros(1, 4)
+    assert torch.isinf(train.what_logp(what, x)[0, 1:]).all(), 'as before: only waiting while a card is in flight'
+    lp = train.what_logp(what, x, 0.0, torch.zeros(1, 4), overlap=True)
+    assert torch.isfinite(lp[0, :2]).all() and torch.isinf(lp[0, 2:]).all(), 'a card yes, an ability press no'
+    assert train.playable(x, overlap=True).tolist() == [[True, False, True, True]], 'not the slot in flight'
+    sc[0, 0] = 0.5                                           # 5 - 3 reserved + the hold's ~0.4 < 3
+    assert not train.playable(x, overlap=True).any() and train.playable(x).all()
+
+
+def test_ranks_step_together_so_adam_stays_in_sync(tmp_path):
+    """Two gloo ranks with 3 and 5 minibatches (PPO) and 3 and 5 batches (IL): the same number of optimizer steps,
+    the same weights and Adam moments after (with DDP's Join they differed)."""
+    script = tmp_path / 'ranks.py'
+    script.write_text(textwrap.dedent(f'''
+        import sys, torch, torch.distributed as dist
+        sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+        import ppo, train
+        rank = int(sys.argv[1])
+        dist.init_process_group('gloo', init_method={('file://' + str(tmp_path / 'store'))!r}, rank=rank, world_size=2)
+        torch.manual_seed(0)
+        model = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(3, 1))
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+        torch.manual_seed(1 + rank)
+        data = [torch.randn(4, 3) for _ in range(3 + 2 * rank)]
+        def step(b):
+            optimizer.zero_grad()
+            model(b).pow(2).mean().backward()
+            optimizer.step()
+        for b in ppo.schedule(data, 2):
+            step(b)
+        n = sum(1 for b in train.lockstep(iter(data), torch.device('cpu'), 2) if step(b) or True)
+        state = [p.detach().clone() for p in model.parameters()] + [s[k] for s in optimizer.state.values() for k in ('exp_avg', 'exp_avg_sq')]
+        out = [None, None]
+        dist.all_gather_object(out, ([t.tolist() for t in state], n))
+        assert out[0] == out[1], out
+        print('same', n)
+    '''))
+    procs = [subprocess.Popen([sys.executable, str(script), str(r)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for r in (0, 1)]
+    results = [p.communicate(timeout=120) for p in procs]
+    assert all(p.returncode == 0 for p in procs), results
+    assert all(out.strip() == 'same 3' for out, _ in results), results
 
 
 def test_a_job_counts_as_ended_only_when_accounting_says_so(monkeypatch):
