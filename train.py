@@ -743,11 +743,11 @@ def split(action):
 
 
 def decode(action, owner):
-    """An action -> ('wait',) | ('ability',) | ('card', hand slot, x, y) in world units."""
+    """An action -> ('wait',) | ('ability', controller 0 or 1) | ('card', hand slot, x, y) in world units."""
     if action == WAIT:
         return ('wait',)
     if action in (ABILITY1, ABILITY2):
-        return ('ability',)  # the first ready controller is pressed (decks with two are rare)
+        return ('ability', action - ABILITY1)
     row, col = divmod((action - CARD) % CELLS, W)
     x, y = C.rotate(col * 1000 + 500, row * 1000 + 500, owner)
     return ('card', (action - CARD) // CELLS, x, y)

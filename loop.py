@@ -51,6 +51,9 @@ class Loop:
     def __init__(self, run):
         self.run = run
         self.cfg = {**LOOP_DEFAULTS, **json.loads((run / 'loop.json').read_text())}
+        for name, path in [*self.cfg['benchmark'].items(), (self.cfg['champion']['name'], self.cfg['champion']['path'])]:
+            if re.fullmatch(r'v\d{6}', name) and Path(path).resolve().parent.parent != run.resolve():
+                raise SystemExit(f'{name} ({path}): names like v000100 are this run\'s snapshots; give it another name')
         path = run / 'loop-state.json'
         self.state = json.loads(path.read_text()) if path.exists() else dict(
             started=time.time(), champion=self.cfg['champion'], champion_ckpt=None, jobs={}, restarts={},
@@ -185,16 +188,16 @@ class Loop:
     def decide(self, gate, scores, late):
         cfg, c = self.cfg, self.state['champion']
         mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
+        full = lambda name: all(len(scores.get(f'{name}:{b}', [])) >= cfg['bench_games'] for b in cfg['benchmark'])  # noqa: E731
         bench = {b: mean(scores.get(f"{gate['name']}:{b}", [])) for b in cfg['benchmark']}
-        if c['name'] not in self.state['bench']:  # kept only once complete (a timed-out gate leaves gaps; measured again)
-            theirs_now = {b: mean(scores.get(f"{c['name']}:{b}", [])) for b in cfg['benchmark']}
-            if None not in theirs_now.values():
-                self.state['bench'][c['name']] = theirs_now
+        # the champion's baseline is kept only once all its games are in (a timed-out gate leaves it to the next gate)
+        if c['name'] not in self.state['bench'] and full(c['name']):
+            self.state['bench'][c['name']] = {b: mean(scores[f"{c['name']}:{b}"]) for b in cfg['benchmark']}
         vs = scores.get(f"{gate['name']}:{c['name']}", [])
         h2h = mean(vs)
         mine = mean([v for v in bench.values() if v is not None])
         theirs = mean([v for v in self.state['bench'].get(c['name'], {}).values() if v is not None])
-        complete = None not in bench.values() and (theirs is not None or not cfg['benchmark'])
+        complete = full(gate['name']) and (theirs is not None or not cfg['benchmark'])
         row = dict(name=gate['name'], champion=c['name'], h2h=h2h, games=len(vs), bench=bench, bench_mean=mine,
                    champion_bench_mean=theirs, at=now(), minutes=round((time.time() - gate['started']) / 60))
         if h2h is None or len(vs) < cfg['champion_games'] // 2 or (h2h >= cfg['promote'] and not complete):

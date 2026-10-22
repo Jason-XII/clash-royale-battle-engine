@@ -266,6 +266,12 @@ def test_packed_inputs_and_ppo_update(tmp_path, monkeypatch, option):
     assert all(len(t['adv']) == len(t['action']) for t in trajectories)
     stats.update(ppo.update(model.train(), reference, torch.optim.Adam(model.parameters(), lr=1e-5), batches,
                             args, device))
+    args.lam_place = 0.9  # 22 Oct: the card and tile get their own credit and clipped term
+    ppo.critic_targets(batches, critic, args, device)
+    assert all(len(t['adv_place']) == len(t['action']) for t in trajectories)
+    placed = ppo.update(model, reference, torch.optim.Adam(model.parameters(), lr=1e-5), batches, args, device)
+    assert all(np.isfinite(v) for v in placed.values()) and not any('old_parts' in t for t in trajectories)
+    del args.lam_place
     optimizer = torch.optim.Adam(critic.parameters(), lr=1e-3)
     first = ppo.train_critic(critic, optimizer, batches, args, device)
     for _ in range(5):
@@ -614,7 +620,8 @@ def test_loop_promotes_rolls_back_and_stops(tmp_path, monkeypatch):
     assert 'v000080' in (tmp_path / 'report.md').read_text()
 
 
-def test_a_timed_out_gate_without_benchmarks_promotes_nothing(tmp_path, monkeypatch):
+@pytest.mark.parametrize('bench', [0, 1])
+def test_a_timed_out_gate_without_benchmarks_promotes_nothing(tmp_path, monkeypatch, bench):
     import loop
     monkeypatch.setattr(loop.Loop, 'jobs', lambda self: {})
     for d in ('pool', 'ckpt', 'league'):
@@ -624,12 +631,75 @@ def test_a_timed_out_gate_without_benchmarks_promotes_nothing(tmp_path, monkeypa
     run = loop.Loop(tmp_path)
     (tmp_path / 'pool' / 'v000020.pt').write_bytes(b'x')
     run.step()
-    with (tmp_path / 'evals.jsonl').open('a') as f:  # the head-to-head is won, no benchmark game ever finishes
-        f.write(''.join(json.dumps(dict(eval='v000020:il', score=1)) + '\n' for _ in range(4)))
+    with (tmp_path / 'evals.jsonl').open('a') as f:  # the head-to-head is won, 0 or 1 of each benchmark's 2 games finish
+        f.write(''.join(json.dumps(dict(eval=e, score=1)) + '\n' for e in ['v000020:il'] * 4 + ['v000020:b1', 'il:b1'] * bench))
     run.state['pending']['started'] -= 10 ** 6
     run.step()
     assert run.state['gates'][-1]['result'] == 'inconclusive' and run.state['champion']['name'] == 'il'
-    assert 'il' not in run.state['bench'], 'a missing baseline is not cached: the next gate measures it again'
+    assert 'il' not in run.state['bench'], 'a partial baseline is not cached: the next gate measures it again'
+    (tmp_path / 'loop.json').write_text(json.dumps(dict(
+        jobs={}, champion=dict(name='il', path='/il.pt'), benchmark={'v000200': '/other-run/pool/v000200.pt'})))
+    with pytest.raises(SystemExit):
+        loop.Loop(tmp_path)  # another run's v000200 would share a name with this run's own snapshot
+
+
+def test_every_rank_gets_collectors_and_an_empty_rank_stops_the_update_loudly(monkeypatch):
+    ports = []
+    monkeypatch.setattr(ppo, 'endpoint', lambda run: dict(host='h', ports=[1, 2, 3, 4], authkey='00'))
+    monkeypatch.setattr(ppo, 'Client', lambda address, authkey: ports.append(address[1]) or SimpleNamespace(send=lambda message: None))
+    monkeypatch.setattr(ppo, 'receive', lambda conn: (0, None, {}))
+    for i in range(8):
+        ppo.Link('run', weights=False, index=i).exchange([], [], {})
+    assert sorted(ports) == [1, 1, 2, 2, 3, 3, 4, 4]
+    monkeypatch.setattr(ppo.dist, 'is_initialized', lambda: True)
+    monkeypatch.setattr(ppo.dist, 'get_world_size', lambda: 2)
+    monkeypatch.setattr(ppo.dist, 'all_gather_object', lambda out, n: out.__setitem__(slice(None), [n, 0]))
+    with pytest.raises(RuntimeError):
+        ppo.schedule(list(range(64)), 2)  # learn() waits for every rank; were one still empty, nobody would train
+
+
+def test_frozen_models_play_without_the_press_floor_and_are_told_apart_by_checkpoint(tmp_path):
+    def model(bias):  # [wait, play, ability 1, ability 2]
+        m = train.Policy(train.Config(vocab_size=3, card_dim=4, object_dim=4, attention_layers=0, conv_channels=4,
+                                      conv_layers=1, core=8)).eval()
+        with torch.no_grad():
+            m.what.weight.zero_()
+            m.what.bias[:] = torch.tensor(bias)
+        return m
+    never, always = [0., -1000., -1000., -1000.], [-1000., -1000., 0., -1000.]
+    paths = []
+    for run, bias in (('a', never), ('b', always)):  # two runs' v000100
+        m, path = model(bias), tmp_path / run / 'v000100.pt'
+        path.parent.mkdir()
+        torch.save(dict(config=m.config.__dict__, model=m.state_dict(), vocab=[26000000]), path)
+        paths.append(str(path))
+    x, _ = arrays(1, 10)
+    x['ability'][0, 0, :2] = 1  # controller 1 ready
+    row = train.pack({k: np.asarray(v[0]) for k, v in x.items()})
+    decider = ppo.Decider({'current': model(never)}, torch.device('cpu'), 8)
+    decider.shape = ppo.layout(row)
+    decider.reset(0)
+    w = ppo.wire(row, decider.shape)
+    (a0, lp0, _), (a1, lp1, _), (a2, _, _) = decider.act(
+        [((0, 0), 'current', None, w), ((0, 1), 'v000100', paths[0], w), ((1, 0), 'v000100', paths[1], w)])
+    assert a0 == a1 == C.WAIT and abs(lp0 - math.log(1 - train.ABILITY_EXPLORE)) < 1e-4, 'the learner explores'
+    assert abs(lp1) < 1e-4, 'a frozen model plays as deployed: no press floor'
+    assert a2 == C.ABILITY1, "the second run's v000100 is its own model"
+
+
+def test_a_press_executes_the_controller_the_model_chose():
+    import arena
+    assert train.decode(train.ABILITY2, 0) == ('ability', 1)
+    queued = []
+    rows = [dict(controllerSlot=k + 1, buttonState=2, remainingCooldownMs=0, remainingChargesRaw=1, championObjectIds=[unit])
+            for k, unit in enumerate((111, 222))]
+    reader = SimpleNamespace(logic=lambda b: None, player=lambda logic, owner: None, abilities=lambda player: rows)
+    engine = arena.Engine.__new__(arena.Engine)
+    engine.env = SimpleNamespace(reader=reader, battle=None,
+                                 queue_ability_action_at=lambda command: queued.append(command.secondary_index))
+    assert engine._activate(0, 1) and queued == [222]
+    rows[1]['buttonState'] = 6  # used
+    assert not engine._activate(0, 1) and queued == [222], 'a used button does nothing, though the other is ready'
 
 
 def test_a_specialist_deck_goes_to_a_learning_seat_or_the_judged_candidate():
@@ -744,5 +814,5 @@ def test_a_decision_server_holds_models_of_different_sizes(tmp_path):
     assert decider.states[8][0][0, seat].abs().sum() > 0 and decider.states[16][0][0, seat].abs().sum() == 0
     decider.reset(0)
     assert all(h[0, seat].abs().sum() == 0 for h, _ in decider.states.values())
-    assert decider.models['small'].temperature == 0.1 and getattr(decider.models['current'], 'temperature', 1.0) == 1.0, \
+    assert decider.models[tmp_path / 'small.pt'].temperature == 0.1 and getattr(decider.models['current'], 'temperature', 1.0) == 1.0, \
         'frozen models play sharpened, the learner as trained'

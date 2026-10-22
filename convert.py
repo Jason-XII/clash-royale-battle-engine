@@ -709,7 +709,7 @@ def worker(index, engine, jobs, out, clapha_engine):
             fid = result['fidelity']
             entry.update(hp_error=int(fid['tower_hp_error']), winner=bool(fid['winner_match']),
                          crowns=bool(fid['crowns_match']), decisions=len(rec.decisions))
-            if int(fid['tower_hp_error']) != 0:
+            if int(fid['tower_hp_error']) != 0 or not (fid['winner_match'] and fid['crowns_match']):
                 entry.update(kept=False, why='did not reproduce on conversion')
             else:
                 played = result['game']

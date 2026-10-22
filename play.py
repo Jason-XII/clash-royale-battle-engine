@@ -509,8 +509,8 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
                                                                           if p['owner'] == owner)['abilityRuntime']],
                      'opponent_commands': [c for _, c in plays.flying if c['owner'] == other]})
                 if choice[0] == 'ability':  # pressed at once: nothing in flight to wait for
-                    taps.tap(*ABILITY_BUTTON)
-                    log({'event': 'tap', 'tick': tick, 'card': None, 'ability': True})
+                    taps.tap(*ABILITY_BUTTON)  # ponytail: controller 1's button only; map the second when decks have two
+                    log({'event': 'tap', 'tick': tick, 'card': None, 'ability': True, 'controller': choice[1]})
                 elif choice[0] == 'card' and not pending:
                     _, slot, x, y = choice
                     card = next((h['cardId'] for h in me['hand'] if h['handIndex'] == slot), None)

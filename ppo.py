@@ -163,9 +163,9 @@ def evaluate(model, x, action, valid):
     tile[play] = tiles.gather(1, cell[play].unsqueeze(1)).squeeze(1)
     tile_entropy[play] = _entropy(tiles)
     pick = lambda lp, i: lp.gather(1, i.unsqueeze(1)).squeeze(1)  # noqa: E731
-    logp = pick(what_lp, what) + torch.where(play, pick(which_lp, slot) + tile, torch.zeros_like(tile))
-    return dict(logp=logp, what=what_lp, which=which_lp, tile=tile, tile_entropy=tile_entropy, play=play,
-                value=full['value'].reshape(-1)[v])
+    logp_what, logp_place = pick(what_lp, what), torch.where(play, pick(which_lp, slot) + tile, torch.zeros_like(tile))
+    return dict(logp=logp_what + logp_place, logp_what=logp_what, logp_place=logp_place, what=what_lp, which=which_lp,
+                tile=tile, tile_entropy=tile_entropy, play=play, value=full['value'].reshape(-1)[v])
 
 
 class Evaluate(nn.Module):
@@ -223,6 +223,9 @@ def critic_targets(batches, critic, args, device):
         t['adv'] = a_win + a_short
         if args.upgo:
             t['adv'] += args.upgo * (upgo(r_win, t['v_win'], 1.0) + upgo(r_short, t['v_short'], args.gamma))
+        if getattr(args, 'lam_place', 0):  # the card and tile choices' own credit: the next few seconds (update)
+            t['adv_place'] = advantages(r_win, t['v_win'], 1.0, args.lam_place)[0] + \
+                advantages(r_short, t['v_short'], args.gamma, args.lam_place)[0]
         t['p_win'] = np.full(n, (t['outcome'] + 1) / 2, np.float32)
         late = np.arange(n) >= 3 * n // 4
         out['outcome'].append(np.full(n, t['outcome'], np.float32))
@@ -262,8 +265,8 @@ def schedule(batches, passes):
     if dist.is_initialized():
         counts = [None] * dist.get_world_size()
         dist.all_gather_object(counts, len(batches))
-    if min(counts) == 0:  # ponytail: a rank no actor sent games to cannot take part; nobody steps this update
-        return []
+    if min(counts) == 0:  # learn() waits until every rank has games; skipping silently here once stalled training
+        raise RuntimeError(f'a rank has no minibatches: {counts}')
     return [b for _ in range(passes)
             for b in random.sample(batches, len(batches)) + random.choices(batches, k=max(counts) - len(batches))]
 
@@ -292,9 +295,14 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
     Evaluate(model), DDP-wrapped on several ranks, every rank taking the same number of steps (schedule)."""
     objective = objective or Evaluate(model)
     trajectories = [t for chunk, *_ in batches for t in chunk]
+    place = getattr(args, 'lam_place', 0)
     if trajectories:
         flat = np.concatenate([t['adv'] for t in trajectories])
         mean, std = flat.mean(), flat.std() + 1e-8
+        if place:  # over the card plays only
+            plays = np.concatenate([t['action'] >= policy.CARD for t in trajectories])
+            flat_p = np.concatenate([t['adv_place'] for t in trajectories])[plays]
+            mean_p, std_p = (flat_p.mean(), flat_p.std() + 1e-8) if len(flat_p) else (0.0, 1.0)
     autocast = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda')
     stats = defaultdict(list)
     # The reference (IL) policy once per trajectory: its what / card heads and the tile taken. It does not change during
@@ -306,6 +314,11 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
             lengths = [len(t['action']) for t in chunk]
             for t, *parts in zip(chunk, *(ref[k].float().split(lengths) for k in ('what', 'which', 'tile'))):
                 t['ref'] = parts
+            if place:  # the two parts' log-probs before this update: their ratios' denominators
+                with torch.autocast(**autocast):
+                    old = evaluate(model, x, targets(chunk, ('action',), device)['action'], valid)
+                for t, *parts in zip(chunk, *(old[k].float().split(lengths) for k in ('logp_what', 'logp_place'))):
+                    t['old_parts'] = parts
     for chunk, x, _, valid in schedule(batches, args.epochs):
         y = targets(chunk, ('action', 'logp', 'adv'), device)
         with torch.autocast(**autocast):
@@ -314,6 +327,18 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
         ratio = (new['logp'] - y['logp'][valid]).exp()
         adv = (y['adv'][valid] - mean) / std
         policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv).mean()
+        if place:
+            # --lam-place: when to play keeps the long credit (adv); the card and tile of a play get their own clipped
+            # term, credited by the next few seconds (lam_place). Each part's ratio is against the policy before
+            # this update (the actors' log-probs exist only for the whole action); the stats keep the joint ratio.
+            old_what, old_place = (torch.cat(parts) for parts in zip(*(t['old_parts'] for t in chunk)))
+            adv_p = (targets(chunk, ('adv_place',), device)['adv_place'][valid] - mean_p) / std_p
+
+            def clipped(r, a):
+                return torch.min(r * a, r.clamp(1 - args.clip, 1 + args.clip) * a)
+            timing = clipped((new['logp_what'] - old_what).exp(), adv)
+            placing = torch.where(new['play'], clipped((new['logp_place'] - old_place).exp(), adv_p), torch.zeros_like(adv))
+            policy_loss = -(timing + placing).mean()
         p_play = new['what'][:, policy.PLAY].exp()
         ent = (_entropy(new['what']) + p_play * _entropy(new['which']) + new['tile_entropy']).mean()
         log_r = ref_tile - new['tile']  # the tile taken: KL's k3 estimate (r - 1 - log r), 0 where no card played
@@ -332,6 +357,7 @@ def update(model, reference, optimizer, batches, args, device, objective=None):
             stats['clip_frac'].append(((ratio - 1).abs() > args.clip).float().mean().item())
     for t in trajectories:
         del t['ref']
+        t.pop('old_parts', None)
     return {k: float(np.mean(v)) for k, v in stats.items()}
 
 
@@ -381,19 +407,20 @@ def receive(conn):
 
 
 class Link:
-    """A connection to one learner rank (chosen at random): finished games out, the opponents (and, with weights=True,
-    the newest weights) back. Reconnects (re-reading endpoint.json) whenever the learner is gone or restarted; games it
-    could not send are lost."""
+    """A connection to one learner rank (collector `index` -> rank index % ranks, so every rank gets games; else one at
+    random): finished games out, the opponents (and, with weights=True, the newest weights) back. Reconnects
+    (re-reading endpoint.json) whenever the learner is gone or restarted; games it could not send are lost."""
 
-    def __init__(self, run, weights=True):
-        self.run, self.conn, self.version, self.weights = run, None, -1, weights
+    def __init__(self, run, weights=True, index=None):
+        self.run, self.conn, self.version, self.weights, self.index = run, None, -1, weights, index
 
     def exchange(self, games, results, timing):
         while True:
             try:
                 if self.conn is None:
                     ep = endpoint(self.run)
-                    self.conn = Client((ep['host'], random.choice(ep['ports'])), authkey=bytes.fromhex(ep['authkey']))
+                    port = random.choice(ep['ports']) if self.index is None else ep['ports'][self.index % len(ep['ports'])]
+                    self.conn = Client((ep['host'], port), authkey=bytes.fromhex(ep['authkey']))
                     self.version = -1  # a restarted learner may have rolled back: take its weights
                 self.conn.send((self.version if self.weights else None, games, results, timing))
                 version, weights, opponents = receive(self.conn)
@@ -473,7 +500,7 @@ def collector(index, run, addresses, key, affinity=False):
     vocab = C.Vocab.load(run / 'vocab.json')
     legal = C.cached_legal()
     engine = Engine(s['engine'])
-    link = Link(run, weights=False)
+    link = Link(run, weights=False, index=index)
     _, opponents = link.exchange([], [], {})
     server, address = None, None
     timing = defaultdict(float)
@@ -541,7 +568,7 @@ def collector(index, run, addresses, key, affinity=False):
                     seat.reward.append(-OVERFLOW_PENALTY * (state.players[o].elixir >= 100000) * enemy_on_board)
                 choice = policy.decode(a, o)
                 if choice[0] == 'ability':
-                    plays.append(Play(o, ABILITY, 0, 0))
+                    plays.append(Play(o, ABILITY, choice[1], 0))
                 elif choice[0] == 'card':
                     plays.append(Play(o, *choice[1:]))
             transition = engine.step(plays, 5, delay=PLAY_DELAY)
@@ -699,7 +726,8 @@ class Decider:
                                              cache_enabled=False):
             h, c = self.states[model.config.core]
             out = model(x, (h.index_select(1, index), c.index_select(1, index)))
-            action, logp = policy.sample(model, out, x, policy.ABILITY_EXPLORE)
+            # the press floor is the learner's exploration only: frozen models play as deployed (live has none)
+            action, logp = policy.sample(model, out, x, policy.ABILITY_EXPLORE if model is self.models.get('current') else 0.0)
             h.index_copy_(1, index, out['state'][0].float())
             c.index_copy_(1, index, out['state'][1].float())
         return action, logp.float(), out['value'][:, 0].float()
@@ -769,9 +797,11 @@ class Decider:
         pending.clear()
 
     def act(self, requests):
-        """requests: [(seat, model name, its checkpoint, wire() row)] -> [(action, logp, value)], same order."""
+        """requests: [(seat, model name, its checkpoint, wire() row)] -> [(action, logp, value)], same order. A model
+        is cached by its checkpoint's path (by name without one, as 'current'): names like v000100 recur across runs."""
         by_model = defaultdict(list)
         for i, (_, name, path, _) in enumerate(requests):
+            name = path or name
             by_model[name].append(i)
             if name not in self.models:
                 self.models[name] = policy.load(path, self.device)[0]
@@ -866,8 +896,8 @@ def server(sid, run, listener, gpu, mps, fast=True):
     while True:
         if weights is not None:
             current.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
-            judged = {m[k][0] for m in evaluation(run) for k in ('a', 'b')}
-            for name in set(decider.models) - {'current'} - set(opponents) - judged:
+            judged = {m[k][1] for m in evaluation(run) for k in ('a', 'b')}
+            for name in set(decider.models) - {'current'} - {path for path, _ in opponents.values()} - judged:
                 decider.drop(name)  # an opponent the learner no longer offers
             weights = None
         if time.monotonic() - polled > WEIGHTS_POLL:
@@ -906,7 +936,7 @@ def server(sid, run, listener, gpu, mps, fast=True):
                 k += len(payload)
             stats['batches'] += 1
             stats['rows'] += k
-            stats['model_calls'] += len({r[1] for r in requests})
+            stats['model_calls'] += len({r[2] or r[1] for r in requests})
             stats['busy_s'] += time.perf_counter() - t0
 
 
@@ -1016,9 +1046,10 @@ class Inbox:
                 except (EOFError, OSError):  # its actor died, or its job ended
                     self.conns.remove(conn)
 
-    def count(self):
+    def count(self, oldest=0):
+        """Games played from version `oldest` on (what take(oldest) returns at least)."""
         with self.lock:
-            return len(self.games)
+            return sum(g['version'] >= oldest for g in self.games)
 
     def take(self, oldest):
         """-> (games played from version `oldest` on, results, actor timings, games dropped as too old)."""
@@ -1045,7 +1076,9 @@ DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibat
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
                 pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, upgo=0.0, margin=0.2, eval_frac=0.25,
                 channels_last=True, against='', frozen_temperature=1.0, learner_temperature=1.0,
-                learner_mix=0.0)
+                learner_mix=0.0, lam_place=0.0)
+# lam_place > 0 (22 Oct): the card and tile of each play are credited by GAE at this lambda (0.95: ~5 s), when to play
+# by --lam; 0: one credit for the whole action, as before
 
 
 def opponent_paths(out, init, s):
@@ -1172,14 +1205,21 @@ def learn(args, settings):
     total_games = 0
     while version < s.updates:
         t0 = time.monotonic()
-        while True:  # until the ranks hold a batch between them
-            n = torch.tensor(inbox.count(), device=device)
+        oldest, warned = max(version - s.max_lag, floor), t0
+        while True:  # until the ranks hold a batch between them, and every rank some of it (schedule() needs them all)
+            total = torch.tensor(inbox.count(oldest), device=device)
+            least = total.clone()
             if world > 1:
-                dist.all_reduce(n)
-            if int(n) >= s.batch:
+                dist.all_reduce(total)
+                dist.all_reduce(least, op=dist.ReduceOp.MIN)
+            if int(total) >= s.batch and int(least) > 0:
                 break
+            if int(total) >= s.batch and time.monotonic() - warned > 300:
+                print(f'rank {rank}: a batch is waiting, but a rank has no fresh games ({inbox.count(oldest)} here, '
+                      f'{len(inbox.conns)} actors)', flush=True)
+                warned = time.monotonic()
             time.sleep(1)
-        games, done, timing, stale = inbox.take(max(version - s.max_lag, floor))
+        games, done, timing, stale = inbox.take(oldest)
         # ponytail: a learner slower than its actors would take ever bigger batches; the newest 2 x --batch are kept
         cap = 2 * s.batch // world
         stale, games = stale + max(0, len(games) - cap), games[-cap:]

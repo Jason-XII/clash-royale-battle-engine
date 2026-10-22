@@ -783,6 +783,20 @@ collector crashed on evaluation games (no learning seat); the candidate now play
 promote a gate that timed out before any benchmark game, and cached a champion baseline with gaps; such a gate is now
 inconclusive, and a baseline is kept only when complete. (4) `--a-overlap`, above.
 
+**Second review (23 October, six issues the user reported; local repo only, not in any running snapshot).** None
+changed a past run as far as measured: every gen-r3 and gen-r3-place update took its policy and critic steps, no
+gate of gen-r3, gen-large or gen-critic timed out (38 gates), all benchmark names start with `b-`, and all 176,732
+games in the IL data pass the winner and crown checks. (1) `schedule` (above) made every rank skip an update when one
+rank had no fresh games; the learner now waits until every rank has some, and collector i sends to rank i mod ranks.
+(2) Frozen models (champion, candidate, benchmarks, league) played with the learner's 1% ability-press floor, which
+live play does not have: only the learner explores now, so gates measure the deployed policy. (3) The decision server
+cached models by name, so two runs' v000100 were one model; it caches by checkpoint path, and loop.py refuses
+benchmark or initial-champion names like v000100 from another run. (4) ABILITY2 pressed the first ready controller;
+the press now carries its controller to execution. Live play still taps one button (controller 1's). (5) convert.py
+kept a game whose tower hit points matched but winner or crowns did not; it now needs all three. (6) A timed-out gate
+counted one benchmark game as a complete benchmark; promotion and the cached champion baseline now need
+`bench_games` games per benchmark.
+
 **Gates.** v140 was promoted (55.9% vs v60, benchmark mean 70.4% vs 66.4%) after v80–v120 missed the 55% bar by
 fractions of a point; v160 then scored 48.3% against v140. The user lowered the bar to 53% with 800 games against the
 champion: at 400 games a no-better model would pass 53% about 12% of the time, at 800 about 4.5%. loop.py reads

@@ -113,7 +113,7 @@ class State:
 @dataclass(frozen=True)
 class Play:
     owner: int
-    slot: int  # ABILITY: activate the hero / champion ability (x, y unused)
+    slot: int  # ABILITY: activate the hero / champion ability of controller x (0 or 1; y unused)
     x: int
     y: int
 
@@ -213,7 +213,8 @@ class Engine:
             if a.slot == ABILITY:  # a tap on the ability button: lands like a card, if a carrier is still ready then
                 ok = free and any(x.ready for x in before.players[a.owner].abilities)
                 if ok:
-                    self.pending.append(dict(due=due, held=False, owner=a.owner, slot=ABILITY, card=None, cost=0))
+                    self.pending.append(dict(due=due, held=False, owner=a.owner, slot=ABILITY, card=None, cost=0,
+                                             controller=a.x))
                 executed.append(ok)
                 continue
             me = before.players[a.owner]
@@ -281,7 +282,7 @@ class Engine:
                 continue
             self.pending.remove(p)
             if p['slot'] == ABILITY:
-                self._activate(p['owner'])
+                self._activate(p['owner'], p['controller'])
                 continue
             hand, _, elixir = players[p['owner']]
             if hand.get(p['slot'], (None, None))[1] == p['card'] and elixir >= p['cost'] * 10000:
@@ -292,12 +293,12 @@ class Engine:
                 self.expired += 1
         return released
 
-    def _activate(self, owner):
-        """Activate the first ready hero / champion ability of `owner`, if any (a press on a button no longer ready
-        does nothing, as in the game)."""
+    def _activate(self, owner, controller):
+        """Activate `owner`'s hero / champion ability of `controller` (0 or 1, the model's ABILITY1 / ABILITY2), if
+        ready (a press on a button no longer ready does nothing, as in the game)."""
         r = self.env.reader
         for row in r.abilities(r.player(r.logic(self.env.battle), owner)):
-            if row['buttonState'] in (2, 4) and row['remainingCooldownMs'] == 0 and row['remainingChargesRaw'] != 0:
+            if row['controllerSlot'] - 1 == controller and row['buttonState'] in (2, 4) and row['remainingCooldownMs'] == 0 and row['remainingChargesRaw'] != 0:
                 for unit in row['championObjectIds']:
                     try:
                         self.env.queue_ability_action_at(SimpleNamespace(owner=owner, secondary_index=unit))
@@ -459,7 +460,7 @@ def evaluate(engine, models, pair, seed, a_owner, device='cpu', a_overlap=False)
     while not state.finalized and state.tick < 7200:
         rows = inputs(state)
         choices = [agent.act(rows[agent.owner]) for agent in agents]
-        actions = [Play(agent.owner, ABILITY, 0, 0) if choice[0] == 'ability' else Play(agent.owner, *choice[1:])
+        actions = [Play(agent.owner, ABILITY, choice[1], 0) if choice[0] == 'ability' else Play(agent.owner, *choice[1:])
                    for agent, choice in zip(agents, choices) if choice[0] != 'wait']
         transition = engine.step(actions, 5, delay=PLAY_DELAY)
         state = transition.state
