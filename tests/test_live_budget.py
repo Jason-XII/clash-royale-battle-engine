@@ -90,8 +90,8 @@ def test_late_ack_and_stale_ack_and_incoherent_frames():
     assert len(budget.pending) == 1
     budget.update(frame(123))
     assert len(budget.pending) == 1, 'estimated due passing does not release the reservation'
-    with pytest.raises(RuntimeError, match='unconfirmed'):
-        budget.update(frame(155))
+    dropped = budget.update(frame(155))  # a missed receipt: given up and reported, the battle goes on
+    assert [p.card for p in dropped] == [26000000] and budget.pending == []
 
 
 def test_external_own_queue_is_reserved_but_opponents_queue_is_not():
@@ -113,7 +113,14 @@ def test_ability_is_reserved_until_same_frame_reports_execution():
     assert len(budget.pending) == 1
     budget.update(frame(122, button=8, charges=1))
     assert budget.pending == []
-    assert LiveBudget(0).ability_due(10, 100, 0) is None, 'unknown cost is not zero'
+    assert LiveBudget(0).ability_due(10, 100, 0) == 122, 'an unknown cost is budgeted at 0: the press stays allowed'
+
+
+def test_unknown_cost_and_mirror_in_own_queue_are_guessed_not_fatal():
+    budget = LiveBudget(0, overlap=True)
+    for card in (C.MIRROR, 26999999):
+        budget.update(frame(110, commands=[dict(owner=0, card_id=card, sequence=1, issue_tick=100, execute_tick=122)]))
+    assert [p.cost for p in budget.pending] == [C.COSTS.get(C.MIRROR, 3), 3]
 
 
 @pytest.mark.parametrize('cost', [-1, 11, math.inf, math.nan])

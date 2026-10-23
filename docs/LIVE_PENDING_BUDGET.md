@@ -59,11 +59,12 @@ python play.py CHECKPOINT --tables TABLES --ability-costs COST_1 COST_2 --overla
 ```
 
 Replace `COST_1` and `COST_2` with **verified costs for the current deck/build**,
-in controller order. Zero is accepted only when explicitly configured. The
-reader/exported tables used here do not expose an authoritative ability-cost
-field. Without costs, ability actions are disabled and an `ability_disabled`
-event explains why. This is an intentional behavior change: unknown is not free.
-Do not reuse these arguments for a different deck without checking them.
+in controller order. The reader/exported tables used here do not expose an
+authoritative ability-cost field. Without costs, presses stay allowed and are
+budgeted at 0 elixir, as live play did before this ledger (an `ability_cost_unknown`
+event says so); a card decided right after a press can then be short. Do not
+reuse these arguments for a different deck without checking them. (Changed on
+merge, 23 Oct: the first version disabled abilities without costs.)
 
 Controller 2 remains disabled in the live sampler because this player has no
 verified screen coordinate for its button. Previously its choice could tap
@@ -79,10 +80,13 @@ queue representation or a claim of improved strength.
 An empty hand slot or missing ACK does not release a reservation. A coherent
 replacement-card frame with no future ACK confirms the card payment; ability
 button/charge changes confirm its resolution. These confirmations share the
-frame's updated elixir, avoiding a second deduction. An unexplained timeout
-stops the live player rather than silently freeing uncertain elixir. An already
-visible own queue entry is adopted once; an untracked variable/unknown-cost
-card stops with an explanation instead of guessing a cost.
+frame's updated elixir, avoiding a second deduction. An already
+visible own queue entry is adopted once; Mirror or an unknown card is reserved at
+`COSTS.get(card, 3)`, the guess used elsewhere. A tap with no receipt
+`HOLD_TICKS + 10` ticks after its predicted landing is dropped and logged as
+`unconfirmed` (most likely a missed touch; if it did land, the next frame's elixir
+shows it). (Changed on merge, 23 Oct: the first version stopped the live player in
+both cases, which loses the battle in progress.)
 
 ## Verification boundaries
 

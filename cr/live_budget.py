@@ -69,23 +69,27 @@ def payment_tick(elixir, tick, pending, cost, *, ability=False):
 
 
 class LiveBudget:
-    """At most two own cards, plus an ability; local taps survive reader ACK lag."""
+    """At most two own cards, plus an ability; local taps survive reader ACK lag. An unknown ability cost (None) is
+    budgeted at 0, as live play did before this ledger: the press is still allowed."""
 
     def __init__(self, owner, *, overlap=False, ability_costs=(None, None)):
         if len(ability_costs) != 2 or any(c is not None and (not math.isfinite(c) or not 0 <= c <= 10)
                                           for c in ability_costs):
             raise ValueError('provide two ability costs, each between 0 and 10 (or None if unknown)')
-        self.owner, self.overlap, self.ability_costs = owner, overlap, ability_costs
+        self.owner, self.overlap = owner, overlap
+        self.ability_costs = tuple(0.0 if c is None else float(c) for c in ability_costs)
         self.pending = []
 
     def update(self, frame):
+        """Reconcile a reader frame; returns the taps given up as unconfirmed (dropped, for the caller to log: a
+        battle in progress must not stop over one missed receipt)."""
         if frame['failure'] != 'none' or not frame.get('coherent', True) or not frame.get('queue_ok'):
-            return
+            return []
         tick = frame['game_tick']
         me = next(p for p in frame['players'] if p['side'] == self.owner)
         hand = {i: me['deck_card_ids'][s] for i, s in enumerate(me['hand_deck_indices']) if s >= 0}
         commands = [c for c in frame.get('commands', ()) if c['owner'] == self.owner]
-        alive = []
+        alive, unconfirmed = [], []
         for p in self.pending:
             if p.kind == 'card':
                 ack = next((c for c in commands if c['card_id'] == p.card and c['issue_tick'] >= p.tap
@@ -105,9 +109,8 @@ class LiveBudget:
             if paid:
                 continue
             if not ack and tick > p.due + C.HOLD_TICKS + 10:
-                # A missing receipt is not proof the action was free. Stop
-                # rather than silently spend an uncertain balance twice.
-                raise RuntimeError(f'unconfirmed {p.kind} tap at tick {p.tap}; stop and inspect the reader log')
+                unconfirmed.append(p)  # most likely a missed touch; if it did land, the next frame's elixir shows it
+                continue
             alive.append(p)
         self.pending = alive
         # Include already-visible own commands (for example, attaching after a
@@ -116,12 +119,11 @@ class LiveBudget:
             card = c.get('card_id', 0)
             if c['execute_tick'] <= tick or card <= 0 or any(p.card == card for p in self.pending):
                 continue
-            cost = C.COSTS.get(card)
-            if cost is None or card == C.MIRROR:
-                raise RuntimeError('untracked variable/unknown-cost card in queue; restart before the next battle')
+            cost = C.COSTS.get(card, 3)  # ponytail: Mirror / unknown cards guessed as elsewhere (COSTS.get(card, 3))
             slot = next((s for s, cid in hand.items() if cid == card), -1)
             self.pending.append(Pending('card', cost, c['issue_tick'], c['execute_tick'], slot, card,
                                         c.get('x', 0), c.get('y', 0), acknowledged=True))
+        return unconfirmed
 
     def card_due(self, elixir, tick, slot, card, cost):
         cards = [p for p in self.pending if p.kind == 'card']
@@ -135,7 +137,7 @@ class LiveBudget:
         cost = self.ability_costs[controller]
         # Preserve the policy's existing card -> ability block. A pending
         # ability, however, need not block a sufficiently funded card.
-        if cost is None or self.pending:
+        if self.pending:
             return None
         return payment_tick(elixir, tick, self.pending, cost, ability=True)
 

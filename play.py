@@ -490,7 +490,7 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log, *, overl
     budget = LiveBudget(owner, overlap=overlap, ability_costs=ability_costs)
     model.overlap = overlap
     if ability_costs[0] is None:
-        log({'event': 'ability_disabled', 'reason': 'unknown cost: set --ability-costs for this deck'})
+        log({'event': 'ability_cost_unknown', 'reason': 'presses budgeted at 0 elixir; set --ability-costs for this deck'})
     log({'event': 'start', 'owner': owner, 'tick': first['game_tick']})
     decided, reported = None, 0
     battle = first['chain']['battle']
@@ -510,7 +510,8 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log, *, overl
                      **{k: c[k] for k in ('issue_tick', 'execute_tick', 'first_seen_tick', 'sequence') if k in c}})
             reported = len(landed)
             tick = frame['game_tick']
-            budget.update(frame)
+            for p in budget.update(frame):
+                log({'event': 'unconfirmed', 'tick': tick, 'kind': p.kind, 'card': p.card, 'tap': p.tap})
             if tick >= FIRST_DECISION and (decided is None or tick >= decided + 5):
                 decided = tick
                 record = records(frame)
@@ -536,10 +537,10 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log, *, overl
                      'opponent_commands': [c for _, c in plays.flying if c['owner'] == other]})
                 if choice[0] == 'ability' and choice[1] == 0 and ability_due is not None:
                     taps.tap(*ABILITY_BUTTON)
-                    budget.pending.append(Pending('ability', ability_costs[0], tick, ability_due, 0,
+                    budget.pending.append(Pending('ability', budget.ability_costs[0], tick, ability_due, 0,
                                                   charges=ready.get('charges', -1)))
                     log({'event': 'tap', 'tick': tick, 'card': None, 'ability': True, 'controller': choice[1],
-                         'cost': ability_costs[0], 'due': ability_due})
+                         'cost': budget.ability_costs[0], 'due': ability_due})
                 elif choice[0] == 'card':
                     _, slot, x, y = choice
                     card = next((h['cardId'] for h in me['hand'] if h['handIndex'] == slot), None)
@@ -577,7 +578,7 @@ def main():
                         help='card and tile temperature (< 1: sharper); when to play stays sampled as trained')
     parser.add_argument('--overlap', action='store_true', help='experimental: allow two outstanding card taps')
     parser.add_argument('--ability-costs', type=float, nargs=2, metavar=('CONTROLLER_1', 'CONTROLLER_2'),
-                        help='verified elixir costs for this deck; absent: abilities disabled (reader has no cost field)')
+                        help='verified elixir costs for this deck; absent: presses budgeted at 0 (reader has no cost field)')
     args = parser.parse_args()
     torch.set_num_threads(2)
     model, vocab, _ = load(args.checkpoint)
