@@ -6,6 +6,8 @@ covers scaling up to the medium IL model, and section 7 covers PPO from it (`~/c
 9 cover gen-large under the improvement loop, and the deployment-temperature finding. Section 10 diagnoses the
 plateau after v200 (search, distillation, critics), section 11 redesigns the network to be cheaper and better, and
 section 12 covers PPO on the new network (gen-r3), the search experiments on it and the first live games.
+Section 13 covers the experiments against gen-r3's plateau on 22–23 October, the second code review, the fitting test
+of the distilled tile head and the decision against search at deployment.
 How to run each script is in `README.md`, and the live client's integration is in `GAME_INTEGRATION.md`.
 
 ## 1. The run
@@ -772,7 +774,7 @@ Fixes, in `~/cr-ppo/src-abilityfix-1022` (the running jobs keep their code): `En
 another card and a press only for another press (refused taps in v140 vs v140: 0.65 to 0.22 per game; the rest
 are repeated presses, harmless). `train.py --ability_labels 1` moves each press 4 decisions earlier (to the first
 ready decision if the button lit up later) and onto the ready controller: all labels usable (94.3% before), 0.16%
-dropped. Not tested yet: how much more pressing is worth in the fixed simulator.
+dropped. How much more pressing is worth: section 13 (no quick gain).
 
 **Review fixes (22 October, four bugs the user reported; same snapshot).** (1) Multi-GPU training kept the ranks'
 Adam states apart: under DDP's Join a rank that ran out of minibatches skipped optimizer steps, and only the weights
@@ -782,20 +784,6 @@ IL steps the ranks together and ends a pass for all when one runs out (`train.lo
 collector crashed on evaluation games (no learning seat); the candidate now plays the deck there. (3) loop.py could
 promote a gate that timed out before any benchmark game, and cached a champion baseline with gaps; such a gate is now
 inconclusive, and a baseline is kept only when complete. (4) `--a-overlap`, above.
-
-**Second review (23 October, six issues the user reported; local repo only, not in any running snapshot).** None
-changed a past run as far as measured: every gen-r3 and gen-r3-place update took its policy and critic steps, no
-gate of gen-r3, gen-large or gen-critic timed out (38 gates), all benchmark names start with `b-`, and all 176,732
-games in the IL data pass the winner and crown checks. (1) `schedule` (above) made every rank skip an update when one
-rank had no fresh games; the learner now waits until every rank has some, and collector i sends to rank i mod ranks.
-(2) Frozen models (champion, candidate, benchmarks, league) played with the learner's 1% ability-press floor, which
-live play does not have: only the learner explores now, so gates measure the deployed policy. (3) The decision server
-cached models by name, so two runs' v000100 were one model; it caches by checkpoint path, and loop.py refuses
-benchmark or initial-champion names like v000100 from another run. (4) ABILITY2 pressed the first ready controller;
-the press now carries its controller to execution. Live play still taps one button (controller 1's). (5) convert.py
-kept a game whose tower hit points matched but winner or crowns did not; it now needs all three. (6) A timed-out gate
-counted one benchmark game as a complete benchmark; promotion and the cached champion baseline now need
-`bench_games` games per benchmark.
 
 **Gates.** v140 was promoted (55.9% vs v60, benchmark mean 70.4% vs 66.4%) after v80–v120 missed the 55% bar by
 fractions of a point; v160 then scored 48.3% against v140. The user lowered the bar to 53% with 800 games against the
@@ -807,3 +795,106 @@ loop.json only when it starts, so it was restarted between gates (15:00); the jo
 promotion or at 72 hours); the full-data r4 IL (N + card stats, ~17.5 h on 2 A100), with a watcher that resubmits it
 if it dies and then starts r4's arena against r3 IL and v200 (both T 0.1).
 
+## 13. Against the plateau (22–23 October)
+
+**gen-r3 on the fixed code.** From v230 (22 October, about 20:30) gen-r3 runs the ability fixes of section 12
+(`src-abilityfix-1022`) on half its GPUs; the other half ran the A/B below. Refused plays fell from 2.17 to 0.8–1.1
+per game. Gates since v140 (from v180: promote at 53%, about 1,000 games against the champion):
+
+| Gate | vs champion | Games | Benchmark mean | Result |
+|---|---|---|---|---|
+| v160 | 48.3% vs v140 | 422 | 69.1% | kept v140 |
+| v180 | 52.3% | 889 | 67.9% | kept |
+| v200 | 51.8% | 1,000 | 72.8% | kept |
+| v220 | 52.7% | 961 | 71.9% | kept |
+| v240 | 55.2% | 1,041 | 72.0% | **promoted** |
+| v260 | 51.5% vs v240 | 1,060 | 70.6% | kept v240 |
+| v280 | 48.8% | 1,122 | 66.8% | kept |
+| v300 | 49.9% | 1,042 | 71.6% | kept |
+| v320 | 48.0% | 1,059 | 69.9% | kept |
+
+v240 scores 58.7% against gen-large v200 (its benchmark, 200 games), the best model in the simulator so far. Nothing
+after it has beaten it: the same plateau as gen-large after v200. These gates ran with the 1% press floor on both
+models (fixed since, see the second code review below), so later gates won't compare one to one.
+
+**Two quick tests at play time** (v140, T 0.05, fixed simulator).
+- Pressing more: ability logits + log 3 and + log 10 against plain v140, 160 games each: 51.9 ± 4.0% (0.76 against
+  0.35 presses per game) and 52.5 ± 3.9% (1.27 against 0.41). Pressing more at the model's own timing is no quick gain.
+- Mirror averaging (the policy on the board and on its left-right mirror, averaged): 48.0 ± 2.5% over 400 games; the
+  two views pick the same top tile in 67% of plays. Dropped.
+
+**A placement yardstick** (`diag/place-ab/score_tiles.py`). A checkpoint's tile head against the search's scores on
+labels-r3's 102 held-out games (8,301 searched card plays), relative to v60: v60 58.3% pair accuracy; v140 58.7%
+(gain captured −1.7%, top tile differs from v60's in 22% of plays); v220 58.5% (−2.3%, 30%); v230 58.9% (−0.8%, 30%).
+PPO keeps moving tiles, but not toward the search's choices.
+
+**Short-term credit for placement (the lam_place A/B).** A tile's effect shows within seconds, so the card and tile of
+a play were credited with λ 0.95 (about 5 s), while when to play kept λ 0.99 (`--lam_place 0.95`; a clipped term per
+part). Both arms started from gen-r3's v230, each on 2 A100 and 2 RTX 5090; the control was gen-r3 itself.
+
+| Snapshot | Pair accuracy, control / test | Top tile differs from v60's, control / test | Test vs control |
+|---|---|---|---|
+| v240 | 59.3 / 59.3% | 31 / 31% | |
+| v260 | 59.4 / 58.7% | 33 / 34% | |
+| v280 | 59.6 / 59.3% | 34 / 37% | 44.2 ± 2.5% (400 games) |
+| v300 | 59.2 / 59.4% | 35 / 38% | 50.0 ± 2.5% (400 games) |
+
+Gain captured stayed within ±2% for both. No gain, and the test arm stopped at v308 on 23 October. A flaw found
+afterwards (another agent's review): the two parts' old log-probabilities are recomputed by the learner at the start
+of each update, so their ratios start at 1 and games played by older versions get no correction. The lag was about
+one update, so the effect is small, but before any rerun weight each sample by exp(learner − actor log-prob).
+
+**Second code review** (23 October, six issues the user reported; commit c20b9f4, not in the running jobs' snapshots).
+None changed a past run as far as measured: every gen-r3 and gen-r3-place update took its policy and critic steps, no
+gate of gen-r3, gen-large or gen-critic timed out (38 gates), all benchmark names start with `b-`, and all 176,732
+games in the IL data pass the winner and crown checks. (1) `schedule` (section 12's review fixes) made every rank skip
+an update when one rank had no fresh games; the learner now waits until every rank has some, and collector i sends to
+rank i mod ranks. (2) Frozen models (champion, candidate, benchmarks, league) played with the learner's 1%
+ability-press floor, which live play does not have: only the learner explores now, so gates measure the deployed
+policy. (3) The decision server cached models by name, so two runs' v000100 were one model; it caches by checkpoint
+path, and loop.py refuses benchmark or initial-champion names like v000100 from another run. (4) ABILITY2 pressed the
+first ready controller; the press now carries its controller to execution. Live play still taps one button (controller
+1's). (5) convert.py kept a game whose tower hit points matched but winner or crowns did not; it now needs all three.
+(6) A timed-out gate counted one benchmark game as a complete benchmark; promotion and the cached champion baseline
+now need `bench_games` games per benchmark.
+
+**Fitting test and learning curve** (`distill-r3/fit.py`, `curve.py`, logs in `distill-r3/fit/`). Another
+agent pointed out that the listwise loss only compares candidates with each other, so a tile outside the 8 candidates
+can become the head's top choice unseen, and "gain captured" skipped those labels (in the earlier runs 7–13% of changed
+tiles went outside, up to 20%). New "whole-board" loss: the same target against the head's distribution over the whole
+board. Gain captured now counts an outside top tile as no gain. v60, no anchor (KL 0):
+
+| Run (50 training games) | Captured, training games | Outside, training games | Captured, held-out |
+|---|---|---|---|
+| Tile head, candidates-only loss | 66% | 42% | −1% |
+| Tile head, whole-board loss | 90% | 1% | 4% (best epoch) |
+| Whole network, whole-board loss | 91% | 1% | 3% |
+
+The network can fit the search's choices; it doesn't carry them to new games. The learning curve (tile head,
+whole-board loss, nested training sets, best epoch on the 102 held-out games):
+
+| Training games | 50 | 100 | 200 | 400 | 915 |
+|---|---|---|---|---|---|
+| Captured, held-out | 5.6% | 7.9% | 10.5% | 10.3% | 11.2% |
+
+It flattens after 200 games: 4.6 times the games add under a point, so 10 times today's labels would likely give
+about 13%. More labels of this kind won't close the gap.
+
+**r4** (N + card stats, full data): final held-out loss 4.6217 against r3's 4.6155. The card stats' gain in the
+30k-game ablation (section 12) did not hold at full data. Its arena against r3 IL and v200 is in
+`~/il-runs/r4-1022/arena/`.
+
+**Live** (user-started battles, T 0.05). gen-large v200 on 22 October, evening: 11–9. gen-r3 v240 on 23 October,
+morning: 6–0 so far (1–0, 1–0, then four 3–0). Small samples; user-started battles have been easier than the ladder
+(section 12: v100 went 6–1 there, 3–6 on the ladder).
+
+**Assessment (23 October).**
+1. PPO's gains come from when to play (section 10: v200's timing head alone 74%, its tile head 51%). gen-r3 has
+   plateaued since v240.
+2. Placement is still the largest measured gap: the search adds about 20 points. PPO doesn't learn it (a better tile is
+   worth about 4% win chance, and PPO sees one sampled tile out of 576), and short-term credit didn't change that.
+3. Distillation: the network can fit the search's choices (90% of the gain on 50 games) but carries only about 11% to
+   new games, flat from 200 to 915 games. More labels of this kind won't close the gap.
+4. Search at deployment, the only measured route to the 20 points, is ruled out as the main route by the user: it ties
+   the bot to the engine and makes it hard to run on other systems. The search stays a teacher for training.
+5. Open: r4's arena, then a new placement plan.

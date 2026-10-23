@@ -58,10 +58,12 @@ Architecture options, all off by default so every saved checkpoint loads unchang
 - `--flight_grid 1` (plays in flight drawn on the board) and `--board_rows / --board_cols` (the coarse map): no gain.
 - `--card_stats 1`: every card and unit id also gets its fixed stats from the game data (range, targets, hitpoints,
   damage, speed, splash, ...: `assets/card_stats.json`, 28 fields), through a learned map added to its embedding.
-  -0.037 held-out loss in the 30k-game ablation (section 12). Rebuild the table for a new game build with
+  -0.037 held-out loss in the 30k-game ablation (section 12), but no gain at full data (r4, section 13). Rebuild the table for a new game build with
   `python card_stats.py CSV_LOGIC assets/vocab.json assets/replay_cards.json UNIT_STATE_TABLES.json assets/card_stats.json`
   (`CSV_LOGIC`: the build's `data/assets/csv_logic`; the unit-state tables name the units' data ids).
 - `--max_train N --max_val N`: random subsets of the games, for ablations.
+- `--ability_labels 1`: each human ability press is labelled where it was tapped (4 decisions earlier) and on the
+  controller that was ready; the converted labels mark it 22 ticks late and always on controller 1 (section 12).
 
 The candidate to replace the large model has about 3x less compute per decision and a lower held-out loss: the large
 flags with `--conv_channels 96 --conv_layers 8 --res_blocks 1 --tile_blocks 1`.
@@ -120,7 +122,10 @@ The first 20 updates train the critic alone. Progress goes to `RUN/metrics.jsonl
 Settings live in `RUN/settings.json`; every default in `ppo.py`'s `DEFAULTS` is also a `learn` flag. Besides the
 reward ones (`shaping`, `margin`: the end-of-game difference in lowest tower HP):
 - `frozen_temperature`: the card/tile temperature of every frozen model (opponents, evaluation and benchmark
-  games), so they play as deployed.
+  games), so they play as deployed. Only the learner gets the 1% ability-press floor (`ABILITY_EXPLORE`).
+- `lam_place` (default 0, off): credit the card and tile of a play with this GAE λ (e.g. 0.95, about 5 s) and when to
+  play with `lam`. No gain in the 22–23 October A/B; its parts' old log-probs come from the learner, not the actors
+  (section 13), so fix that before using it again.
 - `learner_temperature` and `learner_mix`: the temperature the learner plays at, with that share of its untempered
   policy mixed in to keep exploring. PPO scores the log-probabilities of exactly that distribution.
 - `against`: another run's directory. The run then plays only that run's current champion: an exploiter that looks
@@ -135,7 +140,8 @@ cd SNAPSHOT && nohup python loop.py RUN >> RUN/logs/loop.out 2>&1 &   # on the l
 `RUN/loop.json` holds the jobs' sbatch commands (with `--parsable`), the benchmark models and the loop's settings
 (`LOOP_DEFAULTS` in `loop.py`). It keeps a frozen champion, which is also the KL reference. Every snapshot goes through
 a gate of evaluation games played by the collectors: promoted at ≥ `promote` (default 55%) against the champion if its benchmark mean
-isn't more than 3 points below the champion's. Promoted champions stay in `RUN/league/` as opponents. The loop also
+isn't more than 3 points below the champion's, with every benchmark's `bench_games` games played (a timed-out gate
+without them is inconclusive). Benchmark names must not look like this run's snapshots (`v000100`). Promoted champions stay in `RUN/league/` as opponents. The loop also
 resubmits jobs that ended or hung, rolls back after repeated bad gates, stops after `stall_after` gates without a
 promotion, and writes `RUN/report.md` and `RUN/loop-events.log`. To stop a loop run, kill `loop.py` first (it
 resubmits cancelled jobs), then `scancel` the job ids in `RUN/loop-state.json`.
