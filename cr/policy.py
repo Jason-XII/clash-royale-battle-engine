@@ -320,6 +320,11 @@ def playable(x, overlap=False):
     model already has: hand_float cost (Mirror's +1 included), scalars elixir_own and the elixir-rate one-hot. overlap:
     with a card in flight, not its slot (it leaves the hand when it lands) and its cost reserved, as Engine.step does."""
     legal = x['legal'].flatten(2).any(-1)
+    if 'live_playable' in x:
+        # The host has reconciled ALL queued cards and abilities, including
+        # payment order and regeneration. Do not subtract own_flight a second
+        # time or reapply the older one-flight affordability approximation.
+        return legal & x['live_playable'].bool()
     if 'hand_float' not in x or 'scalars' not in x:
         return legal
     s = x['scalars'].float()
@@ -417,10 +422,17 @@ class Agent:
         self.model, self.owner, self.device, self.lstm, self.value, self.p_what = model, owner, device, None, 0.0, None
 
     @torch.no_grad()
-    def act(self, inputs):
+    def act(self, inputs, *, live_playable=None, live_abilities=None):
         x = tensors({k: v[None, None] for k, v in pack(inputs).items()}, self.device)
         out = self.model(x, self.lstm)
         self.lstm = out['state']
+        # Live-only action masks are attached AFTER the network forward pass:
+        # checkpoint shapes, observations and the training sampler are unchanged.
+        if live_playable is not None:
+            x['live_playable'] = torch.as_tensor(live_playable, device=self.device).reshape(1, 1, 4)
+        if live_abilities is not None:
+            allowed = torch.as_tensor([True, True, *live_abilities], device=self.device)
+            out = {**out, 'what': out['what'].masked_fill(~allowed, float('-inf'))}
         self.value = float(out['value'].reshape(-1)[0])  # the IL value head: expected outcome, -1 loss .. +1 win
         self.p_what = out['what'].float().softmax(-1).reshape(-1).tolist()  # wait / play / ability 1 / ability 2
         action, _ = sample(self.model, out, x)

@@ -22,6 +22,7 @@ import torch
 
 from cr import observation as C
 from cr.policy import Agent, load
+from cr.live_budget import LiveBudget, Pending
 
 SDK = Path(os.environ.get('ANDROID_SDK_ROOT', Path.home() / 'Library/Android/sdk'))
 ADB = shutil.which('adb') or str(SDK / 'platform-tools/adb')
@@ -452,12 +453,18 @@ class LivePlays:
         self.flying = [(due, c) for due, c in self.flying if not c['confirmed']]
         return list(self.landed)
 
-    def commands(self, pending=None, owner=None):
+    def commands(self, pending=None, owner=None, *, reservations=(), tick=None):
         """Known history plus visible commands. A just-sent own tap fills the queue's acknowledgement delay only."""
         flying = list(self.flying)
         if pending and not any(c['owner'] == owner and c['card_id'] == pending['card'] for _, c in flying):
             flying.append((pending['due'], {'owner': owner, 'card_id': pending['card'],
                                             'x': pending['x'], 'y': pending['y'], 'tap': pending['tick']}))
+        for due, c in reservations:
+            match = next((q for _, q in flying if q['owner'] == c['owner'] and q['card_id'] == c['card_id']), None)
+            if match is not None:
+                match['tap'] = c['tap']
+            else:
+                flying.append((max(due, tick + 1) if tick is not None else due, c))
         return self.landed + flying
 
 
@@ -472,7 +479,7 @@ def board(record):
              -1 if o['maxHp'] is None else o['maxHp'], kind(o)] for o in record['objects']]
 
 
-def play_battle(stream, first, model, vocab, records, owner, taps, log):
+def play_battle(stream, first, model, vocab, records, owner, taps, log, *, overlap=False, ability_costs=(None, None)):
     """One battle from its first frame to its end -> the last record."""
     other = 1 - owner
     records.reset()
@@ -480,8 +487,12 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
     forms = next(p['deck_form_flags'] for p in first['players'] if p['side'] == other)
     view = C.PlayerView(owner, vocab, C.opponent_heroes(record, forms, owner), C.cached_legal())
     agent, plays = Agent(model, owner), LivePlays()
+    budget = LiveBudget(owner, overlap=overlap, ability_costs=ability_costs)
+    model.overlap = overlap
+    if ability_costs[0] is None:
+        log({'event': 'ability_disabled', 'reason': 'unknown cost: set --ability-costs for this deck'})
     log({'event': 'start', 'owner': owner, 'tick': first['game_tick']})
-    decided, pending, reported = None, None, 0  # pending: {'card', 'tick', 'due', 'x', 'y'} of a card tap not landed
+    decided, reported = None, 0
     battle = first['chain']['battle']
     frame, last_tick, moved = first, first['game_tick'], time.monotonic()
     queue_seen = moved
@@ -497,37 +508,50 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
                 log({'event': 'landed' if c['owner'] == owner else 'opponent', 'tick': tick, 'card': c['card_id'],
                      'world': [c['x'], c['y']] if 'x' in c else None,
                      **{k: c[k] for k in ('issue_tick', 'execute_tick', 'first_seen_tick', 'sequence') if k in c}})
-                if c['owner'] == owner and pending and pending['card'] == c['card_id']:
-                    pending = None
             reported = len(landed)
             tick = frame['game_tick']
-            if pending and tick > pending['due'] + C.HOLD_TICKS + 10:
-                log({'event': 'unconfirmed', 'tick': tick, 'card': pending['card']})
-                pending = None
+            budget.update(frame)
             if tick >= FIRST_DECISION and (decided is None or tick >= decided + 5):
                 decided = tick
                 record = records(frame)
-                choice = agent.act(view.step(record, plays.commands(pending, owner)))
                 me = next(p for p in record['lean']['state']['players'] if p['owner'] == owner)
+                inputs = view.step(record, plays.commands(reservations=budget.commands(), tick=tick))
+                elixir = me['elixirRaw'] / 10000
+                hand = {h['handIndex']: h['cardId'] for h in me['hand']}
+                costs = [round(float(h[0]) * 10, 6) for h in inputs['hand_float']]  # includes Mirror's surcharge
+                due = [budget.card_due(elixir, tick, i, hand[i], costs[i]) if i in hand else None for i in range(4)]
+                abilities = next(p for p in frame['players'] if p['side'] == owner).get('abilities', ())
+                ready = next((a for a in abilities if a['controller_slot'] == 1 and a['button'] in (2, 4)
+                              and not a.get('cooldown_ms') and a.get('charges', -1) != 0 and a.get('units')), None)
+                ability_due = budget.ability_due(elixir, tick, 0) if ready else None
+                # Controller 2 has no verified screen coordinate in this live
+                # player. Do not charge/use controller 1 for a controller-2 choice.
+                choice = agent.act(inputs, live_playable=[d is not None for d in due],
+                                   live_abilities=[ability_due is not None, False])
                 log({'event': 'decision', 'tick': tick, 'elixir': me['elixirRaw'], 'choice': choice[0],
                      'value': round(agent.value, 3), 'p_what': [round(q, 4) for q in agent.p_what], 'board': board(record),
                      'abilities': [[a['controllerSlot'], a['available'], a['buttonState'], a['remainingChargesRaw'],
                                     a['remainingCooldownMs']] for a in next(p for p in record['lean']['players']
                                                                           if p['owner'] == owner)['abilityRuntime']],
                      'opponent_commands': [c for _, c in plays.flying if c['owner'] == other]})
-                if choice[0] == 'ability':  # pressed at once: nothing in flight to wait for
-                    taps.tap(*ABILITY_BUTTON)  # ponytail: controller 1's button only; map the second when decks have two
-                    log({'event': 'tap', 'tick': tick, 'card': None, 'ability': True, 'controller': choice[1]})
-                elif choice[0] == 'card' and not pending:
+                if choice[0] == 'ability' and choice[1] == 0 and ability_due is not None:
+                    taps.tap(*ABILITY_BUTTON)
+                    budget.pending.append(Pending('ability', ability_costs[0], tick, ability_due, 0,
+                                                  charges=ready.get('charges', -1)))
+                    log({'event': 'tap', 'tick': tick, 'card': None, 'ability': True, 'controller': choice[1],
+                         'cost': ability_costs[0], 'due': ability_due})
+                elif choice[0] == 'card':
                     _, slot, x, y = choice
                     card = next((h['cardId'] for h in me['hand'] if h['handIndex'] == slot), None)
-                    short = C.COSTS.get(card, 3) * 10000 - me['elixirRaw']
-                    if card is not None and short <= C.hold_slack(tick):  # the client holds a short tap ~HOLD_TICKS
+                    # Recheck before tapping; both gates use the same complete
+                    # ledger, including pending abilities and regeneration.
+                    payment = budget.card_due(elixir, tick, slot, card, costs[slot]) if card is not None else None
+                    if payment is not None:
                         started = time.perf_counter()
                         pixels = taps.play(slot, x, y, owner)
-                        wait = next(k for k in range(C.HOLD_TICKS + 1) if C.regen(tick, tick + k) >= short) if short > 0 else 0
-                        pending = {'card': card, 'tick': tick, 'due': tick + wait + C.DEPLOY_DELAY, 'x': x, 'y': y}
+                        budget.pending.append(Pending('card', costs[slot], tick, payment, slot, card, x, y))
                         log({'event': 'tap', 'tick': tick, 'card': card, 'slot': slot, 'world': [x, y], 'screen': pixels,
+                             'cost': costs[slot], 'due': payment,
                              'input_ms': round((time.perf_counter() - started) * 1000)})
         frame = next(stream)
         if frame['game_tick'] != last_tick:
@@ -551,6 +575,9 @@ def main():
     parser.add_argument('--queue', action='store_true', help='press OK and Battle to start each ladder game')
     parser.add_argument('--temperature', type=float, default=1.0,
                         help='card and tile temperature (< 1: sharper); when to play stays sampled as trained')
+    parser.add_argument('--overlap', action='store_true', help='experimental: allow two outstanding card taps')
+    parser.add_argument('--ability-costs', type=float, nargs=2, metavar=('CONTROLLER_1', 'CONTROLLER_2'),
+                        help='verified elixir costs for this deck; absent: abilities disabled (reader has no cost field)')
     args = parser.parse_args()
     torch.set_num_threads(2)
     model, vocab, _ = load(args.checkpoint)
@@ -596,7 +623,8 @@ def main():
                 raise SystemExit(f'account {account if account is None else hex(account)} is not exactly one seat: {[hex(i) for i in ids]}')
             owner = ids.index(account)
             log({'event': 'roster', 'accounts': ids, 'owner': owner})
-            last = play_battle(stream, frame, model, vocab, records, owner, taps, log)
+            last = play_battle(stream, frame, model, vocab, records, owner, taps, log,
+                               overlap=args.overlap, ability_costs=args.ability_costs or (None, None))
             alive = {'objects': [o for o in last['objects'] if o['hp'] is None or o['hp'] > 0]}  # the last frame still
             score = (C.crowns(alive, owner), C.crowns(alive, 1 - owner))                     # lists a tower at 0 hp
             log({'event': 'end', 'tick': last['tick'], 'crowns': score})
