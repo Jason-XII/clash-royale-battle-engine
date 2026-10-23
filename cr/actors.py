@@ -126,13 +126,10 @@ def collector(index, run, addresses, key, affinity=False):
             address = addresses[sid]
             server = Client(address, authkey=key)
         pair = rng.choice(pool)
-        if s.get('deck'):  # a specialist (settings.json "deck", as in the pool): one learning seat always plays it
-            special = matchmaking.deck_seat(models, judged, rng)  # the seat that plays the deck
-            deck = rng.sample(s['deck'], len(s['deck']))  # in a random order, as humans' decks come
-            if s.get('deck_mix') and not judged:  # learning games also meet focus and hard decks; gates keep the pool's
-                decks = decks or matchmaking.Decks(pool)
-                pair = decks.pick(pair, 1 - special, s['deck_mix'], matchmaking.read_hard(run), rng)
-            pair = dict(pair, decks=[deck if o == special else d for o, d in enumerate(pair['decks'])])
+        if s.get('deck') or s.get('deck_mix'):  # a specialist's deck and/or opponent decks aimed at the learning seat
+            decks = decks or (matchmaking.Decks(pool) if s.get('deck_mix') else None)
+            pair, special = matchmaking.seat_decks(pair, s, models, judged, decks, run, rng)
+        engine.overlap = [bool(s.get('overlap'))] * 2  # the run's rule for every seat (Game.views() adds the mask)
         game = Game(engine, pair, rng.randrange(1 << 30), {0: vocab, 1: vocab}, legal)
         seats = {o: Seat() for o in (0, 1) if models[o][0] == 'current'}
         start = tower_hp(game.state)
@@ -192,7 +189,7 @@ def collector(index, run, addresses, key, affinity=False):
         learner = min(seats)
         result = dict(opponent=models[1 - learner][0] if len(seats) == 1 else 'self', tick=state.tick,
                       outcome=0.0 if state.result not in (0, 1) else 1.0 if state.result == learner else -1.0)
-        if s.get('deck'):  # the specialist's score against this deck (matchmaking.DeckScores)
+        if s.get('deck') or s.get('deck_mix'):  # the learning seat's score against this deck (matchmaking.DeckScores)
             result.update(deck=matchmaking.deck_key(pair['decks'][1 - special]),
                           deck_score=0.5 if state.result not in (0, 1) else float(state.result == special))
         _, opponents = link.exchange(out, [result], dict(timing, games=1))
@@ -268,10 +265,12 @@ class Decider:
     each call replays a CUDA graph of the whole decision (forward pass and sampling) for its bucket of rows and objects:
     run op by op, a call launched ~280 kernels, 9 ms of CPU for 0.7 ms of GPU work, whatever the batch."""
 
-    def __init__(self, models, device, core, capacity=1024, fast=True, channels_last=False, frozen_temperature=1.0):
+    def __init__(self, models, device, core, capacity=1024, fast=True, channels_last=False, frozen_temperature=1.0,
+                 overlap=False):
         torch.backends.mha.set_fastpath_enabled(False)  # the learner's attention path: same numerics, and capturable
         self.models, self.device, self.capacity = models, device, capacity
         self.frozen_temperature = frozen_temperature  # card/tile temperature of every model but 'current' (as played)
+        self.overlap = overlap  # the run's overlap rule, for every model it serves
         self.rows = {}  # (collector, owner) -> row of the LSTM states; row `capacity` is scratch (padding rows)
         self.states = {}  # LSTM size -> (h, c), each [1, capacity + 1, size]
         self.h, self.c = self.state(core)
@@ -398,6 +397,7 @@ class Decider:
             if name not in self.models:
                 self.models[name] = policy.load(path, self.device)[0]
                 self.models[name].temperature = self.frozen_temperature  # before its graphs are captured
+                self.models[name].overlap = self.overlap
                 self.state(self.models[name].config.core)
                 if self.channels_last:
                     policy.convolution_layout(self.models[name])
@@ -447,7 +447,7 @@ class Decider:
 
 
 WEIGHTS_POLL = 5  # s between a decision server's asks for newer weights
-SERVED = ('learner_temperature', 'learner_mix', 'frozen_temperature', 'channels_last')  # a server applies them once
+SERVED = ('learner_temperature', 'learner_mix', 'frozen_temperature', 'channels_last', 'overlap')  # applied once
 
 
 def served(run):
@@ -473,9 +473,10 @@ def server(sid, run, listener, gpu, mps, fast=True):
     applied = {k: settings.get(k) for k in SERVED}
     current.temperature = settings.get('learner_temperature', 1.0)
     current.mix = settings.get('learner_mix', 0.0)
+    current.overlap = bool(settings.get('overlap'))
     decider = Decider({'current': current}, device, current.config.core, fast=fast,
                       channels_last=settings.get('channels_last', False),
-                      frozen_temperature=settings.get('frozen_temperature', 1.0))
+                      frozen_temperature=settings.get('frozen_temperature', 1.0), overlap=current.overlap)
     conns, arrivals, polled, stats = [], queue.Queue(), time.monotonic(), defaultdict(float)
 
     def accept():

@@ -72,6 +72,31 @@ def test_packed_inputs_and_ppo_update(tmp_path, monkeypatch, option):
     np.testing.assert_array_equal(advantage, [0., -1., -1.])
 
 
+def test_with_overlap_the_learner_scores_what_the_actor_sampled_under_the_engines_mask(tmp_path, monkeypatch):
+    # "overlap": the engine's mask (Engine.playable, as Game.views() adds it) rides in the inputs, so the PPO update's
+    # log-probs are the sampler's even while a card is in flight
+    root = dataset(tmp_path / 'data', monkeypatch)
+    entry = json.loads((root / 'manifest.json').read_text())['entries'][0]
+    x, _ = next(imitation.chunks(imitation.read(root / entry['file'], entry['owner']), 300, True, None))
+    T, rng = len(x['scalars']), np.random.default_rng(0)
+    x['own_flight_card'] = np.where(np.arange(T) % 3 == 0, 1, 0).astype(np.int64)  # a card in flight every third
+    x['live_playable'] = rng.random((T, 4)) < 0.6
+    torch.manual_seed(0)
+    model = policy.Policy(policy.Config(vocab_size=len(C.Vocab([26000000])), card_dim=4, object_dim=4, core=8,
+                                        attention_layers=0, conv_channels=4, conv_layers=1))
+    model.overlap = True
+    rows = [policy.pack({k: v[t] for k, v in x.items()}) for t in range(T)]
+    packed = policy.tensors({k: policy.pad_stack([r[k] for r in rows])[None] for k in rows[0]}, 'cpu')
+    with torch.no_grad():
+        action, logp = policy.sample(model, model(packed), packed, policy.ABILITY_EXPLORE)
+        again = ppo.evaluate(model, packed, action[None], torch.ones(1, T, dtype=torch.bool))
+    assert torch.allclose(again['logp'], logp, atol=1e-4)
+    what, slot, _, play = policy.split(action)
+    assert all(bool(x['live_playable'][t, slot[t]]) for t in range(T) if play[t]), 'only cards the engine takes'
+    flying = torch.from_numpy((x['own_flight_card'] > 0) & x['live_playable'].any(1))
+    assert flying.any() and torch.isfinite(again['what'][flying, policy.PLAY]).all(), 'it may play with a card in flight'
+
+
 def test_actor_learner_link_and_shaping(tmp_path):
     inbox = ppo.Inbox(b'k' * 16, (3, {'w': np.ones(2, np.float32)}, {'il': ('il.pt', 0.3)}))
     (tmp_path / 'endpoint.json').write_text(json.dumps(dict(host='127.0.0.1', ports=[inbox.port], authkey=(b'k' * 16).hex())))
@@ -95,6 +120,7 @@ def test_actor_learner_link_and_shaping(tmp_path):
 
 def test_wire_rows_stage_like_padded_rows():
     x, _ = arrays(3, 1)
+    x['live_playable'] = np.array([[True, False, True, True], [False] * 4, [True] * 4])  # "overlap": the engine's mask
     rows = [policy.pack({k: v[t] for k, v in x.items()}) for t in range(3)]
     rows[1] = {k: v[:1] if k in C.OBJECT_KEYS else v for k, v in rows[1].items()}  # fewer objects
     rows[2] = {k: v[:0] if k in C.OBJECT_KEYS else v for k, v in rows[2].items()}  # none
@@ -385,6 +411,38 @@ def test_a_specialist_meets_focus_hard_and_pool_decks(tmp_path):
     record.save()
     assert len(matchmaking.DeckScores(tmp_path).scores['a']) == matchmaking.RECENT, 'recent games only, kept on restart'
     assert matchmaking.read_hard(tmp_path) == matchmaking.hard_decks({'a': [0.0] * matchmaking.RECENT})
+
+
+def test_a_general_run_aims_opponent_decks_at_its_learning_seat_and_keeps_its_own(tmp_path):
+    deck = lambda *ids: [dict(d=i) for i in ids]  # noqa: E731
+    pool = [dict(decks=[deck(1, 2), deck(3, 4)]), dict(decks=[deck(5, 6), deck(7, 8)])]
+    decks, rng = matchmaking.Decks(pool), random.Random(0)
+    (tmp_path / 'hard-decks.json').write_text(json.dumps({'5-6': 1.0}))
+    models = [('il', '/il'), ('current', None)]
+    general = dict(deck_mix={'hard': 1.0})
+    pair, seat = matchmaking.seat_decks(pool[0], general, models, None, decks, tmp_path, rng)
+    assert seat == 1 and matchmaking.deck_key(pair['decks'][0]) == '5-6', "the opponent's deck: a hard one"
+    assert matchmaking.deck_key(pair['decks'][1]) == '7-8', 'the learning seat: the human deck that met it'
+    judged = dict(a=['current', None], b=['il', '/il'])
+    assert matchmaking.seat_decks(pool[0], general, models, judged, decks, tmp_path, rng) == (pool[0], 1), \
+        'gates keep the pool pair'
+    (tmp_path / 'hard-decks.json').write_text(json.dumps({'7-8': 1.0}))  # on the other side of its pool pair
+    pair, seat = matchmaking.seat_decks(pool[0], general, models, None, decks, tmp_path, rng)
+    assert [matchmaking.deck_key(d) for d in pair['decks']] == ['7-8', '5-6'], 'not a mirror of the drawn deck'
+    (tmp_path / 'hard-decks.json').write_text(json.dumps({'5-6': 1.0}))
+    specialist = dict(general, deck=deck(9, 10))
+    pair, seat = matchmaking.seat_decks(pool[0], specialist, models, None, decks, tmp_path, rng)
+    assert [matchmaking.deck_key(d) for d in pair['decks']] == ['5-6', '9-10']
+
+
+def test_the_imitation_step_learns_from_a_whole_dataset_winning_views_only(tmp_path, monkeypatch):
+    root = dataset(tmp_path / 'data', monkeypatch)
+    seen = []
+    monkeypatch.setattr(imitation, 'chunks', lambda data, *a: (seen.append(data['t_value'][0]), [data])[1])
+    monkeypatch.setattr(imitation, 'collate', lambda items: items)
+    experts = imitation.Experts(root / 'manifest.json', 0)  # a manifest: no outcomes listed, every deck
+    assert len(experts.entries) == 4, 'validation views left out'
+    assert len(experts.batch(6)) == 6 and set(seen) == {1.0}, 'losing views are drawn again'
 
 
 def test_the_imitation_step_learns_the_human_games(tmp_path, monkeypatch):

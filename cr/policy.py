@@ -321,8 +321,8 @@ def playable(x, overlap=False):
     with a card in flight, not its slot (it leaves the hand when it lands) and its cost reserved, as Engine.step does."""
     legal = x['legal'].flatten(2).any(-1)
     if 'live_playable' in x:
-        # The host has reconciled ALL queued cards and abilities, including
-        # payment order and regeneration. Do not subtract own_flight a second
+        # The host has reconciled ALL queued cards and abilities (live: cr.live_budget; the simulator:
+        # Engine.playable for an overlapping player). Do not subtract own_flight a second
         # time or reapply the older one-flight affordability approximation.
         return legal & x['live_playable'].bool()
     if 'hand_float' not in x or 'scalars' not in x:

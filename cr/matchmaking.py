@@ -121,8 +121,22 @@ class Decks:
         else:
             return pair
         i, theirs = rng.choice(self.seats[key])
-        drawn = self.pool[i]
-        return dict(drawn, decks=[drawn['decks'][theirs] if o == side else d for o, d in enumerate(drawn['decks'])])
+        drawn = self.pool[i]  # its other seat: the human deck that met this one (not this one again, a mirror)
+        return dict(drawn, decks=[drawn['decks'][theirs] if o == side else drawn['decks'][1 - theirs] for o in (0, 1)])
+
+
+def seat_decks(pair, s, models, judged, decks, run, rng):
+    """A game's decks with settings `s`: a specialist's "deck" on its learning seat (an evaluation game: the judged
+    candidate), and with "deck_mix" a learning game's opponent deck drawn by `decks` (Decks: focus, hard or the pair's
+    own; a drawn deck brings its own pair, so without "deck" the learning seat plays the human deck that met it)
+    -> (the pair, the seat they are aimed at)."""
+    special = deck_seat(models, judged, rng)
+    deck = s.get('deck') and rng.sample(s['deck'], len(s['deck']))  # in a random order, as humans' decks come
+    if s.get('deck_mix') and not judged:  # gates keep the pool's decks
+        pair = decks.pick(pair, 1 - special, s['deck_mix'], read_hard(run), rng)
+    if deck:
+        pair = dict(pair, decks=[deck if o == special else d for o, d in enumerate(pair['decks'])])
+    return pair, special
 
 
 def hard_decks(scores):

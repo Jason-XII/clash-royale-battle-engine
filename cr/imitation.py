@@ -185,21 +185,29 @@ def collate(items):
 
 
 class Experts:
-    """Human games for the PPO learner's imitation step: the winning player views of a deck index (experiments/
-    deck_index.py; its validation games left out). batch(n): n random views, one random chunk of CHUNK decisions each,
-    ability presses relabelled as train.py --ability_labels 1 does."""
+    """Human games for the PPO learner's imitation step: the winning player views (validation games left out) of a
+    deck index (experiments/deck_index.py, outcomes listed) or of a whole dataset (its manifest.json: every deck; a
+    view's outcome is checked when it is read). batch(n): n random winning views, one random chunk of CHUNK decisions
+    each, ability presses relabelled as train.py --ability_labels 1 does."""
     CHUNK = 128
 
     def __init__(self, index, seed):
-        spec = json.loads(Path(index).read_text())
-        self.root, self.rng = Path(spec['data']), random.Random(seed)
-        self.entries = [e for e in spec['entries'] if e['outcome'] > 0 and not e['validation']]
+        path = Path(index)
+        spec = json.loads(path.read_text())
+        self.root, self.rng = Path(spec.get('data', path.parent)), random.Random(seed)
+        self.entries = [e for e in spec['entries'] if e.get('outcome', 1) > 0 and not e['validation']]
         if not self.entries:
             raise ValueError(f'{index}: no winning player views')
 
     def batch(self, n):
         items = []
-        for e in self.rng.sample(self.entries, min(n, len(self.entries))):
-            data = ability_labels(read(self.root / e['file'], e['owner']))
-            items.append(self.rng.choice(list(chunks(data, self.CHUNK, False, self.rng))))
+        for _ in range(100 * n):  # a manifest's losing views are drawn again (about half its reads)
+            if len(items) == n:
+                break
+            e = self.rng.choice(self.entries)
+            data = read(self.root / e['file'], e['owner'])
+            if data['t_value'][0] > 0:
+                items.append(self.rng.choice(list(chunks(ability_labels(data), self.CHUNK, False, self.rng))))
+        if not items:
+            raise ValueError(f'{self.root}: no winning player view in {100 * n} draws')
         return collate(items)

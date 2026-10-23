@@ -44,6 +44,11 @@ Hog 2.6 recipe), each optional:
 - --bc-index (a deck_index.py file of human games with that deck): after each PPO update, one imitation step on
   --bc-batch random chunks of those games at weight --bc-coef (FirstLight's expert BC, 0.2), which keeps the
   specialist's play close to how humans play the deck. Metrics bc_*.
+"overlap": true (23 Oct): every seat of every game may tap a card while one is in flight, as the real game allows
+(two at most, never the slot in flight, every pending cost reserved: arena.Engine._card_tap); the engine's mask goes to
+each sampler in the inputs (live_playable), so actors and the learner score the same choices. Deploy with play.py
+--overlap. A general run can use the last two without "deck" (23 Oct): "deck_mix" then aims opponent decks at the learning seat's
+weak spots, and "bc_index" can be a whole dataset's manifest.json (every deck's winning human views).
 """
 import argparse
 from collections import defaultdict, deque
@@ -130,11 +135,13 @@ def evaluate(model, x, action, valid):
     full = model(x)
     out, x = policy.flat(full, x)
     v = valid.reshape(-1)
-    xv = {k: x[k][v] for k in ('own_flight_card', 'legal', 'hand_float', 'scalars')}
+    xv = {k: x[k][v] for k in ('own_flight_card', 'own_flight_float', 'hand_card', 'legal', 'hand_float', 'scalars',
+                               'live_playable') if k in x}
     what, slot, cell, play = policy.split(action.reshape(-1)[v])
-    what_lp = policy.what_logp(out['what'][v], xv, policy.ABILITY_EXPLORE, out['which'][v])
+    overlap = getattr(model, 'overlap', False)  # "overlap": the engine's mask (live_playable) rode along in the inputs
+    what_lp = policy.what_logp(out['what'][v], xv, policy.ABILITY_EXPLORE, out['which'][v], overlap)
     t, mix = getattr(model, 'temperature', 1.0), getattr(model, 'mix', 0.0)  # as it plays: the distribution it sampled
-    which_lp = policy.sharpen(policy.which_logp(out['which'][v], xv), t, mix)
+    which_lp = policy.sharpen(policy.which_logp(out['which'][v], xv, overlap), t, mix)
     tiles = policy.sharpen(policy.tile_logp(model, out, x, slot[play], v.nonzero().squeeze(1)[play]), t, mix)
     tile, tile_entropy = what_lp.new_zeros(len(what)), what_lp.new_zeros(len(what))
     tile[play] = tiles.gather(1, cell[play].unsqueeze(1)).squeeze(1)
@@ -414,7 +421,7 @@ DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibat
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
                 pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, margin=0.2, eval_frac=0.25,
                 channels_last=True, against='', frozen_temperature=1.0, learner_temperature=1.0,
-                learner_mix=0.0, bc_index='', bc_coef=0.2, bc_batch=8)
+                learner_mix=0.0, bc_index='', bc_coef=0.2, bc_batch=8, overlap=False)
 
 
 
@@ -437,6 +444,7 @@ def learn(args, settings):
     critic = Critic(trunk).to(device).train()
     model.temperature = reference.temperature = s.learner_temperature  # trains (and is anchored) as it plays
     model.mix = reference.mix = s.learner_mix
+    model.overlap = reference.overlap = s.overlap  # samples (and is scored) under the run's overlap rule
     optimizer = torch.optim.Adam(model.parameters(), lr=s.lr)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=s.critic_lr)
     version = fresh = 0
@@ -495,7 +503,8 @@ def learn(args, settings):
     champion = follow_champion(None)
     floor = version  # games played before this start (old settings) or a rollback are not learned from
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> the learning seat's recent outcomes
-    decks = matchmaking.DeckScores(out) if rank == 0 and getattr(s, 'deck', None) else None  # a specialist's opponents
+    decks = matchmaking.DeckScores(out) if rank == 0 and (getattr(s, 'deck', None) or getattr(s, 'deck_mix', None)) \
+        else None  # the learning seat's opponent decks
     experts = imitation.Experts(s.bc_index, f'{rank}-{version}') if s.bc_index else None
 
     def opponents():
