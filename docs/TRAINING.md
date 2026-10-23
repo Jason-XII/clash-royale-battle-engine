@@ -881,11 +881,11 @@ It flattens after 200 games: 4.6 times the games add under a point, so 10 times 
 about 13%. More labels of this kind won't close the gap.
 
 **r4** (N + card stats, full data): final held-out loss 4.6217 against r3's 4.6155. The card stats' gain in the
-30k-game ablation (section 12) did not hold at full data. Its arena against r3 IL and v200 is in
-`~/il-runs/r4-1022/arena/`.
+30k-game ablation (section 12) did not hold at full data. Arena (T 0.1, 400 paired games each): r4 vs r3 IL
+51.0 ± 4.9%, r4 vs v200 23.2 ± 4.1% (r3 IL: 24.0%). r4 is no better than r3, so no PPO run from it.
 
 **Live** (user-started battles, T 0.05). gen-large v200 on 22 October, evening: 11–9. gen-r3 v240 on 23 October,
-morning: 6–0 so far (1–0, 1–0, then four 3–0). Small samples; user-started battles have been easier than the ladder
+morning: 7–1 (1–0, 1–0, four 3–0, 1–0, 0–1). Small samples; user-started battles have been easier than the ladder
 (section 12: v100 went 6–1 there, 3–6 on the ladder).
 
 **Assessment (23 October).**
@@ -897,4 +897,23 @@ morning: 6–0 so far (1–0, 1–0, then four 3–0). Small samples; user-start
    new games, flat from 200 to 915 games. More labels of this kind won't close the gap.
 4. Search at deployment, the only measured route to the 20 points, is ruled out as the main route by the user: it ties
    the bot to the engine and makes it hard to run on other systems. The search stays a teacher for training.
-5. Open: r4's arena, then a new placement plan.
+5. Open: a new placement plan; the critic truth test (below) decides whether short credit is worth retrying.
+
+**Critic truth test** (23 October, running; `~/cr-ppo/diag/critic-1023/`, `critic_test.py`, `critic_report.py`).
+Is gen-r3's critic accurate enough to judge plays? Seat A plays as the learner (v240 at T 1, the press floor), seat B as
+a frozen opponent (v240 at T 0.05), and v240's critic values A's position. At 2 random decisions per game, the engine
+is forked 16 times and each copy played to the end: the mean outcome is the position's true value, the spread the
+noise no critic can remove. At one of A's card plays per game, A's sampled tile and its top tiles (8) are each forced
+in 8 copies played to the end, copy k with the same random draws for every tile: each tile's true value against the
+critic's value 0.25 to 10 s after the tap, which is what short credit uses. 100 games on 20 CPUs, about 4 hours.
+
+**Which decks beat us? (the user's idea: more training games against them.)** Two quick checks, 23 October.
+- Live, 284 games of PPO models (several models and our own decks, so indicative only): 185–96–3, a 34% loss rate.
+  By the opponent's win condition: Lava Hound 6 losses in 7 games, Giant 11 in 19 (58%), Balloon 5 in 11, P.E.K.K.A
+  10 in 24; Hog Rider 8 in 31 (26%), Golem 12 in 37 (32%). Giant, Lava Hound, Balloon and P.E.K.K.A together: 32
+  losses in 61 games (52%), against 64 in 223 (29%) for the rest.
+- Humans (all IL replays, each game credited to both decks): every win condition wins 44–52%, a balanced meta. Our
+  model in self-play (section 10's 9,335 games): 39–60%, Lava Hound 57% and P.E.K.K.A 54% (it either plays them well
+  or defends them badly; self-play can't tell which), the precise decks lowest (Goblin Drill 39%, X-Bow 41%, Miner 41%).
+- So the live losses concentrate on a few beatdown and air decks that humans don't find stronger than the rest: a
+  real target for deck-weighted training. `attic/decks/human_wincons.py`; `~/cr-ppo/diag/decks/human_wincons.json`.
