@@ -20,8 +20,8 @@ import time
 
 import torch
 
-import common as C
-import train
+from cr import observation as C
+from cr.policy import Agent, load
 
 SDK = Path(os.environ.get('ANDROID_SDK_ROOT', Path.home() / 'Library/Android/sdk'))
 ADB = shutil.which('adb') or str(SDK / 'platform-tools/adb')
@@ -472,7 +472,7 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
     record = records(first)
     forms = next(p['deck_form_flags'] for p in first['players'] if p['side'] == other)
     view = C.PlayerView(owner, vocab, C.opponent_heroes(record, forms, owner), C.cached_legal())
-    agent, plays = train.Agent(model, owner), LivePlays()
+    agent, plays = Agent(model, owner), LivePlays()
     log({'event': 'start', 'owner': owner, 'tick': first['game_tick']})
     decided, pending, reported = None, None, 0  # pending: {'card', 'tick', 'due', 'x', 'y'} of a card tap not landed
     battle = first['chain']['battle']
@@ -533,7 +533,7 @@ def play_battle(stream, first, model, vocab, records, owner, taps, log):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('checkpoint', type=Path, help="a train.py checkpoint (latest.pt)")
+    parser.add_argument('checkpoint', type=Path, help="a model checkpoint (train.py's latest.pt, a PPO snapshot)")
     parser.add_argument('--tables', required=True, type=Path, help="clapha-engine export_tables.py's JSON, August build")
     parser.add_argument('--account', default='auto',
                         help="our account id (finds our seat); 'auto': ask the client each battle (Frida)")
@@ -546,7 +546,7 @@ def main():
                         help='card and tile temperature (< 1: sharper); when to play stays sampled as trained')
     args = parser.parse_args()
     torch.set_num_threads(2)
-    model, vocab, _ = train.load(args.checkpoint)
+    model, vocab, _ = load(args.checkpoint)
     model.temperature = args.temperature
     records = LiveRecords(args.tables)
     prepare(args.serial)

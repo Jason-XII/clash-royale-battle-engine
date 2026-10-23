@@ -95,7 +95,7 @@ the capacity gain here comes from the deployed actors.
 
 Serving fallback: `act --no-fast-inference --no-opponent-affinity`.
 Native fallback: set `CR_NATIVE_FEATURES=0` before starting processes.
-Build native helpers with the deployment interpreter: `python build_features.py`.
+Build native helpers with the deployment interpreter: `python tools/build_features.py`.
 The extension is optional, platform/Python-specific, and not checked into Git.
 PPO layout fallback: `learn --no-channels-last` (saved settings take precedence on resume).
 

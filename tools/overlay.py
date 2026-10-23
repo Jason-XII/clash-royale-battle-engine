@@ -80,7 +80,7 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     here = Path(__file__).resolve().parent
-    parser.add_argument('--profile', type=Path, default=here.parent / 'crack-cr/queue_overlay/arena_grid_profile.json')
+    parser.add_argument('--profile', type=Path, default=here.parent.parent / 'crack-cr/queue_overlay/arena_grid_profile.json')
     parser.add_argument('--logs', type=Path, default=Path.home() / 'cr-live/runs/live')
     args = parser.parse_args()
     box = json.loads(args.profile.read_text())['frame_top_left']

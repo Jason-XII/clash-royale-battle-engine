@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 try:
-    import _native_features
+    from cr import _native_features  # tools/build_features.py
 except ImportError:
     _native_features = None
 if os.environ.get('CR_NATIVE_FEATURES', '1') == '0':
@@ -14,7 +14,7 @@ if os.environ.get('CR_NATIVE_FEATURES', '1') == '0':
 
 import numpy as np
 
-ASSETS = Path(__file__).resolve().parent / 'assets'
+ASSETS = Path(__file__).resolve().parent.parent / 'assets'
 W, H = 18, 32
 CELLS = W * H
 MAX_OBJECTS, MAX_EFFECTS = 128, 6

@@ -26,7 +26,7 @@ import zipfile
 
 import numpy as np
 
-import common as C
+from cr import observation as C
 
 # ---- replay -> native match and commands --------------------------------------------------------------------------------
 CARDS = json.loads((C.ASSETS / 'replay_cards.json').read_text())

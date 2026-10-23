@@ -2,20 +2,34 @@
 
 Replays → native engine → compact games → imitation learning → live play on Null's Royale.
 
-| File | What it does | Where it runs |
+The programs you run are at the top level; what they share is the `cr` package.
+
+| Program | What it does | Where it runs |
 |---|---|---|
 | `convert.py` | Replays the collected battles in the native engine and writes one archive per game (both players' inputs and labels) | Linux, Slurm |
-| `train.py` | The policy network, its loss, the data loader and the training loop; inference helpers | GPU, Slurm |
+| `train.py` | Imitation learning: the training loop | GPU, Slurm |
 | `play.py` | Boots the emulator, reads the game's memory, runs the model and taps | Mac |
-| `common.py` | What all three share: the observation of one decision, legal placement, the clock and elixir timing | — |
 | `arena.py` | Paired-seat native battles between two models | Linux, Slurm |
-| `ppo.py` | Self-play PPO from the IL model: a DDP learner with a separate critic, and actor jobs (native games, batched GPU decisions) | GPU, Slurm |
+| `ppo.py` | PPO from the IL model: the DDP learner with a separate critic (`learn`), and actor jobs (`act`) | GPU, Slurm |
 | `loop.py` | The improvement loop around a PPO run: frozen champion vs learning challenger, gates with evaluation games, promotion, rollback, job recovery, `RUN/report.md` | Slurm login node (light) |
+
+| `cr/` module | What it holds |
+|---|---|
+| `observation.py` | The observation of one decision (`PlayerView`), legal placement, the clock and elixir timing, the vocabulary. NumPy only |
+| `policy.py` | The network, loading a checkpoint, packing inputs, sampling actions (masks, temperature), decoding them; `Agent` |
+| `imitation.py` | Imitation's loss and data: converted games to chunks and padded batches |
+| `engine.py` | The native simulator as the models play it (`Engine`, `Inputs`, matches from the deck pool), one game (`Game`: views, then step with both players' choices), and the rewards' parts |
+| `matchmaking.py` | Who plays whom: opponent weights (PFSP, fixed shares), each game's two models, evaluation matches, a specialist's deck seat and opponent decks |
+| `actors.py` | PPO's collectors and decision servers, their wire format, and the link to the learner |
+
+`tools/` holds small standalone programs: `build_features.py` (the optional C helpers), `card_stats.py`, and the live
+displays `winbar.py` and `overlay.py`. `experiments/` holds measurement scripts kept for reuse. `tests/` checks it all
+without an engine, emulator or GPU. Checkpoints hold plain dicts (config, weights, vocabulary), so they load whatever
+module the code is in.
 
 `assets/` holds the game-build tables (card costs and rarities, effects, placement masks, replay card names, the
 881-token vocabulary, the supported client's hashes). The device reader binary `assets/clapha-reader-nulls` is not in
-the repository: get it from Arron and put it there before playing live. `test_pipeline.py` checks it all
-without an engine, emulator or GPU.
+the repository: get it from Arron and put it there before playing live.
 
 ## Convert
 
@@ -59,7 +73,7 @@ Architecture options, all off by default so every saved checkpoint loads unchang
 - `--card_stats 1`: every card and unit id also gets its fixed stats from the game data (range, targets, hitpoints,
   damage, speed, splash, ...: `assets/card_stats.json`, 28 fields), through a learned map added to its embedding.
   -0.037 held-out loss in the 30k-game ablation (section 12), but no gain at full data (r4, section 13). Rebuild the table for a new game build with
-  `python card_stats.py CSV_LOGIC assets/vocab.json assets/replay_cards.json UNIT_STATE_TABLES.json assets/card_stats.json`
+  `python tools/card_stats.py CSV_LOGIC assets/vocab.json assets/replay_cards.json UNIT_STATE_TABLES.json assets/card_stats.json`
   (`CSV_LOGIC`: the build's `data/assets/csv_logic`; the unit-state tables name the units' data ids).
 - `--max_train N --max_val N`: random subsets of the games, for ablations.
 - `--ability_labels 1`: each human ability press is labelled where it was tapped (4 decisions earlier) and on the
@@ -88,7 +102,7 @@ It boots the visible `Pixel_9_2` emulator if needed (`-gpu host`), verifies the 
 re-applies the review-crash patch an emulator snapshot may have rolled back, and waits for a battle. Start a friendly
 battle by hand, or add `--queue` to press Battle on the ladder. `--games N` plays several. Logs go to
 `~/cr-live/runs/live` (OneDrive stalls writes). The model sees advance opponent commands from the reader's queue.
-`--losses N` plays ladder games until the N-th loss. `python winbar.py` opens a blue/red bar of the model's predicted
+`--losses N` plays ladder games until the N-th loss. `python tools/winbar.py` opens a blue/red bar of the model's predicted
 win chance, (value + 1) / 2 from the policy's value head, following the newest live log. That head is IL's (PPO
 doesn't train it), so the bar is a rough display: it starts near 60% for most decks.
 
@@ -108,7 +122,7 @@ call. Inputs use one pinned transfer per model group and results are read back t
 opponent to a balanced server cohort, reducing the number of small model groups without changing opponent selection.
 Use `act --no-fast-inference --no-opponent-affinity` for the previous serving path. PPO uses the same channels-last
 convolution layout as IL on CUDA; `learn --no-channels-last` disables it (a saved setting takes precedence on resume).
-`python build_features.py` builds optional CPython helpers for memory reads and unit features with the system C compiler;
+`python tools/build_features.py` builds optional CPython helpers (into `cr/`) for memory reads and unit features with the system C compiler;
 build once per Python/platform. They preserve the existing observation arrays. `CR_NATIVE_FEATURES=0` selects Python
 helpers at process startup. Without the extension, the Python path is used automatically.
 Half the games are self-play, the rest against the IL model, recent snapshots (`RUN/pool/`) or promoted champions
@@ -123,9 +137,6 @@ Settings live in `RUN/settings.json`; every default in `ppo.py`'s `DEFAULTS` is 
 reward ones (`shaping`, `margin`: the end-of-game difference in lowest tower HP):
 - `frozen_temperature`: the card/tile temperature of every frozen model (opponents, evaluation and benchmark
   games), so they play as deployed. Only the learner gets the 1% ability-press floor (`ABILITY_EXPLORE`).
-- `lam_place` (default 0, off): credit the card and tile of a play with this GAE λ (e.g. 0.95, about 5 s) and when to
-  play with `lam`. No gain in the 22–23 October A/B; its parts' old log-probs come from the learner, not the actors
-  (section 13), so fix that before using it again.
 - `learner_temperature` and `learner_mix`: the temperature the learner plays at, with that share of its untempered
   policy mixed in to keep exploring. PPO scores the log-probabilities of exactly that distribution.
 - `against`: another run's directory. The run then plays only that run's current champion: an exploiter that looks
@@ -152,7 +163,7 @@ resubmits cancelled jobs), then `scancel` the job ids in `RUN/loop-state.json`.
 python arena.py A.pt B.pt --engine ~/clapha-engine --pool ~/cr-engine/data/deck_pool.json --games 20 --out runs/arena.jsonl \
   --a-temperature 0.1 --b-temperature 0.1   # compare models as they are deployed
 # --a-overlap: A may tap a card while another of its plays is still in flight (humans do; off everywhere by default)
-OMP_NUM_THREADS=2 python -m pytest test_pipeline.py
+OMP_NUM_THREADS=2 python -m pytest tests
 ```
 
 Python 3.10+, NumPy and PyTorch; pyarrow for conversion; pytest for the tests. On a Mac, torchrun needs

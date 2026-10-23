@@ -4,7 +4,7 @@ import shlex
 import subprocess
 import sysconfig
 
-root = Path(__file__).resolve().parent
+root = Path(__file__).resolve().parent.parent / 'cr'
 target = root / ('_native_features' + sysconfig.get_config_var('EXT_SUFFIX'))
 command = shlex.split(sysconfig.get_config_var('LDSHARED'))
 subprocess.run(command + ['-O3', '-fPIC', '-I' + sysconfig.get_path('include'),

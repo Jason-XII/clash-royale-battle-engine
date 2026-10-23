@@ -721,7 +721,7 @@ Trained on v60 with the listwise loss on the same 761 games of value-judged labe
 The branch fits the training games better and the held-out games no better: on this many labels it memorizes. 1,017
 labelled games are kept (`labels-r3/`) for a retry with more labels or with the branch trained on human data first.
 
-**What the model sees** (common.py `decision_inputs` and `PlayerView`). Up to 128 objects (units, buildings, towers,
+**What the model sees** (cr/observation.py `decision_inputs` and `PlayerView`). Up to 128 objects (units, buildings, towers,
 spells, projectiles), each with its card and form id, side, kind, exact position and movement, hp, deploy time, its
 current target, 31 unit-state values (stun, slow, attack cycle and load, charge, dash, ability, shield, height, ...) and
 up to 6 buffs; its hand (cost, affordability, evolution), the next 4 cards, ability buttons; plays in flight (its own,
