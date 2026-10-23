@@ -256,6 +256,13 @@ CYCLE_REQUIRED = {
     26000056: 2, 26000058: 2, 26000059: 2, 26000060: 1, 26000063: 1, 26000064: 2, 27000000: 2, 27000002: 2, 27000006: 2,
     27000010: 2, 27000012: 2, 27000013: 2, 28000004: 2, 28000008: 2, 28000017: 2}
 EVOLUTION = 1  # deck_form_flags: 1 evolution, 2 hero
+
+
+def untag(address):
+    """A reader address ('0x...') without the Android heap tag in its top byte: entities come tagged, targets not."""
+    return int(address, 16) & 0x00FFFFFFFFFFFFFF if address else 0
+
+
 STATE_NAMES = {0: 'idle', 1: 'moving', 2: 'attacking', 3: 'dashing', 4: 'deploying', 5: 'river_jump', 6: 'underground',
                7: 'ability_underground', 10: 'ability_cast', 11: 'waiting_to_appear', 12: 'pulled',
                13: 'reeling_to_building', 14: 'hooking', 16: 'deflecting'}
@@ -279,7 +286,7 @@ class LiveRecords:
 
     def __call__(self, frame):
         entities = frame['entities']
-        ids = {e['address']: (e['side'], e['category']) for e in entities}
+        ids = {untag(e['address']): (e['side'], e['category']) for e in entities}
         units = self.unit_states(frame)
         players = sorted(frame['players'], key=lambda p: p['side'])
         return {'tick': frame['game_tick'],
@@ -374,7 +381,7 @@ class LiveRecords:
 def _object(e, ids):
     """One objects() row: the attack's target, load and the deploy timer only with an attack component."""
     attack = bool(e.get('has_attack'))
-    target = ids.get(e.get('target'))
+    target = ids.get(untag(e.get('target')))  # no target: 0x0, no entity
     return {'nativeObjectId': e['category'], 'owner': e['side'], 'cardId': e['card_id'],
             'dataGlobalId': (e.get('data_id') or 0) & 0xFFFFFFFF, 'x': e['x'], 'y': e['y'],
             'hp': e['hp'] if e['hp'] >= 0 else None, 'maxHp': e['max_hp'] if e['max_hp'] >= 0 else None,
