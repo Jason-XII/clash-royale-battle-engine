@@ -9,6 +9,8 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
+import numpy as np
+
 from cr import observation as C
 
 # decision -> landing ticks, one drawn per play: as live (136 v350/v400 games, taps it could pay for, 2026-10-18:
@@ -109,6 +111,7 @@ class Play:
 
 
 ABILITY = -1
+CARDS_IN_FLIGHT = 2  # with overlap, at most this many own cards on their way (the live ledger's rule, play.py --overlap)
 
 
 @dataclass(frozen=True)
@@ -185,21 +188,19 @@ class Engine:
         next tick with delay=0; `delay` = a tuple of choices: each play draws its own (PLAY_DELAY, as live). As the live client does (C.HOLD_TICKS), a play the elixir cannot pay for yet is held
         until it can, for at most C.HOLD_TICKS, then issued (and lands `delay` ticks later); a play that could not be paid
         for within that is refused. As live does, a player with a card in flight cannot start another (unless
-        self.overlap[owner]: 22 Oct), and a pending ability press blocks only another press, not a card.
+        self.overlap[owner]: 22 Oct; then up to CARDS_IN_FLIGHT, see _card_tap), and a pending ability press blocks only
+        another press, not a card.
         `executed[i]` says whether play i was accepted; landed plays show up in later states' `plays`."""
         before = self.state
         self.played = []  # confirmed card consumption this step, with exact tick and commanded position
         executed = []
         for a in actions:
-            # a card waits only for this player's cards, a press only for its presses: the live client takes a card tap
-            # while a press is on its way (22 Oct: blocking it refused ~0.4 card taps a game the model could not see)
-            mine = [p for p in self.pending if p['owner'] == a.owner and (p['slot'] == ABILITY) == (a.slot == ABILITY)]
-            free = not mine or (self.overlap[a.owner] and a.slot != ABILITY and
-                                all(p['slot'] != a.slot and not p['held'] for p in mine))
-            reserved = sum(p['cost'] for p in mine) * 10000
             lag = max(delay if isinstance(delay, int) else random.choice(delay), 1)
             due = before.tick + lag
             if a.slot == ABILITY:  # a tap on the ability button: lands like a card, if a carrier is still ready then
+                # a press waits only for this player's presses: the live client takes a card tap while a press is on
+                # its way (22 Oct: blocking it refused ~0.4 card taps a game the model could not see)
+                free = not any(p['owner'] == a.owner and p['slot'] == ABILITY for p in self.pending)
                 ok = free and any(x.ready for x in before.players[a.owner].abilities)
                 if ok:
                     self.pending.append(dict(due=due, held=False, owner=a.owner, slot=ABILITY, card=None, cost=0,
@@ -207,8 +208,7 @@ class Engine:
                 executed.append(ok)
                 continue
             me = before.players[a.owner]
-            card = next((h for h in me.hand if h.slot == a.slot), None)
-            ok = card is not None and free and card.cost * 10000 <= me.elixir - reserved + C.hold_slack(before.tick)
+            card, reserved, ok = self._card_tap(a.owner, a.slot, before)
             if ok:
                 self.pending.append(dict(due=due, tap=before.tick, delay=lag, held=card.cost * 10000 > me.elixir - reserved,
                                          hold_until=before.tick + C.HOLD_TICKS, owner=a.owner, slot=a.slot,
@@ -227,6 +227,23 @@ class Engine:
         after = self._capture()
         self.state = after
         return Transition(after, after.tick - before.tick, tuple(executed))
+
+    def _card_tap(self, owner, slot, state):
+        """step()'s rule for a card tap on hand slot `slot` -> (the card or None, the elixir the pending cards reserve,
+        accepted?): free with none of the player's cards in flight, or with overlap fewer than CARDS_IN_FLIGHT, none on
+        this slot or still held for elixir; then the cost paid within the client's hold once their costs are reserved."""
+        mine = [p for p in self.pending if p['owner'] == owner and p['slot'] != ABILITY]
+        free = not mine or (self.overlap[owner] and len(mine) < CARDS_IN_FLIGHT and
+                            all(p['slot'] != slot and not p['held'] for p in mine))
+        reserved = sum(p['cost'] for p in mine) * 10000
+        me = state.players[owner]
+        card = next((h for h in me.hand if h.slot == slot), None)
+        return card, reserved, card is not None and free and card.cost * 10000 <= me.elixir - reserved + C.hold_slack(state.tick)
+
+    def playable(self, owner):
+        """[4] bool: the hand slots step() would take a card tap on now. Game.views() gives it to an overlapping player
+        as x['live_playable'], so its sampler picks only taps the engine accepts (its inputs show one card in flight)."""
+        return np.array([self._card_tap(owner, slot, self.state)[2] for slot in range(4)])
 
     def _players(self):
         """Per owner: ({hand index: (deck slot, card id)}, cycle card ids, elixir raw), with the battle's cached deck
@@ -449,7 +466,11 @@ class Game:
         self.inputs = Inputs(engine, self.match, vocabs, C.cached_legal() if legal is None else legal)
 
     def views(self):
-        return self.inputs(self.state)
+        views = self.inputs(self.state)
+        for owner, x in views.items():
+            if self.engine.overlap[owner]:  # its sampler takes exactly the card taps the engine accepts
+                x['live_playable'] = self.engine.playable(owner)
+        return views
 
     def step(self, choices):
         """choices: {owner: policy.decode() choice} -> (the Plays submitted, the Transition: `executed` in their order)."""
