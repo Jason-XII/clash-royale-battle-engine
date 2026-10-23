@@ -110,7 +110,7 @@ def collector(index, run, addresses, key, affinity=False):
     engine = Engine(s['engine'])
     link = Link(run, weights=False, index=index)
     _, opponents = link.exchange([], [], {})
-    server, address = None, None
+    server, address, decks = None, None, None
     timing = defaultdict(float)
     while True:
         # every game: a learner (re)started after this collector may have new settings (an actor that starts with its
@@ -127,9 +127,12 @@ def collector(index, run, addresses, key, affinity=False):
             server = Client(address, authkey=key)
         pair = rng.choice(pool)
         if s.get('deck'):  # a specialist (settings.json "deck", as in the pool): one learning seat always plays it
-            seat = matchmaking.deck_seat(models, judged, rng)
+            special = matchmaking.deck_seat(models, judged, rng)  # the seat that plays the deck
             deck = rng.sample(s['deck'], len(s['deck']))  # in a random order, as humans' decks come
-            pair = dict(pair, decks=[deck if o == seat else d for o, d in enumerate(pair['decks'])])
+            if s.get('deck_mix') and not judged:  # learning games also meet focus and hard decks; gates keep the pool's
+                decks = decks or matchmaking.Decks(pool)
+                pair = decks.pick(pair, 1 - special, s['deck_mix'], matchmaking.read_hard(run), rng)
+            pair = dict(pair, decks=[deck if o == special else d for o, d in enumerate(pair['decks'])])
         game = Game(engine, pair, rng.randrange(1 << 30), {0: vocab, 1: vocab}, legal)
         seats = {o: Seat() for o in (0, 1) if models[o][0] == 'current'}
         start = tower_hp(game.state)
@@ -189,6 +192,9 @@ def collector(index, run, addresses, key, affinity=False):
         learner = min(seats)
         result = dict(opponent=models[1 - learner][0] if len(seats) == 1 else 'self', tick=state.tick,
                       outcome=0.0 if state.result not in (0, 1) else 1.0 if state.result == learner else -1.0)
+        if s.get('deck'):  # the specialist's score against this deck (matchmaking.DeckScores)
+            result.update(deck=matchmaking.deck_key(pair['decks'][1 - special]),
+                          deck_score=0.5 if state.result not in (0, 1) else float(state.result == special))
         _, opponents = link.exchange(out, [result], dict(timing, games=1))
         timing = defaultdict(float)
 

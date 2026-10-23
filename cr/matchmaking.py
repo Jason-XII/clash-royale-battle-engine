@@ -1,9 +1,16 @@
-"""Who plays whom, and with which decks: the learner's opponents and their PFSP weights, each collector game's two
-models, the loop's evaluation matches, and a specialist's deck seat."""
+"""Who plays whom, and with which decks: the learner's opponents and their weights (fixed shares, PFSP), each
+collector game's two models, the loop's evaluation matches, and a specialist's seat and opponent decks."""
+from collections import defaultdict
 import json
+import os
 from pathlib import Path
 
 import numpy as np
+
+FOCUS = 20         # a specialist's focus decks: the pool's most common card sets
+HARD_BELOW = 0.55  # hard decks (FirstLight's rule): smoothed score (w + 2) / (n + 4) below this,
+HARD_TOP = 128     # the most pressing ones, by priority (HARD_BELOW - score) x n / (n + 4), drawn by priority^2
+RECENT = 32        # games per deck the scores keep (the newest)
 
 
 def evaluation(run):
@@ -49,11 +56,18 @@ def opponent_paths(out, init, s):
             **{p.stem: str(p) for p in sorted((out / 'league').glob('*.pt'))}}
 
 
-def pfsp(paths, results):
-    """{name: (checkpoint, weight)} over `paths` ({name: checkpoint}): weight (1 - the learner's win rate)^2 + 0.05, the
-    win rate from `results` ({name: recent outcomes, +-1}; 0.5 before any)."""
-    win = {n: (np.mean(results[n]) + 1) / 2 if results[n] else 0.5 for n in paths}
-    return {n: (path, (1 - win[n]) ** 2 + 0.05) for n, path in paths.items()}
+def weights(paths, results, fixed=None):
+    """{name: (checkpoint, weight)}: the opponents in `fixed` ({name: [checkpoint, share]}) at their shares of the games,
+    the rest of the games by PFSP over the other `paths` ({name: checkpoint}): weight (1 - the learner's win rate)^2 +
+    0.05, the win rate from `results` ({name: recent outcomes, +-1}; 0.5 before any), scaled to what the shares leave."""
+    fixed = fixed or {}
+    if not 0 <= sum(share for _, share in fixed.values()) <= 1:
+        raise ValueError(f'opponent shares must add up to at most 1: {fixed}')
+    rest = {n: path for n, path in paths.items() if n not in fixed}
+    win = {n: (np.mean(results[n]) + 1) / 2 if results[n] else 0.5 for n in rest}
+    pfsp = {n: (1 - win[n]) ** 2 + 0.05 for n in rest}
+    scale = (1 - sum(share for _, share in fixed.values())) / sum(pfsp.values()) if fixed and pfsp else 1.0
+    return {**{n: (path, share) for n, (path, share) in fixed.items()}, **{n: (rest[n], w * scale) for n, w in pfsp.items()}}
 
 
 def pick_models(opponents, matches, s, rng):
@@ -75,3 +89,80 @@ def pick_models(opponents, matches, s, rng):
     else:
         models = [('current', None)] * 2
     return models, judged
+
+
+# ---- a specialist's opponent decks --------------------------------------------------------------------------------------
+def deck_key(deck):
+    """A deck's card set (forms aside), as one string."""
+    return '-'.join(str(c) for c in sorted(c['d'] for c in deck))
+
+
+class Decks:
+    """The pool's decks by card set. pick(): a specialist's learning game draws its opponent's deck from the FOCUS most
+    common card sets (uniformly), from the hard ones (`hard`: {key: weight}), or keeps the pair's own (each deck as often
+    as humans played it), by the shares in `mix` ({'focus': share, 'hard': share}; the rest: the pair's own). A drawn
+    set comes with one of its pool seats at random: its forms and its pair's levels, as humans had them."""
+
+    def __init__(self, pool):
+        self.pool, self.seats = pool, defaultdict(list)
+        for i, pair in enumerate(pool):
+            for side, deck in enumerate(pair['decks']):
+                self.seats[deck_key(deck)].append((i, side))
+        self.focus = sorted(self.seats, key=lambda k: (-len(self.seats[k]), k))[:FOCUS]
+
+    def pick(self, pair, side, mix, hard, rng):
+        """-> (the pair to play, its deck on `side` replaced as drawn, or `pair` as it is)."""
+        u = rng.random()
+        if u < mix.get('focus', 0):
+            key = rng.choice(self.focus)
+        elif u < mix.get('focus', 0) + mix.get('hard', 0) and hard:
+            keys = sorted(hard)
+            key = rng.choices(keys, [hard[k] for k in keys])[0]
+        else:
+            return pair
+        i, theirs = rng.choice(self.seats[key])
+        drawn = self.pool[i]
+        return dict(drawn, decks=[drawn['decks'][theirs] if o == side else d for o, d in enumerate(drawn['decks'])])
+
+
+def hard_decks(scores):
+    """{key: weight} of the hard decks from `scores` ({key: recent scores of the specialist against it, 1 win, 0.5
+    draw, 0 loss})."""
+    priority = {}
+    for key, xs in scores.items():
+        n = len(xs)
+        rate = (sum(xs) + 2) / (n + 4)
+        if rate < HARD_BELOW:
+            priority[key] = (HARD_BELOW - rate) * n / (n + 4)
+    top = sorted(priority, key=lambda k: (-priority[k], k))[:HARD_TOP]
+    return {k: priority[k] ** 2 for k in top}
+
+
+class DeckScores:
+    """The learner's record of a specialist's learning games by opponent deck: rank 0 adds every update's results and
+    writes RUN/deck-scores.json ({key: recent scores}; read back on a restart) and RUN/hard-decks.json (hard_decks(),
+    for the collectors)."""
+
+    def __init__(self, run):
+        self.run = Path(run)
+        path = self.run / 'deck-scores.json'
+        self.scores = defaultdict(list, json.loads(path.read_text()) if path.exists() else {})
+
+    def add(self, results):
+        for row in results:
+            if 'deck' in row:
+                self.scores[row['deck']] = (self.scores[row['deck']] + [row['deck_score']])[-RECENT:]
+
+    def save(self):
+        for name, value in (('deck-scores', self.scores), ('hard-decks', hard_decks(self.scores))):
+            tmp = self.run / f'{name}.tmp'
+            tmp.write_text(json.dumps(value))
+            os.replace(tmp, self.run / f'{name}.json')
+
+
+def read_hard(run):
+    """RUN/hard-decks.json ({} before the learner wrote one, or caught mid-write)."""
+    try:
+        return json.loads((Path(run) / 'hard-decks.json').read_text())
+    except (OSError, ValueError):
+        return {}

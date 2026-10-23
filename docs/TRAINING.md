@@ -917,3 +917,38 @@ critic's value 0.25 to 10 s after the tap, which is what short credit uses. 100 
   or defends them badly; self-play can't tell which), the precise decks lowest (Goblin Drill 39%, X-Bow 41%, Miner 41%).
 - So the live losses concentrate on a few beatdown and air decks that humans don't find stronger than the rest: a
   real target for deck-weighted training. `attic/decks/human_wincons.py`; `~/cr-ppo/diag/decks/human_wincons.json`.
+
+## 14. The refactor and the Hog 2.6 specialist (23 October)
+
+**Goal (the user, 23 October).** A general agent that is strong with any deck; the current one fails at interaction
+details (placement, unit against unit). And a Hog 2.6 specialist, as FirstLight's learned decent placement. The
+specialist is a model in its own right and a test: if concentrated experience teaches the details v240 misses, that
+is the lever for the general agent too.
+
+**gen-r3 stopped** at v356 (23 October, about 11:00; the user's decision). Champion v240; v260–v340 kept (47.8–49.9%
+against it, five failed gates in a row). Everything is kept in `~/cr-ppo/runs/gen-r3`.
+
+**Refactor.** The programs stay at the top level with the same names and commands; what they share moved into the `cr`
+package (`observation`, `policy`, `imitation`, `engine` with one shared `Game` loop, `matchmaking`, `actors`), the
+small programs into `tools/`, the tests into `tests/` (README). Retired options were removed (`--unmasked_b`,
+`REFUSED_PENALTY`, `upgo`, `lam_place`). Check: the old and the new code play 6 seeded arena games (v240 against
+the r3 IL model) to byte-identical results.
+
+**The specialist's recipe** (FirstLight's, read from its code: `native_runner/training/v4/ppo_expert_bc.py` and its
+matchmaking), in `~/cr-ppo/runs/hog26`:
+- Deck: Hog Rider, hero Musketeer, evolved Cannon, Fireball, The Log, evolved Skeletons, Ice Golem, Ice Spirits (the
+  pool's most common Hog 2.6 form: 1,130 of its 1,805 Hog 2.6 seats). No self-play.
+- Start: v240's full checkpoint (policy, critic, both Adam states) as version 0. Champion and KL reference: v240
+  (`g-v240`). The critic alone learns for the first 3 updates.
+- Opponents: 40% the r3 IL model, 40% v240, 20% by PFSP over the run's own snapshots and league (FirstLight: 40% IL,
+  60% its general model; our 20% guards against learning to exploit two fixed models).
+- Opponent decks in learning games: 30% from the pool's 20 most common decks, 30% from the decks it scores worst
+  against (smoothed score (w + 2) / (n + 4) below 55%, the 128 with the highest (0.55 − score) × n / (n + 4), drawn by
+  its square; FirstLight's rule, over each deck's last 32 games), 40% the pool pair's own. Gates keep the pool's pairs.
+- Imitation: after each PPO update, one step on 8 random 128-decision chunks of human Hog 2.6 games, at weight 0.2
+  (FirstLight's expert BC). `experiments/deck_index.py` found 10,992 Hog 2.6 player views in the IL data (5,901 wins);
+  the step uses the winners' training views.
+- Everything else as gen-r3 (rewards, λ 0.99, lr 2e-5, batch 1,024, frozen models at T 0.05, gates at 53% over 800
+  games against the champion, the same four benchmarks), so the comparison with v240 stays clean.
+
+Start (update 1, 1,024 games): Hog-playing v240 scores 33% against v240 on pool decks and 60% against the IL model.

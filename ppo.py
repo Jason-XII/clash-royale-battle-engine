@@ -34,7 +34,16 @@ An exploiter: "against": the main run's directory and "self_play": 0 in its own 
 the main run's champion (RUN/champion.json there), to find what beats it.
 
 A specialist: put "deck" (a deck as in the pool) and "self_play": 0 in RUN/settings.json before the first start; a
-learning seat then always plays that deck, against the pool's decks.
+learning seat then always plays that deck, against the pool's decks. Three more settings.json keys (23 Oct, FirstLight's
+Hog 2.6 recipe), each optional:
+- "fixed_opponents": {name: [checkpoint, share]}: these frozen opponents get their share of the learning games (e.g. the
+  IL model 0.4, the general champion 0.4); the rest go by PFSP to the other opponents (own snapshots, the league).
+- "deck_mix": {"focus": 0.3, "hard": 0.3}: a learning game's opponent deck comes from the pool's 20 most common decks,
+  from the decks the specialist scores worst against (RUN/hard-decks.json, matchmaking.hard_decks), or (the rest) is
+  its pair's own. Its scores by opponent deck: RUN/deck-scores.json.
+- --bc-index (a deck_index.py file of human games with that deck): after each PPO update, one imitation step on
+  --bc-batch random chunks of those games at weight --bc-coef (FirstLight's expert BC, 0.2), which keeps the
+  specialist's play close to how humans play the deck. Metrics bc_*.
 """
 import argparse
 from collections import defaultdict, deque
@@ -54,7 +63,7 @@ from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from cr import actors, matchmaking, observation as C, policy
+from cr import actors, imitation, matchmaking, observation as C, policy
 from cr.actors import PRIVATE
 
 ADAM_WARMUP = 20  # updates of learning-rate ramp after a fresh Adam (a fresh Adam at full lr collapsed ppo-ebarbs2)
@@ -206,6 +215,39 @@ def critic_targets(batches, critic, args, device):
         'win_ev_late': explained(o['outcome'][o['late']], o['v_win'][o['late']]),  # the last quarter of each game
         'short_ev_mc': explained(o['short'], o['v_short']),
         'short_ev_td': explained(o['ret_short'], o['v_short'])}
+
+
+def average_gradients(parameters):
+    """The ranks' mean gradient, by hand (for a step outside the DDP-wrapped update); a parameter no rank has a gradient
+    for keeps none, so Adam leaves it alone."""
+    if not dist.is_initialized():
+        return
+    params = [p for p in parameters if p.requires_grad]
+    has = torch.tensor([p.grad is not None for p in params], dtype=torch.int32, device=params[0].device)
+    dist.all_reduce(has, op=dist.ReduceOp.MAX)
+    used = [p for p, h in zip(params, has.tolist()) if h]
+    flat = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1) for p in used])
+    dist.all_reduce(flat)
+    flat /= dist.get_world_size()
+    offset = 0
+    for p in used:
+        p.grad = flat[offset:offset + p.numel()].view_as(p).clone()
+        offset += p.numel()
+
+
+def imitation_step(model, optimizer, batch, coef, device):
+    """One optimizer step on human games (FirstLight's expert BC after each PPO update): coef x the imitation loss of the
+    when / card / tile heads on `batch` (imitation.collate's; no value or next-play loss)."""
+    xs, ts = ({k: v.to(device, non_blocking=True) for k, v in g.items()} for g in batch)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
+        loss, m = imitation.loss_and_metrics(model, xs, ts, 0.0, 0.0)
+    (coef * loss).backward()
+    average_gradients(model.parameters())
+    stats = defaultdict(list)
+    finite_step(model.parameters(), optimizer, 0.5, stats, 'bc_skipped')
+    return dict(bc_loss=m['loss'], bc_what=m['what'], bc_which=m['which'], bc_tile=m['tile'],
+                bc_tile_top1=m.get('tile_top1', 0) / max(1, m['plays']), bc_skipped=stats['bc_skipped'][0])
 
 
 def finite_step(parameters, optimizer, max_norm, stats, key):
@@ -372,7 +414,7 @@ DEFAULTS = dict(updates=100000, batch=512, max_lag=4, lr=2e-5, epochs=2, minibat
                 critic_lr=1e-4, critic_epochs=4, entropy=0.002, kl_coef=0.05, value_warmup=20, self_play=0.5,
                 pool_size=6, snapshot_every=100, checkpoint_every=10, shaping=0.1, margin=0.2, eval_frac=0.25,
                 channels_last=True, against='', frozen_temperature=1.0, learner_temperature=1.0,
-                learner_mix=0.0)
+                learner_mix=0.0, bc_index='', bc_coef=0.2, bc_batch=8)
 
 
 
@@ -453,10 +495,12 @@ def learn(args, settings):
     champion = follow_champion(None)
     floor = version  # games played before this start (old settings) or a rollback are not learned from
     results = defaultdict(lambda: deque(maxlen=200))  # opponent -> the learning seat's recent outcomes
+    decks = matchmaking.DeckScores(out) if rank == 0 and getattr(s, 'deck', None) else None  # a specialist's opponents
+    experts = imitation.Experts(s.bc_index, f'{rank}-{version}') if s.bc_index else None
 
     def opponents():
         """{name: (checkpoint, PFSP weight)} over opponent_paths."""
-        return matchmaking.pfsp(matchmaking.opponent_paths(out, init, s), results)
+        return matchmaking.weights(matchmaking.opponent_paths(out, init, s), results, getattr(s, 'fixed_opponents', None))
 
     key = [os.urandom(16).hex()]
     if world > 1:
@@ -513,6 +557,8 @@ def learn(args, settings):
         t_policy = time.monotonic()
         if version >= s.value_warmup:  # before that, the critic alone learns (the policy's advantages need it)
             stats.update(update(model, reference, optimizer, batches, s, device, objective))
+            if experts is not None:
+                stats.update(imitation_step(model, optimizer, experts.batch(s.bc_batch), s.bc_coef, device))
         stats['policy_s'] = time.monotonic() - t_policy
         t_critic = time.monotonic()
         stats.update(train_critic(critic, critic_optimizer, batches, s, device, critic_objective),
@@ -543,6 +589,9 @@ def learn(args, settings):
             for row in r['results']:
                 if row['opponent'] != 'self':
                     results[row['opponent']].append(row['outcome'])
+        if decks is not None:
+            decks.add(row for r in everyone for row in r['results'])
+            decks.save()
         if rank == 0 and version % s.snapshot_every == 0:  # a policy snapshot (opponent, gate candidate) and its full
             torch.save(dict(config=saved['config'], model=model.state_dict(), vocab=saved['vocab'], version=version),
                        out / 'pool' / 'snapshot.tmp')  # checkpoint (what a rollback returns to)
@@ -583,6 +632,8 @@ def learn(args, settings):
                 refused_per_game=round(sum(t.get('refused', 0) for t in times) / max(1, sum(t.get('games', 0) for t in times)), 2),
                 score={n: round(float(np.mean(results[n])), 3) for n in sorted(results) if results[n]},
                 ticks=float(np.mean([row['tick'] for row in finished] or [0])),
+                **(dict(deck_score=float(np.mean([row['deck_score'] for row in finished if 'deck' in row] or [0])),
+                        hard_decks=len(matchmaking.hard_decks(decks.scores))) if decks is not None else {}),
                 **{k: float(np.mean([r['stats'][k] for r in everyone if k in r['stats']])) for k in sorted(keys)})
             last = now
             log.write(json.dumps(row) + '\n')

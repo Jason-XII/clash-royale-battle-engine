@@ -142,6 +142,23 @@ reward ones (`shaping`, `margin`: the end-of-game difference in lowest tower HP)
 - `against`: another run's directory. The run then plays only that run's current champion: an exploiter that looks
   for what beats it (use with `self_play` 0).
 
+A specialist (one deck; FirstLight's Hog 2.6 recipe, 23 October): these go in `RUN/settings.json` before the first
+start.
+- `deck` (a deck as in the pool) and `self_play` 0: a learning seat always plays it. In gate games the candidate plays it.
+- `fixed_opponents`, `{name: [checkpoint, share]}`: those frozen models get that share of the learning games (e.g. the
+  IL model 0.4 and the general champion 0.4); the rest go by PFSP to the run's own snapshots and league.
+- `deck_mix`, e.g. `{"focus": 0.3, "hard": 0.3}`: that share of the opponent decks comes from the pool's 20 most common
+  decks, and that share from the decks the specialist scores below 55% against (`RUN/hard-decks.json`, weighted by how
+  hard; its scores by deck are in `RUN/deck-scores.json`). The rest keep the pool pair's own deck.
+- `bc_index` (a file from `experiments/deck_index.py`: the human games played with that deck), `bc_coef` 0.2,
+  `bc_batch` 8: after each PPO update, one imitation step on that many random 128-decision chunks of the winners' games.
+  It keeps the specialist close to how humans play the deck. Metrics `bc_*`.
+
+```bash
+python experiments/deck_index.py ~/il-data/full-reuse-20261014 hog26-views.json \
+  --cards HogRider,Musketeer,Cannon,Fireball,Log,Skeletons,IceGolemite,IceSpirits --procs 20   # in a job
+```
+
 ### The improvement loop
 
 ```bash

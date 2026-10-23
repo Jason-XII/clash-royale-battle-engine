@@ -1,5 +1,6 @@
 """Imitation learning's loss and data: converted games -> chunks and padded batches -> the loss. train.py trains on
 them; the PPO learner's imitation step (--bc-index) uses them too."""
+import json
 import math
 from pathlib import Path
 import random
@@ -181,3 +182,24 @@ def collate(items):
     ts = {k: torch.from_numpy(np.stack([pad(t[k], k) for _, t in items])) for k in items[0][1]}
     ts['time'] = torch.from_numpy(np.stack([np.arange(L) < len(t['what']) for _, t in items]))
     return xs, ts
+
+
+class Experts:
+    """Human games for the PPO learner's imitation step: the winning player views of a deck index (experiments/
+    deck_index.py; its validation games left out). batch(n): n random views, one random chunk of CHUNK decisions each,
+    ability presses relabelled as train.py --ability_labels 1 does."""
+    CHUNK = 128
+
+    def __init__(self, index, seed):
+        spec = json.loads(Path(index).read_text())
+        self.root, self.rng = Path(spec['data']), random.Random(seed)
+        self.entries = [e for e in spec['entries'] if e['outcome'] > 0 and not e['validation']]
+        if not self.entries:
+            raise ValueError(f'{index}: no winning player views')
+
+    def batch(self, n):
+        items = []
+        for e in self.rng.sample(self.entries, min(n, len(self.entries))):
+            data = ability_labels(read(self.root / e['file'], e['owner']))
+            items.append(self.rng.choice(list(chunks(data, self.CHUNK, False, self.rng))))
+        return collate(items)

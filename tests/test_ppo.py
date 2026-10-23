@@ -262,7 +262,8 @@ def test_a_specialist_deck_goes_to_a_learning_seat_or_the_judged_candidate():
 
 def test_ranks_step_together_so_adam_stays_in_sync(tmp_path):
     """Two gloo ranks with 3 and 5 minibatches (PPO) and 3 and 5 batches (IL): the same number of optimizer steps,
-    the same weights and Adam moments after (with DDP's Join they differed)."""
+    the same weights and Adam moments after (with DDP's Join they differed). Then a step past DDP, as the imitation
+    step takes it (the bare module, gradients averaged by hand): the same weights again."""
     script = tmp_path / 'ranks.py'
     script.write_text(textwrap.dedent(f'''
         import sys, torch, torch.distributed as dist
@@ -282,6 +283,10 @@ def test_ranks_step_together_so_adam_stays_in_sync(tmp_path):
         for b in ppo.schedule(data, 2):
             step(b)
         n = sum(1 for b in train.lockstep(iter(data), torch.device('cpu'), 2) if step(b) or True)
+        optimizer.zero_grad()
+        model.module(data[0] * (1 + rank)).pow(2).mean().backward()
+        ppo.average_gradients(model.parameters())
+        optimizer.step()
         state = [p.detach().clone() for p in model.parameters()] + [s[k] for s in optimizer.state.values() for k in ('exp_avg', 'exp_avg_sq')]
         out = [None, None]
         dist.all_gather_object(out, ([t.tolist() for t in state], n))
@@ -341,3 +346,62 @@ def test_a_decision_server_holds_models_of_different_sizes(tmp_path):
     assert all(h[0, seat].abs().sum() == 0 for h, _ in decider.states.values())
     assert decider.models[tmp_path / 'small.pt'].temperature == 0.1 and getattr(decider.models['current'], 'temperature', 1.0) == 1.0, \
         'frozen models play sharpened, the learner as trained'
+
+
+def test_fixed_opponent_shares_leave_the_rest_to_pfsp():
+    paths = {'il': '/il.pt', 'g-v240': '/v240.pt', 'v000020': '/a.pt', 'v000040': '/b.pt'}
+    results = {n: [] for n in paths} | {'v000020': [1.0, 1.0], 'v000040': [-1.0]}
+    plain = matchmaking.weights(paths, results)
+    assert plain['v000020'][1] == pytest.approx(0.05) and plain['il'][1] == pytest.approx(0.3), 'PFSP as before'
+    w = matchmaking.weights(paths, results, {'il': ['/il.pt', 0.4], 'g-v240': ['/v240.pt', 0.4]})
+    assert w['il'] == ('/il.pt', 0.4) and w['g-v240'][1] == 0.4
+    assert w['v000020'][1] + w['v000040'][1] == pytest.approx(0.2) and w['v000040'][1] > w['v000020'][1]
+    assert matchmaking.weights({'il': '/il.pt'}, {'il': []}, {'il': ['/il.pt', 0.4], 'x': ['/x.pt', 0.4]})['x'][1] == 0.4, \
+        'no PFSP opponent yet: the shares alone (the collectors draw by weight)'
+    with pytest.raises(ValueError):
+        matchmaking.weights(paths, results, {'il': ['/il.pt', 0.7], 'g-v240': ['/v240.pt', 0.4]})
+
+
+def test_a_specialist_meets_focus_hard_and_pool_decks(tmp_path):
+    deck = lambda *ids: [dict(d=i) for i in ids]  # noqa: E731
+    pool = [dict(decks=[deck(1, 2), deck(3, 4)], lvlcap=16), dict(decks=[deck(5, 6), deck(1, 2)], lvlcap=14),
+            dict(decks=[deck(7, 8), deck(9, 10)], lvlcap=15)]
+    decks = matchmaking.Decks(pool)
+    assert decks.focus[0] == '1-2' and len(decks.seats['1-2']) == 2
+    rng = random.Random(0)
+    drawn = [decks.pick(pool[2], 1, {'focus': 0.3, 'hard': 0.3}, {'5-6': 1.0}, rng) for _ in range(3000)]
+    theirs = [matchmaking.deck_key(p['decks'][1]) for p in drawn]
+    assert 0.25 < theirs.count('5-6') / 3000 < 0.35 + 0.3 / 5, 'the hard share (and focus, uniform over 5 sets)'
+    assert 0.35 < theirs.count('9-10') / 3000 < 0.45 + 0.3 / 5, "the pair's own"
+    hard_5_6 = next(p for p in drawn if matchmaking.deck_key(p['decks'][1]) == '5-6')
+    assert hard_5_6['lvlcap'] == 14, "a drawn deck comes with its own pair's levels"
+    assert all(decks.pick(pool[2], 0, {'hard': 1.0}, {}, rng) is pool[2] for _ in range(20)), 'no hard decks yet: the pool'
+    scores = {'easy': [1.0] * 30, 'hard': [0.0] * 30, 'new': [0.0], 'even': [0.5] * 30}
+    hard = matchmaking.hard_decks(scores)
+    assert set(hard) == {'hard', 'new', 'even'} and hard['hard'] > hard['even'] > hard['new'], \
+        'below 0.55 smoothed; many losses weigh more than one'
+    record = matchmaking.DeckScores(tmp_path)
+    record.add([dict(deck='a', deck_score=0.0)] * 40 + [dict(opponent='il')])
+    record.save()
+    assert len(matchmaking.DeckScores(tmp_path).scores['a']) == matchmaking.RECENT, 'recent games only, kept on restart'
+    assert matchmaking.read_hard(tmp_path) == matchmaking.hard_decks({'a': [0.0] * matchmaking.RECENT})
+
+
+def test_the_imitation_step_learns_the_human_games(tmp_path, monkeypatch):
+    root = dataset(tmp_path / 'data', monkeypatch)
+    entries = json.loads((root / 'manifest.json').read_text())['entries']
+    index = tmp_path / 'index.json'
+    index.write_text(json.dumps(dict(data=str(root), entries=[dict(e, outcome=1.0 if i % 2 else -1.0)
+                                                              for i, e in enumerate(entries)])))
+    experts = imitation.Experts(index, 0)
+    assert all(e['outcome'] > 0 and not e['validation'] for e in experts.entries) and experts.entries
+    torch.manual_seed(0)
+    model = policy.Policy(policy.Config(vocab_size=len(C.Vocab([26000000])), card_dim=4, object_dim=4, conv_channels=4,
+                                        conv_layers=1, core=8, attention_layers=0)).train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    batch = experts.batch(2)
+    first = ppo.imitation_step(model, optimizer, batch, 0.2, torch.device('cpu'))
+    for _ in range(20):
+        last = ppo.imitation_step(model, optimizer, batch, 0.2, torch.device('cpu'))
+    assert all(math.isfinite(v) for v in {**first, **last}.values()) and last['bc_loss'] < first['bc_loss']
+    assert model.next_when.weight.grad is None, 'heads the step does not train keep no gradient'
