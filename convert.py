@@ -34,6 +34,11 @@ FIRST_LEVEL = {'Common': 1, 'Rare': 3, 'Epic': 6, 'Legendary': 9, 'Champion': 11
 TOWER_FIRST_LEVEL = {159000000: 1, 159000001: 6, 159000002: 9, 159000004: 9}
 DEAL = (((2, 0, 4, 7), (6, 1, 3, 5)), ((7, 1, 4, 3), (6, 0, 2, 5)))
 SEED = 1784463263
+# The conversion rules (measured 2026-10-23/24; each made its battles exact without breaking exact ones -- docs/CONVERSION.md):
+COMMAND_AGE = 21            # a replay's tick is the command's ISSUE tick; the game lands a play / press 21 ticks later
+BATTLE_TICK_LIMIT = 7200    # the battle runs until the game's own rules end it; this is only a safety stop
+MIRROR = 28000006           # Mirror copies the card that has LANDED when it lands: its selection is not taken at the tap
+TOWER_IDS = range(5000000, 5000006)     # the six crown towers are the battle's first objects
 ALIASES = defaultdict(set)
 for _card, _info in CARDS['cards'].items():
     for _alias in _info['aliases']:
@@ -146,8 +151,15 @@ def ability_sources(event, cards):
     return inferred or explicit
 
 
-def prepare(payload):
-    """Normalize exactly the fields needed by native playback and IL observations."""
+def side_level(cards):
+    """A side's commonest displayed card level (the higher on a tie), or None."""
+    counts = Counter(c['level'] for c in cards if c['level'])
+    return max(counts, key=lambda lv: (counts[lv], lv)) if counts else None
+
+
+def prepare(payload, kings=None):
+    """Normalize exactly the fields needed by native playback and IL observations. kings: {owner: 'cards'} sets that
+    King to its side's commonest card level instead of its tower troop's (the replay does not record the King's level)."""
     source = payload.get('source') or {}
     tag = str(source.get('replay_tag') or '')
     if not (re.fullmatch(r'[0289PYLQGRJCUV]+', tag, re.I) or
@@ -183,7 +195,7 @@ def prepare(payload):
         tick = int(event.get('replay_tick_20hz', -1))
         if tick < 1:
             raise ValueError('replay event tick must be positive')
-        command = dict(tick=tick + 1, owner=owner)
+        command = dict(issue=tick, tap=tick, tick=tick + COMMAND_AGE, owner=owner)
         if event['kind'] == 'play_card':
             cid = card_id(event.get('card_key'))
             if cid not in {c['id'] for c in decks[owner]}:
@@ -242,12 +254,14 @@ def prepare(payload):
         openings.append(opening); queues.append(queue); configured.append(arranged)
         forms.append([by_id[c]['form'] for c in arranged]); omitted.append(omit)
     commands = [c for _, _, _, c in sorted(parsed, key=lambda row: row[:3])]
-    last_source = max((c['tick'] - 1 for c in commands), default=0)
+    last_source = max((c['issue'] for c in commands), default=0)
     duration = (payload.get('replay') or {}).get('duration') or {}
     times = [int(round(duration[k] * 20)) for k in ('timeline_seconds', 'display_seconds')
              if isinstance(duration.get(k), (int, float)) and not isinstance(duration[k], bool) and duration[k] >= 0]
     source_end = max([last_source, *times])
-    end = max(source_end, max((c['tick'] for c in commands), default=0))
+    # the battle ends by the game's rules (a King down, the result fixed at regular time, the tiebreaker felling a tower),
+    # never at a length from the data: a recorded or assumed length stops tiebreaker battles short
+    end = max(source_end + COMMAND_AGE, max((c['tick'] for c in commands), default=0), BATTLE_TICK_LIMIT)
     levels = [c['level'] for cards in decks.values() for c in cards if c['level'] is not None]
     for p in players.values():
         level = (p.get('tower_card') or {}).get('level')
@@ -282,13 +296,19 @@ def prepare(payload):
             entries.append(entry)
         support = native[f'deck{owner}']['sc'][0]
         support['d'] = troop
-        if tower.get('level'):
-            support['l'] = max(0, int(tower['level']) - TOWER_FIRST_LEVEL[troop])
+        # no tower level in the replay (RoyaleAPI leaves it out in River Race and some tournaments): the cards'
+        tower_level = int(tower['level']) if tower.get('level') else side_level(decks[owner])
+        if tower_level:
+            support['l'] = max(0, tower_level - TOWER_FIRST_LEVEL[troop])
         native[f'deck{owner}']['sp'] = entries
         avatar = native[f'avatar{owner}']
         avatar.update(name=str(p.get('name') or p.get('tag') or f'RoyaleAPI-{"Top" if owner == 0 else "Bottom"}').strip()[:48]
                       or f'RoyaleAPI-{"Top" if owner == 0 else "Bottom"}', expLevel=level)
-        native['hbd'][owner]['kt'] = level
+        # the King's level is not in the replay: its tower troop's first, the side's cards' when `kings` asks (rule 5:
+        # 0a5c3799 needed the troop's 15 beside cards at 16, edbc5868 the cards' 16 beside a level-15 Royal Chef)
+        cards_level = side_level(decks[owner])
+        native['hbd'][owner]['kt'] = ((cards_level if (kings or {}).get(owner) == 'cards' else tower_level)
+                                      or cards_level or level)
         displayed_levels[owner] = {cid: c['level'] for cid, c in cards.items() if c['level']}
         displayed_levels[f'tower{owner}'] = int(tower['level']) if tower.get('level') else None
     match.update(rndSeed=SEED, endTick=end)
@@ -299,7 +319,10 @@ def prepare(payload):
                     source_result=str(battle.get('result') or ''),
                     players=tuple({'owner': owner, 'crowns': int(battle[side]['crowns'])}
                                   for owner in (0, 1) for side in side_owner if side_owner[side] == owner))
+    king_alternatives = [o for o in (0, 1) if displayed_levels[f'tower{o}'] and side_level(decks[o])
+                         and displayed_levels[f'tower{o}'] != side_level(decks[o])]
     return dict(tag=tag, match=match, commands=commands, terminal=terminal, opening=openings, queue=queues,
+                king_alternatives=king_alternatives,
                 omitted=omitted, levels=displayed_levels, episode=dict(source_team_owner=side_owner['team'],
                 deck0_form_availability=tuple(forms[0]), deck1_form_availability=tuple(forms[1])))
 
@@ -379,28 +402,70 @@ def calibrate(game, native):
     raise ValueError('native deal calibration failed after ten configurations')
 
 
-def queue_ability(native, command):
+def calibrate_deal(game, native, seeds=64):
+    """calibrate(), and for a deck with a card the game keeps out of the starting hand (Elixir Collector, Mirror) that it
+    refuses, again under other seeds: such a card waits in the draw queue at a place set by the battle's seed ALONE,
+    whatever its deck slot (engine probe 2026-10-24: seed 1 -> 3rd of 4 from any of the 8 slots, seed 7919 -> 4th), so
+    moving it between slots under one seed never fits the plays that need it elsewhere. The first seed that fits is the
+    battle's seed from then on (the real one is not published). A game whose seed is fixed (the dice search) is not varied."""
+    try:
+        return calibrate(copy.deepcopy(game), native)
+    except ValueError as refused:
+        if not any(game['omitted']) or game.get('fixed_seed'):
+            raise
+        for k in range(1, seeds + 1):
+            trial = copy.deepcopy(game)
+            trial['match']['rndSeed'] = (int(game['match']['rndSeed']) + 104729 * k) % 2 ** 31
+            try:
+                return calibrate(trial, native)
+            except ValueError:
+                continue
+        raise refused
+
+
+def ability_ids(keys):
     ids = set()
-    for key in command['source_keys']:
+    for key in keys:
         cid = card_id(key)
         ids.add(cid)
         if str(cid) in CARDS['hero_units']:
             ids.add(int(CARDS['hero_units'][str(cid)]))
-    objects = [o for o in native.observe()['objects'] if o['owner'] == command['owner'] and
-               (not ids or o.get('cardId') in ids) and o.get('nativeObjectId')]
-    for obj in sorted(objects, key=lambda o: -o['nativeObjectId']):
-        try:
-            native.queue_ability_action_at(SimpleNamespace(owner=command['owner'], object_index=-2,
-                                           secondary_index=obj['nativeObjectId']), execute_in_ticks=1)
-            return True
-        except RuntimeError:
-            continue
-    return False
+    return ids
+
+
+def press(native, command, presses, choices):
+    """A recorded press: a unit whose ability was ready at the press's ISSUE tick (the replay's named ones if any was),
+    queued to execute next tick with no readiness re-check (rules 2, 3: the client checked at the tap). RoyaleAPI does not
+    name the unit: where two different cards were ready, choices[k] picks one for the k-th such press (play_exact
+    searches them), else the newest unit."""
+    ids = ability_ids(command['source_keys'])
+    ready = command.get('ready') or []
+    alive = {o['nativeObjectId'] for o in native.observe()['objects'] if o['owner'] == command['owner']}
+    candidates = [r for r in ([r for r in ready if r[1] in ids] or ready) if r[0] in alive]
+    if not candidates:                          # none ready at the issue: the named units, newest first
+        candidates = [(o['nativeObjectId'], o.get('cardId')) for o in native.observe()['objects']
+                      if o['owner'] == command['owner'] and (not ids or o.get('cardId') in ids) and o.get('nativeObjectId')]
+    if not candidates:
+        return False
+    cards = sorted({str(c) for _, c in candidates})
+    pick = max(candidates, key=lambda r: r[0])
+    if len(cards) > 1:
+        k = sum(1 for p in presses if len(p['cards']) > 1)
+        if choices is not None and k < len(choices):
+            card = cards[choices[k] % len(cards)]
+            pick = max((r for r in candidates if str(r[1]) == card), key=lambda r: r[0])
+    presses.append(dict(tick=command['tick'], owner=command['owner'], cards=cards, unit=list(pick)))
+    native.queue_ability_action_at(SimpleNamespace(owner=command['owner'], object_index=-2, secondary_index=int(pick[0])),
+                                   execute_in_ticks=1, check_ready=False)
+    return True
 
 
 def fidelity(final, terminal, payload, team_owner):
     alive = {}
     for obj in final.get('objects', []):
+        # only the six tower objects: by position alone a troop standing where a tower fell was scored as the tower
+        if int(obj.get('nativeObjectId') or 0) not in TOWER_IDS:
+            continue
         owner = obj.get('owner')
         for name, x, y in (('king', 9000, 3000), ('left', 3500, 6500), ('right', 14500, 6500)):
             y = 32000 - y if owner == 1 else y
@@ -452,11 +517,18 @@ class Recorder:
         return frames, env.tick(), False
 
 
-def play_replay(native, payload):
-    """Play a replay's commands in the native engine (a Recorder) -> its game, held-play log and fidelity."""
-    game = calibrate(prepare(payload), native)
+def play_replay(native, payload, kings=None, press_choices=None, seed=None):
+    """Play a replay's commands in the native engine (a Recorder) -> its game, held-play log and fidelity.
+    Each command has two stages: at its issue tick what the client decided then (a card's selection, the units whose
+    ability was ready), one tick before its landing (issue + 21) the command itself."""
+    game = prepare(payload, kings)
+    if seed is not None:
+        game['match']['rndSeed'], game['fixed_seed'] = int(seed), True
+    game = calibrate_deal(game, native)
     native.create_match(game['match'])
-    tick, ended_at, failures = 0, None, []
+    if hasattr(native, 'decisions'):
+        native.decisions = []
+    tick, ended_at, failures, presses = 0, None, [], []
 
     def advance(to):
         nonlocal tick, ended_at
@@ -465,21 +537,91 @@ def play_replay(native, payload):
             if ended and tick < to:
                 ended_at = tick
 
-    for command in game['commands']:
-        advance(command['tick'] - 1)
+    commands = game['commands']
+    steps = sorted([(c['issue'], 0, i) for i, c in enumerate(commands)] +
+                   [(c['tick'] - 1, 1, i) for i, c in enumerate(commands)])
+    for at, stage, i in steps:
+        command = commands[i]
+        advance(at)
         if ended_at is not None:
             break
+        if stage == 0:
+            try:
+                if command['kind'] == 'card':
+                    # the client takes a play's cost off its own bar at the tap, the engine when it lands: a choice made at
+                    # the tap (Spirit Empress mounted or on foot) sees the bar less the player's plays still in flight
+                    in_flight = sum(c.get('cost', 0) for c in commands if c is not command and c['kind'] == 'card'
+                                    and c['owner'] == command['owner'] and c['issue'] < command['issue'] < c['tick'])
+                    selection = native.selection_of(command['owner'], command['card_id'], elixir_less=in_flight)
+                    command['cost'] = (selection[1] >> 28) & 0xF if selection else 0
+                    if command['card_id'] != MIRROR:
+                        command['selection'] = selection
+                else:
+                    command['ready'] = native.ready_ability_sources(command['owner'])
+            except Exception as error:  # noqa: BLE001
+                failures.append((command['issue'], command['kind'], 'at issue: ' + str(error)[:100]))
+            continue
         try:
             if command['kind'] == 'card':
                 native.queue_card_at(command['owner'], command['card_id'], command['x'], command['y'],
-                                     execute_tick=command['tick'])
-            elif not queue_ability(native, command):
-                failures.append((command['tick'], 'ability', 'no ready source unit accepted it'))
+                                     execute_tick=command['tick'], selection=command.get('selection'))
+            elif not press(native, command, presses, press_choices):
+                failures.append((command['tick'], 'ability', 'no unit to press'))
         except Exception as error:
             failures.append((command['tick'], command['kind'], str(error)[:120]))
     advance(game['terminal']['native_tick'])
-    return dict(game=game, holds=list(native.hold_log), ended_at=ended_at, failures=failures,
+    for command in commands:                    # not JSON: the selection is the engine's (card, parameter) tuple
+        command.pop('selection', None)
+        command.pop('ready', None)
+    return dict(game=game, holds=list(native.hold_log), ended_at=ended_at, failures=failures, presses=presses,
                 fidelity=fidelity(native.observe(), game['terminal'], payload, game['episode']['source_team_owner']))
+
+
+def exact(result):
+    f = result['fidelity']
+    return f['tower_hp_error'] == 0 and f['winner_match'] and f['crowns_match']
+
+
+def play_exact(native, payload, seeds=0, max_presses=4):
+    """play_replay, with the searches for what RoyaleAPI does not publish, each kept only when every tower ends exactly as
+    recorded: the King's level where the tower troop's and the cards' differ (rule 5), the unit of each press where two
+    different cards were ready (rule 2), and the battle's seed (dice: Skeleton King, Hunter, Elixir Golem; it stops when
+    5 seeds give the same result). result['search'] says what was used."""
+    first = play_replay(native, payload)
+    first['search'] = {'runs': 1}
+    if exact(first):
+        return first
+    owners = first['game']['king_alternatives']
+    kings = [None] + [dict.fromkeys(c, 'cards') for n in range(1, len(owners) + 1) for c in itertools.combinations(owners, n)]
+    runs = 1
+    for king in kings:
+        result = first if king is None else play_replay(native, payload, kings=king)
+        runs += king is not None
+        if exact(result):
+            result['search'] = {'runs': runs, 'king': king}
+            return result
+        ambiguous = [p for p in result['presses'] if len(p['cards']) > 1][:max_presses]
+        for combo in itertools.product(*[range(len(p['cards'])) for p in ambiguous]) if ambiguous else ():
+            trial = play_replay(native, payload, kings=king, press_choices=list(combo))
+            runs += 1
+            if exact(trial):
+                trial['search'] = {'runs': runs, 'king': king, 'presses': list(combo)}
+                return trial
+    errors = {first['fidelity']['tower_hp_error']}
+    for k in range(1, seeds + 1):
+        try:
+            trial = play_replay(native, payload, seed=7919 * k)
+        except ValueError:                     # a seed under which the deal cannot fit the plays
+            continue
+        runs += 1
+        errors.add(trial['fidelity']['tower_hp_error'])
+        if exact(trial):
+            trial['search'] = {'runs': runs, 'seed': 7919 * k}
+            return trial
+        if k >= 4 and len(errors) == 1:        # the same result under 5 seeds: not seed-dependent
+            break
+    first['search'] = {'runs': runs, 'seed_dependent': len(errors) > 1}
+    return first
 
 
 # ---- a played game -> inputs and labels ---------------------------------------------------------------------------------
@@ -542,8 +684,8 @@ def _snap_to_legal(inputs, labels):
 
 
 def _labels(header, decisions, ticks, owner, vocab, inputs):
-    """The human's action at each decision: a play landing at tick c (the replay's tick) is labelled at the last
-    decision before c - 22 (the board at the tap). Ability presses the same way, at their own tick."""
+    """The human's action at each decision: a play or press is labelled at the last decision before its tap (the replay's
+    tick is the issue tick; the play lands 21 ticks later: docs/CONVERSION.md rule 1)."""
     T = len(decisions)
     out = {'action_kind': np.zeros(T, np.int64), 'action_card': np.zeros(T, np.int64),
            'action_cell': np.zeros(T, np.int64), 'action_controller': np.zeros(T, np.int64),
@@ -556,8 +698,8 @@ def _labels(header, decisions, ticks, owner, vocab, inputs):
     for c in header['commands']:
         if c['owner'] != owner or (c['kind'] == 'card' and c.get('executed_tick', 0) is None):
             continue
-        i = int(np.searchsorted(ticks, c['tick'] - C.DEPLOY_DELAY)) - 1 if c['kind'] == 'card' else \
-            int(np.searchsorted(ticks, c['tick'])) - 1
+        tap = c.get('tap', c['tick'] - C.DEPLOY_DELAY if c['kind'] == 'card' else c['tick'])
+        i = int(np.searchsorted(ticks, tap)) - 1
         if i < 0 or i >= T or out['action_kind'][i]:
             continue
         if c['kind'] == 'card':
@@ -669,13 +811,28 @@ def _jsonable(x):
 
 
 # ---- workers ------------------------------------------------------------------------------------------------------------
-def worker(index, engine, jobs, out, clapha_engine):
+def payload_of(job, tables):
+    """A job's payload: a row of a parquet shard (payload_json), or a line of a JSON-lines file ({tag, payload}: e.g.
+    clapha-engine crx/replay_audit/schema5_json.py's output for the royaleapi-downloader schema-5 dump)."""
+    if job['path'] not in tables:
+        tables.clear()
+        if job['path'].endswith('.jsonl'):
+            tables[job['path']] = open(job['path']).read().splitlines()
+        else:
+            import pyarrow.parquet as pq
+            tables[job['path']] = pq.read_table(job['path'], columns=['replay_tag', 'payload_json'])
+    table = tables[job['path']]
+    if isinstance(table, list):
+        return json.loads(table[job['row']])['payload']
+    return json.loads(table['payload_json'][job['row']].as_py())
+
+
+def worker(index, engine, jobs, out, clapha_engine, seeds=0):
     name, libdir, assets = engine
     sys.path.insert(0, str(Path(clapha_engine).expanduser() / 'crx'))
     log = open(out / f'log-{name}-{index}.txt', 'a')
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    import pyarrow.parquet as pq
     from env import CrxEnv
     time.sleep(index // 4 * 10)                 # start 4 engines at a time (data-table loading times out under load)
     for attempt in range(3):
@@ -691,9 +848,7 @@ def worker(index, engine, jobs, out, clapha_engine):
     index_file = open(out / f'index-{name}-{index}.jsonl', 'a')
     tables = {}
     for job in jobs:
-        if job['path'] not in tables:
-            tables = {job['path']: pq.read_table(job['path'], columns=['replay_tag', 'payload_json'])}
-        payload = json.loads(tables[job['path']]['payload_json'][job['row']].as_py())
+        payload = payload_of(job, tables)
         if job.get('towers'):
             # a collected battle the oracle accepted with one tower-troop pair only (it did not keep them)
             for side, troop in zip(('team', 'opponent'), job['towers']):
@@ -705,10 +860,10 @@ def worker(index, engine, jobs, out, clapha_engine):
         game = None
         try:
             rec = Recorder(env)
-            result = play_replay(rec, payload)
+            result = play_exact(rec, payload, seeds=seeds)
             fid = result['fidelity']
             entry.update(hp_error=int(fid['tower_hp_error']), winner=bool(fid['winner_match']),
-                         crowns=bool(fid['crowns_match']), decisions=len(rec.decisions))
+                         crowns=bool(fid['crowns_match']), decisions=len(rec.decisions), search=_jsonable(result['search']))
             if int(fid['tower_hp_error']) != 0 or not (fid['winner_match'] and fid['crowns_match']):
                 entry.update(kept=False, why='did not reproduce on conversion')
             else:
@@ -745,7 +900,7 @@ def convert(args):
     engines = {name: (name, str(Path(lib).expanduser()), str(Path(assets).expanduser())) for name, lib, assets in args.engine}
     parts = {}
     for directory in args.replays:
-        for p in sorted(Path(directory).expanduser().glob('*.parquet')):
+        for p in sorted([*Path(directory).expanduser().glob('*.parquet'), *Path(directory).expanduser().glob('*.jsonl')]):
             parts.setdefault(p.name, str(p.resolve()))
     rows = [json.loads(line) for line in open(Path(args.assignment).expanduser())]
     selected = [dict(r, path=parts[r['part']]) for r in rows if r.get('engine') in engines and r['part'] in parts]
@@ -757,48 +912,65 @@ def convert(args):
     print(f'{len(selected)} games; {len(selected) - len(jobs)} already written; {len(jobs)} to convert', flush=True)
 
     ctx = mp.get_context('fork')
-    running, crashes = {}, Counter()
 
-    def start(name, index, share):
-        (out / f'current-{name}-{index}.txt').unlink(missing_ok=True)
-        process = ctx.Process(target=worker, args=(index, engines[name], share, out, args.clapha_engine))
-        process.start()
-        running[name, index] = (process, share)
+    def run(jobs):
+        running, crashes = {}, Counter()
 
-    # one CPU budget over the engine builds, in proportion to their games
-    by_engine = {name: sorted((r for r in jobs if r['engine'] == name), key=lambda r: (r['part'], r['row']))
-                 for name in engines}
-    by_engine = {k: v for k, v in by_engine.items() if v}
-    for name, mine in by_engine.items():
-        count = max(1, min(len(mine), args.workers * len(mine) // len(jobs)))
-        for index in range(count):
-            start(name, index, mine[index::count])
-    try:
-        while running:
-            time.sleep(1)
-            for (name, index), (process, share) in list(running.items()):
-                if process.is_alive():
-                    continue
-                del running[name, index]
-                if process.exitcode == 0:
-                    continue
-                marker = out / f'current-{name}-{index}.txt'
-                if not marker.exists():
-                    raise RuntimeError(f'{name} worker {index} failed before its first game; see its log')
-                tag = marker.read_text().strip()
-                crashes[tag] += 1
-                if crashes[tag] >= 2:  # the native engine crashes on this replay: record it, do not drop it silently
-                    job = next(r for r in share if r['tag'] == tag)
-                    write_archive(archive_path(out, tag), None, None, None,
-                                  dict(tag=tag, part=job['part'], row=job['row'], engine=name, kept=False,
-                                       why='native engine crashed twice'))
-                rest = [r for r in share if not archive_path(out, r['tag']).exists()]
-                if rest:
-                    start(name, index, rest)
-    finally:
-        for process, _ in running.values():
-            process.terminate()
-            process.join()
+        def start(name, index, share):
+            (out / f'current-{name}-{index}.txt').unlink(missing_ok=True)
+            process = ctx.Process(target=worker, args=(index, engines[name], share, out, args.clapha_engine, args.seeds))
+            process.start()
+            running[name, index] = (process, share)
+
+        # one CPU budget over the engine builds, in proportion to their games
+        by_engine = {name: sorted((r for r in jobs if r['engine'] == name), key=lambda r: (r['part'], r['row']))
+                     for name in engines}
+        by_engine = {k: v for k, v in by_engine.items() if v}
+        for name, mine in by_engine.items():
+            count = max(1, min(len(mine), args.workers * len(mine) // len(jobs)))
+            for index in range(count):
+                start(name, index, mine[index::count])
+        try:
+            while running:
+                time.sleep(1)
+                for (name, index), (process, share) in list(running.items()):
+                    if process.is_alive():
+                        continue
+                    del running[name, index]
+                    if process.exitcode == 0:
+                        continue
+                    marker = out / f'current-{name}-{index}.txt'
+                    if not marker.exists():
+                        raise RuntimeError(f'{name} worker {index} failed before its first game; see its log')
+                    tag = marker.read_text().strip()
+                    crashes[tag] += 1
+                    if crashes[tag] >= 2:  # the native engine crashes on this replay: record it, do not drop it silently
+                        job = next(r for r in share if r['tag'] == tag)
+                        write_archive(archive_path(out, tag), None, None, None,
+                                      dict(tag=tag, part=job['part'], row=job['row'], engine=name, kept=False,
+                                           why='native engine crashed twice'))
+                    rest = [r for r in share if r['tag'] != tag or crashes[tag] < 2]
+                    rest = [r for r in rest if not archive_path(out, r['tag']).exists() or r.get('retry')]
+                    if rest:
+                        start(name, index, rest)
+        finally:
+            for process, _ in running.values():
+                process.terminate()
+                process.join()
+
+    if jobs:
+        run(jobs)
+    # a hot update reaches players during its first day: a battle of a switch day the first engine did not reproduce runs
+    # again on its assignment's 'alt' engine (the data before or after the update); a reproduced one replaces the archive
+    retry = []
+    for r in selected:
+        if r.get('alt') in engines and archive_path(out, r['tag']).exists():
+            meta = read_metadata(archive_path(out, r['tag']))
+            if not meta['kept'] and meta.get('engine') == r['engine'] and meta.get('why') == 'did not reproduce on conversion':
+                retry.append(dict(r, engine=r['alt'], retry=True))
+    if retry:
+        print(f'{len(retry)} switch-day games again on their alternative data', flush=True)
+        run(retry)
 
     entries, rejected, missing = [], [], []
     for r in selected:
@@ -827,6 +999,8 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--workers', type=int, default=23)
     parser.add_argument('--limit', type=int, default=0, help='convert only the first N assigned games')
+    parser.add_argument('--seeds', type=int, default=64, help="seeds tried for a battle that depends on the seed (dice); "
+                        "the search stops early when 5 seeds give the same result")
     convert(parser.parse_args())
 
 
