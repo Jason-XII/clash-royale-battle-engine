@@ -41,7 +41,9 @@ publish. `--seeds N` tries up to N seeds per battle that misses (stops after 5 s
 | 09-01 | d2a: 16.402.2 from app 160402002 | 160402002 |
 
 The asset server serves only the current data (older versions 403), so sep17, oct1 (and jul6, aug26 for the summer) were
-rebuilt from real later files and accepted only when their battles turned exact; ask Arron for the folders. For future
+rebuilt from real later files and accepted only when their battles turned exact. **Every engine and data version used,
+and a kit that replicates the result** (our converter at the versions used, the sample's 1,791 kept battles, replicate.py):
+the release `conversion-2026-10-24` of ClashAlpha/clapha-engine. For future
 battles: save each data version when it goes live (its fingerprint changes) and none has to be rebuilt.
 
 ## Running it on the schema-5 dump
